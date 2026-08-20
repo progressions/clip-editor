@@ -191,26 +191,53 @@ class CoverPreview(Gtk.Widget):
             self.on_pan()
 
 
+def _round_rect(cr, x: float, y: float, w: float, h: float, r: float) -> None:  # noqa: ANN001
+    if w <= 0 or h <= 0:
+        return
+    r = min(r, h / 2.0, w / 2.0)
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -1.5708, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, 1.5708)
+    cr.arc(x + r, y + h - r, r, 1.5708, 3.1416)
+    cr.arc(x + r, y + r, r, 3.1416, 4.7124)
+    cr.close_path()
+
+
 class Timeline(Gtk.DrawingArea):
-    """Full-clip ruler: selected in/out range and a draggable playhead."""
+    """Ruler plus video and audio lanes. Playhead is draggable; clips are not."""
 
     __gtype_name__ = "ClipTimeline"
+
+    _GUTTER = 22.0
+    _PAD_RIGHT = 8.0
+    _RULER_H = 16.0
+    _LANE_H = 28.0
+    _LANE_GAP = 6.0
+    _BOTTOM = 16.0
 
     def __init__(self) -> None:
         super().__init__()
         self.duration = 0.0
+        self.video_dur = 0.0
+        self.video_name = ""
+        self.audio_name = ""
+        self.audio_start = 0.0
+        self.audio_dur = 0.0
+        self.audio_kind = ""
         self.in_s = 0.0
         self.out_s = 0.0
         self.playhead = 0.0
         self.on_seek = None
         self._dragging = False
         self.set_hexpand(True)
+        self.set_vexpand(False)
         self.set_content_width(200)
-        self.set_content_height(56)
+        self.set_content_height(94)
+        self.set_size_request(-1, 94)
         self.set_draw_func(self._draw)
         self.set_sensitive(False)
         self.set_cursor_from_name("col-resize")
-        self.set_tooltip_text("Drag the playhead. Highlight is the in/out range.")
+        self.set_tooltip_text("Drag the playhead. Bars are the video and audio clips.")
         click = Gtk.GestureClick()
         click.connect("pressed", self._on_pressed)
         self.add_controller(click)
@@ -220,16 +247,45 @@ class Timeline(Gtk.DrawingArea):
         drag.connect("drag-end", self._on_drag_end)
         self.add_controller(drag)
 
-    def set_duration(self, duration: float) -> None:
-        self.duration = max(0.0, float(duration))
-        if self.out_s <= 0 or self.out_s > self.duration:
-            self.out_s = self.duration
+    def _recompute_span(self) -> None:
+        self.duration = max(
+            self.video_dur,
+            self.audio_start + self.audio_dur,
+            self.out_s,
+            0.0,
+        )
         self.set_sensitive(self.duration > 0.04)
+
+    def set_duration(self, duration: float) -> None:
+        self.video_dur = max(0.0, float(duration))
+        if self.out_s <= 0 or (self.video_dur > 0 and self.out_s > self.video_dur):
+            self.out_s = self.video_dur
+        self._recompute_span()
+        self.queue_draw()
+
+    def set_clips(
+        self,
+        *,
+        video_name: str = "",
+        video_dur: float = 0.0,
+        audio_name: str = "",
+        audio_start: float = 0.0,
+        audio_dur: float = 0.0,
+        audio_kind: str = "",
+    ) -> None:
+        self.video_name = video_name
+        self.video_dur = max(0.0, float(video_dur))
+        self.audio_name = audio_name
+        self.audio_start = max(0.0, float(audio_start))
+        self.audio_dur = max(0.0, float(audio_dur))
+        self.audio_kind = audio_kind
+        self._recompute_span()
         self.queue_draw()
 
     def set_range(self, in_s: float, out_s: float) -> None:
         self.in_s = max(0.0, float(in_s))
         self.out_s = max(self.in_s, float(out_s))
+        self._recompute_span()
         if self.duration > 0:
             self.out_s = min(self.out_s, self.duration)
         self.queue_draw()
@@ -242,19 +298,21 @@ class Timeline(Gtk.DrawingArea):
             self.playhead = min(self.playhead, self.duration)
         self.queue_draw()
 
+    def _inner(self, width: float) -> tuple[float, float]:
+        left = self._GUTTER
+        inner = max(1.0, float(width) - left - self._PAD_RIGHT)
+        return left, inner
+
     def _x_to_t(self, x: float) -> float:
-        w = max(1.0, float(self.get_width()))
-        pad = 8.0
-        inner = max(1.0, w - 2 * pad)
-        t = ((x - pad) / inner) * self.duration
+        left, inner = self._inner(max(1.0, float(self.get_width())))
+        t = ((x - left) / inner) * self.duration
         return max(0.0, min(self.duration, t))
 
     def _t_to_x(self, t: float, width: float) -> float:
-        pad = 8.0
-        inner = max(1.0, width - 2 * pad)
+        left, inner = self._inner(width)
         if self.duration <= 0:
-            return pad
-        return pad + (max(0.0, min(self.duration, t)) / self.duration) * inner
+            return left
+        return left + (max(0.0, min(self.duration, t)) / self.duration) * inner
 
     def _seek_x(self, x: float) -> None:
         t = self._x_to_t(x)
@@ -282,67 +340,137 @@ class Timeline(Gtk.DrawingArea):
         if callable(self.on_seek):
             self.on_seek(self.playhead)
 
+    def _draw_clip(
+        self,
+        cr,  # noqa: ANN001
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+        color: tuple[float, float, float],
+        name: str,
+        alpha: float = 1.0,
+    ) -> None:
+        w = max(3.0, w)
+        _round_rect(cr, x, y, w, h, 4)
+        cr.set_source_rgba(*color, alpha)
+        cr.fill()
+        if not name or w < 18:
+            return
+        cr.save()
+        cr.rectangle(x + 4, y, max(0.0, w - 8), h)
+        cr.clip()
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.92)
+        cr.set_font_size(11)
+        ext = cr.text_extents(name)
+        cr.move_to(x + 8, y + (h + ext.height) / 2.0)
+        cr.show_text(name)
+        cr.restore()
+
     def _draw(self, _area: Gtk.DrawingArea, cr, width: int, height: int) -> None:  # noqa: ANN001
         bg = theme_rgb("dark_background", (0.04, 0.05, 0.08))
         track = theme_rgb("lighter_background", (0.12, 0.14, 0.22))
         sel = theme_rgb("accent", (0.49, 0.51, 0.85))
         fg = theme_rgb("foreground", (1.0, 0.8, 0.68))
         muted = theme_rgb("muted", (0.43, 0.49, 0.71))
+        green = theme_rgb("green", (0.22, 0.62, 0.45))
         cr.set_source_rgb(*bg)
         cr.paint()
-        pad_x, pad_y = 8.0, 16.0
-        track_h = 10.0
-        track_y = (height - track_h) / 2.0
-        inner_w = max(1.0, width - 2 * pad_x)
 
-        def _round_rect(x: float, y: float, w: float, h: float, r: float) -> None:
-            r = min(r, h / 2.0, w / 2.0)
-            cr.new_sub_path()
-            cr.arc(x + w - r, y + r, r, -1.5708, 0)
-            cr.arc(x + w - r, y + h - r, r, 0, 1.5708)
-            cr.arc(x + r, y + h - r, r, 1.5708, 3.1416)
-            cr.arc(x + r, y + r, r, 3.1416, 4.7124)
-            cr.close_path()
+        left, inner = self._inner(width)
+        v_y = self._RULER_H
+        a_y = self._RULER_H + self._LANE_H + self._LANE_GAP
+        lanes_bottom = a_y + self._LANE_H
 
-        _round_rect(pad_x, track_y, inner_w, track_h, 3)
+        _round_rect(cr, left, v_y, inner, self._LANE_H, 4)
+        cr.set_source_rgb(*track)
+        cr.fill()
+        _round_rect(cr, left, a_y, inner, self._LANE_H, 4)
         cr.set_source_rgb(*track)
         cr.fill()
 
+        cr.set_source_rgb(*muted)
+        cr.set_font_size(11)
+        cr.move_to(6, v_y + 19)
+        cr.show_text("V")
+        cr.move_to(6, a_y + 19)
+        cr.show_text("A")
+
+        if self.video_dur > 0:
+            x0 = self._t_to_x(0.0, width)
+            x1 = self._t_to_x(self.video_dur, width)
+            self._draw_clip(
+                cr, x0, v_y + 3, max(3.0, x1 - x0), self._LANE_H - 6, sel, self.video_name
+            )
+
+        if self.audio_dur > 0:
+            x0 = self._t_to_x(self.audio_start, width)
+            x1 = self._t_to_x(self.audio_start + self.audio_dur, width)
+            color = green if self.audio_kind != "source" else muted
+            self._draw_clip(
+                cr, x0, a_y + 3, max(3.0, x1 - x0), self._LANE_H - 6, color, self.audio_name
+            )
+
         if self.duration > 0 and self.out_s > self.in_s:
-            x0 = self._t_to_x(self.in_s, width)
-            x1 = self._t_to_x(self.out_s, width)
-            sel_h = track_h + 6
-            _round_rect(x0, track_y - 3, max(2.0, x1 - x0), sel_h, 3)
-            cr.set_source_rgba(*sel, 0.92)
-            cr.fill()
+            x_in = self._t_to_x(self.in_s, width)
+            x_out = self._t_to_x(self.out_s, width)
+            cr.set_source_rgba(*bg, 0.55)
+            if x_in > left:
+                cr.rectangle(left, v_y, x_in - left, lanes_bottom - v_y)
+                cr.fill()
+            right_end = left + inner
+            if x_out < right_end:
+                cr.rectangle(x_out, v_y, right_end - x_out, lanes_bottom - v_y)
+                cr.fill()
             cr.set_source_rgb(*fg)
             cr.set_line_width(2)
-            cr.move_to(x0, pad_y - 6)
-            cr.line_to(x0, height - pad_y + 6)
-            cr.move_to(x1, pad_y - 6)
-            cr.line_to(x1, height - pad_y + 6)
+            cr.move_to(x_in, v_y - 2)
+            cr.line_to(x_in, lanes_bottom + 2)
+            cr.move_to(x_out, v_y - 2)
+            cr.line_to(x_out, lanes_bottom + 2)
             cr.stroke()
+
+        cr.set_source_rgb(*muted)
+        cr.set_line_width(1)
+        cr.set_font_size(10)
+        if self.duration > 0:
+            step = self.duration
+            for cand in (0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0):
+                if self.duration / cand <= 7:
+                    step = cand
+                    break
+            t = 0.0
+            while t <= self.duration + 0.0001:
+                tx = self._t_to_x(t, width)
+                cr.set_source_rgb(*muted)
+                cr.move_to(tx, 2)
+                cr.line_to(tx, 8)
+                cr.stroke()
+                label = f"{t:.0f}s" if step >= 1 else f"{t:.1f}s"
+                cr.move_to(tx + 2, 12)
+                cr.show_text(label)
+                t += step
 
         px = self._t_to_x(self.playhead, width)
         cr.set_source_rgb(*fg)
         cr.set_line_width(2)
-        cr.move_to(px, 4)
-        cr.line_to(px, height - 4)
+        cr.move_to(px, 2)
+        cr.line_to(px, lanes_bottom + 2)
         cr.stroke()
-        cr.move_to(px, 4)
-        cr.line_to(px - 6, 14)
-        cr.line_to(px + 6, 14)
+        cr.move_to(px, 2)
+        cr.line_to(px - 6, 12)
+        cr.line_to(px + 6, 12)
         cr.close_path()
         cr.fill()
 
         cr.set_source_rgb(*muted)
         cr.set_font_size(11)
-        cr.move_to(pad_x, height - 3)
+        cr.move_to(left, height - 3)
         cr.show_text(f"{self.playhead:.2f}s")
         if self.duration > 0:
             label = f"{self.duration:.2f}s"
             ext = cr.text_extents(label)
-            cr.move_to(width - pad_x - ext.width, height - 3)
+            cr.move_to(width - self._PAD_RIGHT - ext.width, height - 3)
             cr.show_text(label)
 
 
@@ -794,12 +922,40 @@ class EditorWindow(Adw.ApplicationWindow):
         self.export_name.set_text(f"{path.parent.name}/{path.name}")
         self.export_name.set_tooltip_text(str(path))
 
+    def _sync_timeline_clips(self) -> None:
+        vname = self.video_path.name if self.video_path else ""
+        vdur = float((self.video_info or {}).get("duration") or 0)
+        if self.audio_path and self.audio_info:
+            aname = self.audio_path.name
+            adur = float(self.audio_info.get("duration") or 0)
+            astart = 0.0 if self.follow_in.get_active() else self.in_spin.get_value()
+            kind = "replace"
+        elif self.video_info and self.video_info.get("has_audio"):
+            aname = "video soundtrack"
+            adur = vdur
+            astart = 0.0
+            kind = "source"
+        else:
+            aname = ""
+            adur = 0.0
+            astart = 0.0
+            kind = ""
+        self.timeline.set_clips(
+            video_name=vname,
+            video_dur=vdur,
+            audio_name=aname,
+            audio_start=astart,
+            audio_dur=adur,
+            audio_kind=kind,
+        )
+        self.timeline.set_range(self.in_spin.get_value(), self.out_spin.get_value())
+
     def _refresh_fit(self) -> None:
         v = self._edit_dur()
         a = self._audio_usable()
         longer = bool(self.audio_path) and a > v + 0.05 and v > 0.04
         self.btn_fit.set_sensitive(bool(self.audio_path))
-        self.timeline.set_range(self.in_spin.get_value(), self.out_spin.get_value())
+        self._sync_timeline_clips()
         if not self.audio_path:
             self.btn_fit.set_label("Fit")
             self._schedule_autosave()
@@ -1007,11 +1163,12 @@ class EditorWindow(Adw.ApplicationWindow):
             return
         dur = float((self.video_info or {}).get("duration") or 0)
         self.clock.set_text(f"{value:.2f} / {dur:.2f}")
+        seek_t = min(value, dur) if dur > 0 else value
         if self._vmedia is not None:
             if not self.playing:
                 self.preview.set_media(self._vmedia)
             try:
-                self._vmedia.seek(int(max(0.0, value) * 1_000_000))
+                self._vmedia.seek(int(max(0.0, seek_t) * 1_000_000))
             except GLib.Error:
                 pass
             self.preview.queue_draw()
