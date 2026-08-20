@@ -101,6 +101,7 @@ class CoverPreview(Gtk.Widget):
         self._texture: Gdk.Texture | None = None
         self._media: Gtk.MediaFile | None = None
         self._inv_id = 0
+        self.blank = False
         self.set_layout_manager(Gtk.BinLayout())
         self.set_hexpand(True)
         self.set_vexpand(True)
@@ -131,7 +132,15 @@ class CoverPreview(Gtk.Widget):
             self._inv_id = media.connect("invalidate-contents", lambda *_: self.queue_draw())
         self.queue_draw()
 
+    def set_blank(self, blank: bool) -> None:
+        if self.blank == blank:
+            return
+        self.blank = blank
+        self.queue_draw()
+
     def _paintable(self) -> Gdk.Paintable | None:
+        if self.blank:
+            return None
         if self._media is not None:
             iw = int(self._media.get_intrinsic_width() or 0)
             ih = int(self._media.get_intrinsic_height() or 0)
@@ -571,6 +580,8 @@ class EditorWindow(Adw.ApplicationWindow):
         self.aspect = "9:16"
         self.audio_fit = False
         self.video_start = 0.0
+        self._clip_playing = False
+        self._audio_pending = False
         self.project_path: Path | None = None
         self._loading = False
         self._autosave_src: int = 0
@@ -1080,6 +1091,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.timeline.set_playhead(0)
         self.timeline.set_range(0.0, 0.0)
         self.timeline.set_duration(0.0)
+        self.preview.set_blank(False)
 
     def _on_new_project(self, *_args: object) -> None:
         if self.exporting:
@@ -1199,18 +1211,24 @@ class EditorWindow(Adw.ApplicationWindow):
             return 0.0
         return max(0.0, float(self.audio_info["duration"]) - self._audio_start())
 
+    def _program_end(self) -> float:
+        return max(self.video_start + self.out_spin.get_value(), 0.05)
+
+    def _timeline_now(self) -> float:
+        if self.playing:
+            return self._play_t0 + (time.monotonic() - self._play_mono)
+        return self.timeline.playhead
+
     def _playhead(self) -> float:
-        if self.playing and self._vmedia is not None and self._vmedia.is_prepared():
+        if self.playing and self._clip_playing and self._vmedia is not None and self._vmedia.is_prepared():
             ts = self._vmedia.get_timestamp()
             if ts >= 0:
                 return ts / 1_000_000.0
-        if self.playing:
-            return self._play_t0 + (time.monotonic() - self._play_mono)
-        src = self.timeline.playhead - self.video_start
+        src = self._timeline_now() - self.video_start
         dur = float((self.video_info or {}).get("duration") or 0)
         if dur > 0:
             return min(max(0.0, src), dur)
-        return src
+        return max(0.0, src)
 
     def _install_drop(self, widget: Gtk.Widget) -> None:
         actions = Gdk.DragAction.COPY | Gdk.DragAction.MOVE
@@ -1414,6 +1432,7 @@ class EditorWindow(Adw.ApplicationWindow):
                 self._set_status("that file has no video stream")
                 return
             self._stop()
+            self.preview.set_blank(False)
             self.video_path = path
             self.video_info = info
             dur = float(info["duration"] or 0)
@@ -1511,9 +1530,9 @@ class EditorWindow(Adw.ApplicationWindow):
         if not done:
             return
         self._sync_timeline_clips()
-        dur = float((self.video_info or {}).get("duration") or 0)
-        source = self.timeline.playhead - self.video_start
-        self.clock.set_text(f"{source:.2f} / {dur:.2f}")
+        t = self.timeline.playhead
+        self.clock.set_text(f"{t:.2f} / {self._program_end():.2f}")
+        self._apply_timeline_frame(t, start_media=False)
         self._checkpoint()
         self._schedule_autosave()
         self._set_status(f"Video starts at {self.video_start:.2f}s")
@@ -1521,27 +1540,16 @@ class EditorWindow(Adw.ApplicationWindow):
     def _on_timeline_seek(self, value: float) -> None:
         if self._syncing_scrub:
             return
-        dur = float((self.video_info or {}).get("duration") or 0)
-        source = value - self.video_start
-        self.clock.set_text(f"{source:.2f} / {dur:.2f}")
-        seek_t = source
-        if dur > 0:
-            seek_t = min(max(0.0, source), dur)
-        if self._vmedia is not None:
-            if not self.playing:
-                self.preview.set_media(self._vmedia)
-            try:
-                self._vmedia.seek(int(max(0.0, seek_t) * 1_000_000))
-            except GLib.Error:
-                pass
-            self.preview.queue_draw()
+        end = self._program_end()
+        self.clock.set_text(f"{value:.2f} / {end:.2f}")
+        self._apply_timeline_frame(value, start_media=self.playing)
         if not self.playing:
             return
-        self._play_t0 = seek_t
+        self._play_t0 = value
         self._play_mono = time.monotonic()
         if self._seek_audio_src:
             GLib.source_remove(self._seek_audio_src)
-        self._seek_audio_src = GLib.timeout_add(80, self._restart_seek_audio, seek_t)
+        self._seek_audio_src = GLib.timeout_add(80, self._restart_seek_audio, value)
 
     def _restart_seek_audio(self, value: float) -> bool:
         self._seek_audio_src = 0
@@ -1549,17 +1557,27 @@ class EditorWindow(Adw.ApplicationWindow):
             self._start_preview_audio(value)
         return False
 
-    def _preview_cmd(self, at_s: float) -> list[str] | None:
-        remaining = max(0.05, self.out_spin.get_value() - at_s)
+    def _audio_begins_at(self) -> float | None:
+        if self.audio_path:
+            if self.follow_in.get_active():
+                return self.video_start
+            return self.in_spin.get_value()
+        if self.video_path and self.video_info and self.video_info.get("has_audio"):
+            return self.video_start
+        return None
+
+    def _preview_cmd(self, timeline_t: float) -> list[str] | None:
+        remaining = max(0.05, self._program_end() - timeline_t)
+        begins = self._audio_begins_at()
+        if begins is None:
+            return None
+        start = timeline_t - begins
+        if start < -0.02:
+            return None
         if self.audio_path:
             path = self.audio_path
-            if self.follow_in.get_active():
-                start = at_s
-            else:
-                start = self.video_start + (at_s - self.in_spin.get_value())
         elif self.video_path and self.video_info and self.video_info.get("has_audio"):
             path = self.video_path
-            start = at_s
         else:
             return None
         start = max(0.0, start)
@@ -1610,13 +1628,42 @@ class EditorWindow(Adw.ApplicationWindow):
             except OSError:
                 pass
 
-    def _start_preview_audio(self, at_s: float) -> None:
+    def _apply_timeline_frame(self, timeline_t: float, *, start_media: bool) -> None:
+        v0 = self.video_start
+        if timeline_t < v0 - 0.02 or self._vmedia is None:
+            self.preview.set_blank(True)
+            if self._vmedia is not None:
+                self._vmedia.pause()
+            self._clip_playing = False
+            return
+        self.preview.set_blank(False)
+        source = max(0.0, timeline_t - v0)
+        dur = float((self.video_info or {}).get("duration") or 0)
+        if dur > 0:
+            source = min(source, dur)
+        self.preview.set_media(self._vmedia)
+        if start_media:
+            self._play_media_at(source)
+            self._clip_playing = True
+        else:
+            try:
+                self._vmedia.seek(int(source * 1_000_000))
+            except GLib.Error:
+                pass
+            self.preview.queue_draw()
+
+    def _start_preview_audio(self, timeline_t: float) -> None:
         self._stop_preview_audio()
-        cmd = self._preview_cmd(at_s)
+        begins = self._audio_begins_at()
+        cmd = self._preview_cmd(timeline_t)
         if cmd is None:
-            if self.audio_path:
+            if begins is not None and timeline_t < begins - 0.02:
+                self._audio_pending = True
+                return
+            if self.audio_path and not shutil.which("ffplay") and not shutil.which("mpv"):
                 self._set_status("Need ffplay or mpv to hear preview audio")
             return
+        self._audio_pending = False
         log = Path.home() / ".cache" / "clip-editor" / "preview-audio.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         logf = log.open("w", encoding="utf-8")
@@ -1694,6 +1741,8 @@ class EditorWindow(Adw.ApplicationWindow):
 
     def _stop(self) -> None:
         self.playing = False
+        self._clip_playing = False
+        self._audio_pending = False
         self.btn_play.set_label("Play")
         self._stop_preview_audio()
         if self._seek_audio_src:
@@ -1702,6 +1751,8 @@ class EditorWindow(Adw.ApplicationWindow):
         if self._vmedia is not None:
             self._vmedia.pause()
         self.preview.set_media(None)
+        t = self.timeline.playhead
+        self.preview.set_blank(t < self.video_start - 0.02)
         if self._tick is not None:
             GLib.source_remove(self._tick)
             self._tick = None
@@ -1714,15 +1765,16 @@ class EditorWindow(Adw.ApplicationWindow):
         if self.playing:
             self._stop()
             return
-        t = self._playhead()
-        inn, out = self.in_spin.get_value(), self.out_spin.get_value()
-        if t < inn - 0.02 or t >= out - 0.02:
-            t = inn
-        self._play_t0 = t
+        self._play_t0 = 0.0
         self._play_mono = time.monotonic()
-        self.preview.set_media(self._vmedia)
-        self._play_media_at(t)
-        self._start_preview_audio(t)
+        self._clip_playing = False
+        self._audio_pending = False
+        self._syncing_scrub = True
+        self.timeline.set_playhead(0.0)
+        self._syncing_scrub = False
+        self.clock.set_text(f"0.00 / {self._program_end():.2f}")
+        self._apply_timeline_frame(0.0, start_media=True)
+        self._start_preview_audio(0.0)
         if not self.audio_path and not (
             self.video_info and self.video_info.get("has_audio")
         ):
@@ -1732,15 +1784,23 @@ class EditorWindow(Adw.ApplicationWindow):
         self._tick = GLib.timeout_add(50, self._on_tick)
 
     def _on_tick(self) -> bool:
-        t = self._playhead()
-        out = self.out_spin.get_value()
-        dur = float((self.video_info or {}).get("duration") or 0)
+        t = self._timeline_now()
+        end = self._program_end()
         self._syncing_scrub = True
-        self.timeline.set_playhead(t + self.video_start)
+        self.timeline.set_playhead(t)
         self._syncing_scrub = False
-        self.clock.set_text(f"{t:.2f} / {dur:.2f}")
-        self.preview.queue_draw()
-        if t >= out - 0.02:
+        self.clock.set_text(f"{t:.2f} / {end:.2f}")
+        if t < self.video_start - 0.02:
+            self._apply_timeline_frame(t, start_media=False)
+        elif not self._clip_playing:
+            self._apply_timeline_frame(t, start_media=True)
+        else:
+            self.preview.queue_draw()
+        if self._audio_pending and self._preview_proc is None:
+            begins = self._audio_begins_at()
+            if begins is not None and t >= begins - 0.02:
+                self._start_preview_audio(t)
+        if t >= end - 0.02:
             self._stop()
             return False
         return True

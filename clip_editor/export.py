@@ -85,19 +85,29 @@ def build_cmd(
     if a_start < 0:
         a_start = 0.0
     v_start = max(0.0, float(video_start or 0.0))
+    out_dur = duration + v_start
+    if v_start > 0.04:
+        vchain.append(f"tpad=start_duration={v_start:.6f}:color=black")
+
     # Original soundtrack stays locked to the picture. Replacement audio
     # only follows the in-point when the user asks (driver sync).
-    # Sliding the video clip (video_start) shifts which part of a music
-    # bed sits under the export.
-    if use_source_audio or (use_replacement and audio_follows_in):
+    # A video_start lead-in is black; a music bed plays from timeline 0.
+    picture_locked = use_source_audio or (use_replacement and audio_follows_in)
+    if picture_locked:
         a_start += in_s
-    elif use_replacement:
-        a_start += v_start
+        a_len = duration
+    else:
+        a_len = out_dur
 
     achain = [
-        f"atrim=start={a_start:.6f}:duration={duration:.6f}",
+        f"atrim=start={a_start:.6f}:duration={a_len:.6f}",
         "asetpts=PTS-STARTPTS",
-        f"apad=whole_dur={duration:.6f}",
+    ]
+    if picture_locked and v_start > 0.04:
+        ms = int(round(v_start * 1000.0))
+        achain.append(f"adelay={ms}:all=1")
+    achain += [
+        f"apad=whole_dur={out_dur:.6f}",
         "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo",
     ]
 
@@ -142,7 +152,7 @@ def build_cmd(
         "-movflags",
         "+faststart",
         "-t",
-        f"{duration:.6f}",
+        f"{out_dur:.6f}",
         "-f",
         "mp4",
         str(out),
@@ -152,7 +162,7 @@ def build_cmd(
         "dest": {"width": dw, "height": dh, "aspect": aspect},
         "in_s": in_s,
         "out_s": in_s + duration,
-        "duration": duration,
+        "duration": out_dur,
         "audio": str(audio_path) if audio_path else None,
         "audio_follows_in": bool(audio_follows_in),
         "audio_offset": a_start if (use_replacement or use_source_audio) else None,
