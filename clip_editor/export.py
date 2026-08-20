@@ -115,6 +115,8 @@ def build_cmd(
         a_in = "[1:a]" if use_replacement else "[0:a]"
         filt = f"[0:v]{','.join(vchain)}[v];{a_in}{','.join(achain)}[a]"
         cmd += ["-filter_complex", filt, "-map", "[v]", "-map", "[a]"]
+        cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2"]
+        cmd += ["-disposition:a", "default"]
     else:
         cmd += ["-filter:v", ",".join(vchain), "-map", "0:v:0", "-an"]
 
@@ -127,10 +129,10 @@ def build_cmd(
         "20",
         "-pix_fmt",
         "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
+        "-map_metadata",
+        "-1",
+        "-map_chapters",
+        "-1",
         "-movflags",
         "+faststart",
         "-t",

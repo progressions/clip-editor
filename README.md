@@ -59,6 +59,19 @@ intake**, using the same config eagle-browse does (`eagle-browse.toml`,
 `*.mp4.tmp` then `os.replace` so the Ginger watcher never sees a half-written
 file.
 
+## Project files
+
+Format: JSON, ``format: "clip-editor-project"``, ``version: 1``, suffix
+``.clip.json``. Records video/audio paths (absolute plus relative to the
+project file), aspect, pan, in/out, Fit, and “audio follows in-point”.
+
+The hamburger menu: Open project, Save (Ctrl+S), Save As (Ctrl+Shift+S).
+The current edit auto-saves every 800ms to
+``~/.local/state/clip-editor/autosave.clip.json``, and to the named project
+file once you have saved once. Reopening the app restores the last session.
+
+Drop a ``.clip.json`` onto the window to open it.
+
 ## First-goal job
 
 Open a (usually 1:1) gen, add a music or driver track, set 9:16, drag the

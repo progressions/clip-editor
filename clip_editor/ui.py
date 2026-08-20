@@ -17,12 +17,21 @@ gi.require_version("Adw", "1")
 gi.require_version("Gdk", "4.0")
 gi.require_version("GdkPixbuf", "2.0")
 
-from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Graphene, Gtk, Pango  # noqa: E402
 
 from clip_editor.aspects import ASPECTS, cover_crop, dest_size
 from clip_editor.eagle import apply_omarchy_theme, theme_rgb
 from clip_editor.export import ExportError, default_out_path, run_export
 from clip_editor.probe import ProbeError, probe, which_ffmpeg
+from clip_editor.project import (
+    AUTOSAVE_PATH,
+    Project,
+    ProjectError,
+    read_autosave,
+    read_project,
+    write_autosave,
+    write_project,
+)
 
 APP_ID = "local.clip.Editor"
 
@@ -64,7 +73,11 @@ def _load_frame(path: Path) -> GdkPixbuf.Pixbuf:
     return pb
 
 
-class CoverPreview(Gtk.DrawingArea):
+class CoverPreview(Gtk.Widget):
+    """Cover-crop preview. The same pan applies to the still, playback, and export."""
+
+    __gtype_name__ = "ClipCoverPreview"
+
     def __init__(self) -> None:
         super().__init__()
         self.pixbuf: GdkPixbuf.Pixbuf | None = None
@@ -72,7 +85,10 @@ class CoverPreview(Gtk.DrawingArea):
         self.pan_y = 0.5
         self.on_pan = None
         self._drag_pan = (0.5, 0.5)
-        self.set_draw_func(self._draw)
+        self._texture: Gdk.Texture | None = None
+        self._media: Gtk.MediaFile | None = None
+        self._inv_id = 0
+        self.set_layout_manager(Gtk.BinLayout())
         self.set_hexpand(True)
         self.set_vexpand(True)
         self.set_cursor_from_name("grab")
@@ -82,42 +98,74 @@ class CoverPreview(Gtk.DrawingArea):
         drag.connect("drag-end", lambda *_: self.set_cursor_from_name("grab"))
         self.add_controller(drag)
 
+    def do_measure(self, orientation: Gtk.Orientation, for_size: int) -> tuple[int, int, int, int]:  # noqa: N802
+        return 32, 240, -1, -1
+
     def set_pixbuf(self, pb: GdkPixbuf.Pixbuf | None) -> None:
         self.pixbuf = pb
+        self._texture = Gdk.Texture.new_for_pixbuf(pb) if pb is not None else None
         self.queue_draw()
 
-    def _draw(self, _area: Gtk.DrawingArea, cr, width: int, height: int) -> None:  # noqa: ANN001
-        cr.set_source_rgb(*theme_rgb("dark_background", (0.0, 0.0, 0.0)))
-        cr.paint()
-        pb = self.pixbuf
-        if pb is None or width <= 0 or height <= 0:
+    def set_media(self, media: Gtk.MediaFile | None) -> None:
+        if self._media is not None and self._inv_id:
+            try:
+                self._media.disconnect(self._inv_id)
+            except (TypeError, RuntimeError):
+                pass
+            self._inv_id = 0
+        self._media = media
+        if media is not None:
+            self._inv_id = media.connect("invalidate-contents", lambda *_: self.queue_draw())
+        self.queue_draw()
+
+    def _paintable(self) -> Gdk.Paintable | None:
+        if self._media is not None:
+            return self._media
+        return self._texture
+
+    def do_snapshot(self, snapshot: Gtk.Snapshot) -> None:  # noqa: N802
+        w, h = self.get_width(), self.get_height()
+        if w <= 0 or h <= 0:
             return
-        pw, ph = pb.get_width(), pb.get_height()
-        src_a = pw / ph
-        dst_a = width / height
+        r, g, b = theme_rgb("dark_background", (0.0, 0.0, 0.0))
+        bg = Gdk.RGBA()
+        bg.red, bg.green, bg.blue, bg.alpha = r, g, b, 1.0
+        snapshot.append_color(bg, Graphene.Rect().init(0, 0, w, h))
+        p = self._paintable()
+        if p is None:
+            return
+        iw = int(p.get_intrinsic_width() or 0)
+        ih = int(p.get_intrinsic_height() or 0)
+        if iw <= 0 or ih <= 0:
+            return
+        src_a = iw / ih
+        dst_a = w / h
         if src_a > dst_a:
-            scale = height / ph
-            overflow = pw * scale - width
-            x = -overflow * self.pan_x
+            scale = h / ih
+            sw, sh = iw * scale, float(h)
+            x = -(sw - w) * self.pan_x
             y = 0.0
         else:
-            scale = width / pw
-            overflow = ph * scale - height
+            scale = w / iw
+            sw, sh = float(w), ih * scale
             x = 0.0
-            y = -overflow * self.pan_y
-        cr.save()
-        cr.translate(x, y)
-        cr.scale(scale, scale)
-        Gdk.cairo_set_source_pixbuf(cr, pb, 0, 0)
-        cr.paint()
-        cr.restore()
+            y = -(sh - h) * self.pan_y
+        snapshot.push_clip(Graphene.Rect().init(0, 0, w, h))
+        snapshot.save()
+        snapshot.translate(Graphene.Point().init(x, y))
+        p.snapshot(snapshot, sw, sh)
+        snapshot.restore()
+        snapshot.pop()
 
     def _overflow(self) -> tuple[float, float]:
-        pb = self.pixbuf
+        p = self._paintable()
         w, h = self.get_width(), self.get_height()
-        if pb is None or w <= 0 or h <= 0:
+        if p is None or w <= 0 or h <= 0:
             return 0.0, 0.0
-        pw, ph = pb.get_width(), pb.get_height()
+        pw = int(p.get_intrinsic_width() or 0)
+        ph = int(p.get_intrinsic_height() or 0)
+        if pw <= 0 or ph <= 0:
+            return 0.0, 0.0
         src_a = pw / ph
         dst_a = w / h
         if src_a > dst_a:
@@ -152,6 +200,9 @@ class EditorWindow(Adw.ApplicationWindow):
         self.audio_info: dict | None = None
         self.aspect = "9:16"
         self.audio_fit = False
+        self.project_path: Path | None = None
+        self._loading = False
+        self._autosave_src: int = 0
         self.exporting = False
         self.playing = False
         self._vmedia: Gtk.MediaFile | None = None
@@ -164,7 +215,16 @@ class EditorWindow(Adw.ApplicationWindow):
 
         toolbar = Adw.ToolbarView()
         header = Adw.HeaderBar()
+        menu = Gio.Menu()
+        menu.append("Open project…", "win.open-project")
+        menu.append("Save", "win.save")
+        menu.append("Save As…", "win.save-as")
+        mb = Gtk.MenuButton(icon_name="open-menu-symbolic")
+        mb.set_menu_model(menu)
+        mb.set_tooltip_text("Project")
+        header.pack_start(mb)
         toolbar.add_top_bar(header)
+        self._install_project_actions()
 
         root = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
         root.set_margin_top(16)
@@ -177,21 +237,12 @@ class EditorWindow(Adw.ApplicationWindow):
         self.aspect_frame = Gtk.AspectFrame(ratio=9 / 16, obey_child=False)
         self.aspect_frame.set_hexpand(True)
         self.aspect_frame.set_vexpand(True)
-        self.preview_stack = Gtk.Stack()
-        self.preview_stack.set_hexpand(True)
-        self.preview_stack.set_vexpand(True)
         self.preview = CoverPreview()
         self.preview.on_pan = self._refresh_crop
-        self.live = Gtk.Picture()
-        self.live.set_content_fit(Gtk.ContentFit.COVER)
-        self.live.set_hexpand(True)
-        self.live.set_vexpand(True)
-        self.preview_stack.add_named(self.preview, "still")
-        self.preview_stack.add_named(self.live, "live")
-        self.aspect_frame.set_child(self.preview_stack)
+        self.aspect_frame.set_child(self.preview)
         left.append(self.aspect_frame)
 
-        self.crop_label = Gtk.Label(xalign=0)
+        self.crop_label = self._wrapping_label("")
         self.crop_label.add_css_class("dim-label")
         left.append(self.crop_label)
 
@@ -213,6 +264,8 @@ class EditorWindow(Adw.ApplicationWindow):
 
         right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         right.set_size_request(320, -1)
+        right.set_hexpand(False)
+        right.set_hexpand_set(True)
 
         right.append(self._section("Video"))
         row = Gtk.Box(spacing=8)
@@ -220,7 +273,7 @@ class EditorWindow(Adw.ApplicationWindow):
         b.connect("clicked", lambda *_: self._pick("video"))
         row.append(b)
         right.append(row)
-        self.video_label = Gtk.Label(label="none", xalign=0, wrap=True)
+        self.video_label = self._wrapping_label("none")
         right.append(self.video_label)
 
         right.append(self._section("Audio"))
@@ -238,10 +291,8 @@ class EditorWindow(Adw.ApplicationWindow):
         self.btn_clear_audio.connect("clicked", self._on_clear_audio)
         row.append(self.btn_clear_audio)
         right.append(row)
-        self.audio_label = Gtk.Label(
-            label="none — keeps the video’s audio if it has one",
-            xalign=0,
-            wrap=True,
+        self.audio_label = self._wrapping_label(
+            "none — keeps the video’s audio if it has one"
         )
         right.append(self.audio_label)
         self.follow_in = Gtk.CheckButton(label="Audio follows video in-point")
@@ -288,11 +339,7 @@ class EditorWindow(Adw.ApplicationWindow):
         right.append(row)
 
         right.append(self._section("Export"))
-        self.export_name = Gtk.Label(
-            label="name is assigned on export (.mp4)",
-            xalign=0,
-            wrap=True,
-        )
+        self.export_name = self._wrapping_label("name is assigned on export (.mp4)")
         self.export_name.add_css_class("dim-label")
         right.append(self.export_name)
         self.btn_export = Gtk.Button(label="Export")
@@ -302,7 +349,7 @@ class EditorWindow(Adw.ApplicationWindow):
         right.append(self.btn_export)
         self.progress = Gtk.ProgressBar()
         right.append(self.progress)
-        self.status = Gtk.Label(xalign=0, wrap=True)
+        self.status = self._wrapping_label("")
         self.status.add_css_class("dim-label")
         right.append(self.status)
 
@@ -317,7 +364,207 @@ class EditorWindow(Adw.ApplicationWindow):
         self._install_drop(toolbar)
         self._install_drop(root)
         self._install_drop(self.preview)
-        self._install_drop(self.live)
+        GLib.idle_add(self._restore_autosave)
+
+    def _install_project_actions(self) -> None:
+        for name, handler in (
+            ("open-project", self._on_open_project),
+            ("save", self._on_save),
+            ("save-as", self._on_save_as),
+        ):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", handler)
+            self.add_action(action)
+
+    def _current_project(self) -> Project:
+        return Project(
+            video=self.video_path,
+            audio=self.audio_path,
+            aspect=self.aspect,
+            pan_x=self.preview.pan_x,
+            pan_y=self.preview.pan_y,
+            in_s=self.in_spin.get_value(),
+            out_s=self.out_spin.get_value(),
+            audio_follows_in=self.follow_in.get_active(),
+            audio_fit=self.audio_fit,
+            path=self.project_path,
+        )
+
+    def _update_title(self) -> None:
+        if self.project_path:
+            self.set_title(f"Clip editor — {self.project_path.name}")
+        else:
+            self.set_title("Clip editor")
+
+    def _schedule_autosave(self) -> None:
+        if self._loading:
+            return
+        if self._autosave_src:
+            GLib.source_remove(self._autosave_src)
+            self._autosave_src = 0
+        self._autosave_src = GLib.timeout_add(800, self._autosave_now)
+
+    def _autosave_now(self) -> bool:
+        self._autosave_src = 0
+        proj = self._current_project()
+        if proj.video is None and proj.audio is None:
+            return False
+        try:
+            write_autosave(proj)
+            if self.project_path is not None:
+                write_project(self.project_path, proj)
+        except OSError as exc:
+            self._set_status(f"Auto-save failed: {exc}")
+        return False
+
+    def _flush_autosave(self) -> None:
+        if self._autosave_src:
+            GLib.source_remove(self._autosave_src)
+            self._autosave_src = 0
+        self._autosave_now()
+
+    def _apply_project(self, proj: Project) -> None:
+        self._loading = True
+        self._stop()
+        try:
+            if proj.video is not None:
+                if proj.video.is_file():
+                    self._open_path("video", proj.video, from_project=True)
+                else:
+                    self._set_status(f"Video missing: {proj.video}")
+            if proj.audio is not None:
+                if proj.audio.is_file():
+                    self._open_path("audio", proj.audio, from_project=True)
+                else:
+                    self._set_status(f"Audio missing: {proj.audio}")
+            if proj.aspect in self.aspect_buttons:
+                self.aspect_buttons[proj.aspect].set_active(True)
+            self.preview.pan_x = min(1.0, max(0.0, proj.pan_x))
+            self.preview.pan_y = min(1.0, max(0.0, proj.pan_y))
+            self.preview.queue_draw()
+            self.in_spin.set_value(proj.in_s)
+            if proj.out_s is not None:
+                self.out_spin.set_value(proj.out_s)
+            self.follow_in.set_active(proj.audio_follows_in)
+            self.audio_fit = proj.audio_fit
+            if proj.path is not None:
+                self.project_path = proj.path
+            self._refresh_fit()
+            self._update_title()
+        finally:
+            self._loading = False
+
+    def _load_project_file(self, path: Path) -> None:
+        try:
+            proj = read_project(path)
+        except ProjectError as exc:
+            self._set_status(str(exc))
+            return
+        self.project_path = path
+        self._apply_project(proj)
+        self.project_path = path
+        self._update_title()
+        self._schedule_autosave()
+        self._set_status(f"Opened {path.name}")
+
+    def _restore_autosave(self) -> bool:
+        proj = read_autosave()
+        if proj is None or (proj.video is None and proj.audio is None):
+            return False
+        self._apply_project(proj)
+        if self.video_path or self.audio_path:
+            self._set_status("Restored last session")
+        return False
+
+    def _project_dialog_filters(self) -> Gio.ListStore:
+        filt = Gtk.FileFilter()
+        filt.set_name("Clip editor project")
+        filt.add_pattern("*.clip.json")
+        allf = Gtk.FileFilter()
+        allf.set_name("All files")
+        allf.add_pattern("*")
+        store = Gio.ListStore.new(Gtk.FileFilter)
+        store.append(filt)
+        store.append(allf)
+        return store
+
+    def _on_open_project(self, *_args: object) -> None:
+        dialog = Gtk.FileDialog(title="Open project")
+        dialog.set_filters(self._project_dialog_filters())
+        filters = dialog.get_filters()
+        if filters is not None:
+            first = filters.get_item(0)
+            if first is not None:
+                dialog.set_default_filter(first)
+
+        def done(d: Gtk.FileDialog, result: Gio.AsyncResult) -> None:
+            try:
+                f = d.open_finish(result)
+            except GLib.Error:
+                return
+            path = Path(f.get_path() or "")
+            if path.is_file():
+                self._load_project_file(path)
+
+        dialog.open(self, None, done)
+
+    def _on_save(self, *_args: object) -> None:
+        if self.project_path is None:
+            self._on_save_as()
+            return
+        try:
+            write_project(self.project_path, self._current_project())
+            write_autosave(self._current_project())
+            self._update_title()
+            self._set_status(f"Saved {self.project_path.name}")
+        except OSError as exc:
+            self._set_status(f"Save failed: {exc}")
+
+    def _on_save_as(self, *_args: object) -> None:
+        dialog = Gtk.FileDialog(title="Save project as")
+        dialog.set_filters(self._project_dialog_filters())
+        stem = "untitled"
+        if self.video_path:
+            stem = self.video_path.stem
+            dialog.set_initial_folder(Gio.File.new_for_path(str(self.video_path.parent)))
+        elif self.project_path:
+            stem = self.project_path.name.removesuffix(".clip.json")
+            dialog.set_initial_folder(Gio.File.new_for_path(str(self.project_path.parent)))
+        dialog.set_initial_name(stem + ".clip.json")
+
+        def done(d: Gtk.FileDialog, result: Gio.AsyncResult) -> None:
+            try:
+                f = d.save_finish(result)
+            except GLib.Error:
+                return
+            path = Path(f.get_path() or "")
+            if not path.name:
+                return
+            try:
+                written = write_project(path, self._current_project())
+            except OSError as exc:
+                self._set_status(f"Save failed: {exc}")
+                return
+            self.project_path = written
+            self._update_title()
+            self._schedule_autosave()
+            self._set_status(f"Saved {written.name}")
+
+        dialog.save(self, None, done)
+
+    @staticmethod
+    def _wrapping_label(text: str) -> Gtk.Label:
+        # wrap=True alone only breaks on spaces; paths have none, so the
+        # sidebar grows. WORD_CHAR + a small width_chars keeps the panel
+        # at 320px and wraps at slashes and underscores.
+        lab = Gtk.Label(label=text, xalign=0)
+        lab.set_wrap(True)
+        lab.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        lab.set_hexpand(True)
+        lab.set_width_chars(24)
+        lab.set_max_width_chars(36)
+        lab.set_selectable(True)
+        return lab
 
     def _section(self, title: str) -> Gtk.Label:
         lab = Gtk.Label(label=title, xalign=0)
@@ -361,6 +608,7 @@ class EditorWindow(Adw.ApplicationWindow):
 
     def _on_close(self, *_args: object) -> bool:
         self._stop()
+        self._flush_autosave()
         return False
 
     def _refresh_crop(self) -> None:
@@ -380,6 +628,7 @@ class EditorWindow(Adw.ApplicationWindow):
             f"crop {crop.w}×{crop.h} at {crop.x},{crop.y}  →  {dw}×{dh}"
         )
         self._refresh_export_name()
+        self._schedule_autosave()
 
     def _refresh_export_name(self) -> None:
         if not self.video_path:
@@ -396,6 +645,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.btn_fit.set_sensitive(bool(self.audio_path))
         if not self.audio_path:
             self.btn_fit.set_label("Fit")
+            self._schedule_autosave()
             return
         name = self.audio_path.name
         dur = float(self.audio_info["duration"]) if self.audio_info else 0.0
@@ -408,6 +658,7 @@ class EditorWindow(Adw.ApplicationWindow):
             if self.audio_fit and not longer:
                 self.audio_fit = False
         self._refresh_crop()
+        self._schedule_autosave()
 
     def _pick(self, kind: str) -> None:
         dialog = Gtk.FileDialog(title="Open video" if kind == "video" else "Open audio")
@@ -474,6 +725,9 @@ class EditorWindow(Adw.ApplicationWindow):
         video_ext = {".mp4", ".mov", ".webm", ".mkv", ".m4v"}
         audio_ext = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".opus"}
         for p in dropped:
+            if p.name.endswith(".clip.json") or self._looks_like_project(p):
+                self._load_project_file(p)
+                continue
             ext = p.suffix.lower()
             if ext in video_ext:
                 self._open_path("video", p)
@@ -485,7 +739,18 @@ class EditorWindow(Adw.ApplicationWindow):
                 self._open_path("audio", p)
         return True
 
-    def _open_path(self, kind: str, path: Path) -> None:
+    def _looks_like_project(self, path: Path) -> bool:
+        if path.suffix.lower() != ".json":
+            return False
+        try:
+            import json
+
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        return isinstance(data, dict) and data.get("format") == "clip-editor-project"
+
+    def _open_path(self, kind: str, path: Path, *, from_project: bool = False) -> None:
         try:
             info = probe(path)
         except ProbeError as exc:
@@ -499,8 +764,9 @@ class EditorWindow(Adw.ApplicationWindow):
             self.video_path = path
             self.video_info = info
             dur = float(info["duration"] or 0)
-            self.in_spin.set_value(0)
-            self.out_spin.set_value(dur)
+            if not from_project:
+                self.in_spin.set_value(0)
+                self.out_spin.set_value(dur)
             self.scrub.set_range(0, max(dur, 0.01))
             self.scrub.set_value(0)
             self.scrub.set_sensitive(True)
@@ -513,8 +779,11 @@ class EditorWindow(Adw.ApplicationWindow):
                 self.preview.set_pixbuf(_load_frame(path))
             except (ProbeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
                 self._set_status(f"opened {path.name}, no preview frame ({exc})")
-            self.preview.pan_x = 0.5
-            self.preview.pan_y = 0.5
+            if not from_project:
+                self.preview.pan_x = 0.5
+                self.preview.pan_y = 0.5
+                self.in_spin.set_value(0)
+                self.out_spin.set_value(dur)
             self._load_media(path)
             extra = ""
             if not info.get("has_audio"):
@@ -526,7 +795,8 @@ class EditorWindow(Adw.ApplicationWindow):
                 return
             self.audio_path = path
             self.audio_info = info
-            self.audio_fit = False
+            if not from_project:
+                self.audio_fit = False
             self.btn_clear_audio.set_sensitive(True)
             self._set_status(f"Opened {path.name}")
             if self._audio_usable() > self._edit_dur() + 0.05:
@@ -534,6 +804,7 @@ class EditorWindow(Adw.ApplicationWindow):
                     f"Music is {self._audio_usable():.2f}s; video is {self._edit_dur():.2f}s. Fit cuts the extra."
                 )
         self._refresh_fit()
+        self._schedule_autosave()
 
     def _on_clear_audio(self, *_args: object) -> None:
         self.audio_path = None
@@ -584,16 +855,19 @@ class EditorWindow(Adw.ApplicationWindow):
                     self._vmedia.seek(int(max(0.0, value) * 1_000_000))
                 except GLib.Error:
                     pass
-            if self.audio_path:
-                self._start_preview_audio(value)
+            self._start_preview_audio(value)
         return False
 
     def _preview_cmd(self, at_s: float) -> list[str] | None:
-        if not self.audio_path:
-            return None
         remaining = max(0.05, self.out_spin.get_value() - at_s)
-        path = self.audio_path
-        start = self._audio_start() + (at_s - self.in_spin.get_value())
+        if self.audio_path:
+            path = self.audio_path
+            start = self._audio_start() + (at_s - self.in_spin.get_value())
+        elif self.video_path and self.video_info and self.video_info.get("has_audio"):
+            path = self.video_path
+            start = at_s
+        else:
+            return None
         start = max(0.0, start)
         # Same players Eagle Browse uses for audio preview. ffplay first —
         # Gtk.MediaFile/GStreamer is mute or abort here.
@@ -690,24 +964,22 @@ class EditorWindow(Adw.ApplicationWindow):
         if self._vmedia is not None:
             self._vmedia.pause()
         self._vmedia = None
-        self.live.set_paintable(None)
+        self.preview.set_media(None)
 
     def _load_media(self, path: Path) -> None:
         self._dispose_media()
         media = Gtk.MediaFile.new_for_filename(str(path))
         media.set_loop(False)
         self._vmedia = media
-        self.live.set_paintable(media)
 
     def _play_media_at(self, t: float) -> None:
         m = self._vmedia
         if m is None:
             return
-        mute = self.audio_path is not None
-
         def go(*_a: object) -> bool:
-            m.set_muted(mute)
-            m.set_volume(0.0 if mute else 1.0)
+            # Gtk.Picture is video-only; sound goes through ffplay/mpv.
+            m.set_muted(True)
+            m.set_volume(0.0)
             try:
                 m.seek(int(max(0.0, t) * 1_000_000))
             except GLib.Error:
@@ -732,7 +1004,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self._stop_preview_audio()
         if self._vmedia is not None:
             self._vmedia.pause()
-        self.preview_stack.set_visible_child_name("still")
+        self.preview.set_media(None)
         if self._tick is not None:
             GLib.source_remove(self._tick)
             self._tick = None
@@ -749,14 +1021,13 @@ class EditorWindow(Adw.ApplicationWindow):
             t = inn
         self._play_t0 = t
         self._play_mono = time.monotonic()
-        self.preview_stack.set_visible_child_name("live")
+        self.preview.set_media(self._vmedia)
         self._play_media_at(t)
-        if self.audio_path:
-            self._start_preview_audio(t)
-        elif self.video_info and not self.video_info.get("has_audio"):
+        self._start_preview_audio(t)
+        if not self.audio_path and not (
+            self.video_info and self.video_info.get("has_audio")
+        ):
             self._set_status("Playing · this clip is silent — add an audio track")
-        else:
-            self._set_status("Playing")
         self.playing = True
         self.btn_play.set_label("Pause")
         self._tick = GLib.timeout_add(50, self._on_tick)
@@ -769,6 +1040,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.scrub.set_value(t)
         self._syncing_scrub = False
         self.clock.set_text(f"{t:.2f} / {dur:.2f}")
+        self.preview.queue_draw()
         if t >= out - 0.02:
             self._stop()
             return False
@@ -843,6 +1115,9 @@ class EditorApp(Adw.Application):
         win = self.props.active_window
         if win is None:
             win = EditorWindow(application=self)
+            self.set_accels_for_action("win.save", ["<Control>s"])
+            self.set_accels_for_action("win.save-as", ["<Control><Shift>s"])
+            self.set_accels_for_action("win.open-project", ["<Control>o"])
         win.present()
 
 
