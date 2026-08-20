@@ -211,6 +211,37 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
         assert g["acodec"] == "aac", g
         assert g["width"] == 1080 and g["height"] == 1920, g
         assert 1.8 <= float(g["duration"]) <= 2.2, g
+
+        from clip_editor.export import _flatten_clips
+        from clip_editor.project import ClipInst
+
+        flat = _flatten_clips(
+            [
+                ClipInst(start=0.0, in_s=0.0, out_s=0.6),
+                ClipInst(start=0.3, in_s=0.0, out_s=0.6),
+            ],
+            2.0,
+        )
+        assert len(flat) == 2, flat
+        assert abs(flat[0][0] - 0.0) < 0.02 and abs(flat[0][1] - 0.3) < 0.02, flat
+        assert abs(flat[1][0] - 0.3) < 0.02 and abs(flat[1][1] - 0.9) < 0.02, flat
+
+        out2 = td_p / "out_two.mp4"
+        result2 = run_export(
+            video,
+            out2,
+            audio=None,
+            aspect="9:16",
+            in_s=0.0,
+            out_s=2.0,
+            video_clips=[
+                ClipInst(start=0.0, in_s=0.0, out_s=0.5),
+                ClipInst(start=0.6, in_s=0.0, out_s=0.5),
+            ],
+        )
+        g2 = result2["gate"]
+        assert g2["gate_ok"], g2
+        assert 1.0 <= float(g2["duration"]) <= 1.3, g2
         print("selftest ok")
         print(f"  crop {result['meta']['crop']}")
         print(f"  {g['width']}x{g['height']} {g['vcodec']}+{g['acodec']} {g['duration']:.3f}s")

@@ -17,13 +17,14 @@ gi.require_version("Adw", "1")
 gi.require_version("Gdk", "4.0")
 gi.require_version("GdkPixbuf", "2.0")
 
-from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Graphene, Gtk, Pango  # noqa: E402
+from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, GObject, Graphene, Gtk, Pango  # noqa: E402
 
 from clip_editor.aspects import ASPECTS, cover_crop, dest_size
 from clip_editor.eagle import apply_omarchy_theme, theme_rgb
 from clip_editor.export import ExportError, default_out_path, run_export
 from clip_editor.probe import ProbeError, probe, which_ffmpeg
 from clip_editor.project import (
+    ClipInst,
     Project,
     ProjectError,
     clear_autosave,
@@ -259,17 +260,25 @@ class Timeline(Gtk.DrawingArea):
         self.audio_kind = ""
         self.in_s = 0.0
         self.out_s = 0.0
+        self.vclips: list[ClipInst] = []
+        self.aclips: list[ClipInst] = []
+        self.sel_v = -1
+        self.sel_a = -1
         self.playhead = 0.0
         self.on_seek = None
         self.on_video_move = None
         self.on_audio_move = None
         self.on_video_trim = None
         self.on_audio_trim = None
+        self.on_place = None
+        self.on_select = None
         self._drag_mode = ""
+        self._drag_index = -1
         self._drag_v0 = 0.0
         self._drag_span = 0.0
         self._drag_inner = 1.0
         self._snap_line: float | None = None
+        self._drop_hover: tuple[str, float] | None = None
         self.set_hexpand(True)
         self.set_vexpand(False)
         self.set_content_width(200)
@@ -293,15 +302,24 @@ class Timeline(Gtk.DrawingArea):
         motion = Gtk.EventControllerMotion()
         motion.connect("motion", self._on_motion)
         self.add_controller(motion)
+        drop = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.COPY)
+        drop.set_preload(True)
+        drop.connect("enter", self._on_bin_enter)
+        drop.connect("motion", self._on_bin_motion)
+        drop.connect("leave", self._on_bin_leave)
+        drop.connect("drop", self._on_bin_drop)
+        self.add_controller(drop)
 
     def _recompute_span(self) -> None:
-        self.duration = max(
-            self.video_start + self.video_dur,
-            self.audio_start + self.audio_dur,
-            self.video_start + self.out_s,
-            0.0,
-        )
-        self.set_sensitive(self.duration > 0.04)
+        ends = [0.0]
+        for c in self.vclips:
+            ends.append(c.start + max(c.out_s, self.video_dur))
+            ends.append(c.start + c.out_s)
+        for c in self.aclips:
+            ends.append(c.start + max(c.out_s, self.audio_dur))
+            ends.append(c.start + c.out_s)
+        self.duration = max(ends)
+        self.set_sensitive(self.duration > 0.04 or bool(self.vclips or self.aclips))
 
     def set_duration(self, duration: float) -> None:
         self.video_dur = max(0.0, float(duration))
@@ -322,26 +340,58 @@ class Timeline(Gtk.DrawingArea):
         audio_in: float = 0.0,
         audio_out: float = 0.0,
         audio_kind: str = "",
+        vclips: list[ClipInst] | None = None,
+        aclips: list[ClipInst] | None = None,
+        sel_v: int = 0,
+        sel_a: int = 0,
     ) -> None:
         self.video_name = video_name
         self.video_dur = max(0.0, float(video_dur))
-        self.video_start = float(video_start)
         self.audio_name = audio_name
-        self.audio_start = float(audio_start)
         self.audio_dur = max(0.0, float(audio_dur))
-        self.audio_in = max(0.0, float(audio_in))
-        aout = float(audio_out) if audio_out else 0.0
-        self.audio_out = aout if aout > self.audio_in else self.audio_dur
         self.audio_kind = audio_kind
+        if vclips is not None:
+            self.vclips = [c.copy() for c in vclips]
+        elif video_dur > 0:
+            self.vclips = [
+                ClipInst(start=float(video_start), in_s=self.in_s, out_s=self.out_s or video_dur)
+            ]
+        else:
+            self.vclips = []
+        if aclips is not None:
+            self.aclips = [c.copy() for c in aclips]
+        elif audio_dur > 0:
+            aout = float(audio_out) if audio_out else audio_dur
+            self.aclips = [
+                ClipInst(start=float(audio_start), in_s=max(0.0, float(audio_in)), out_s=aout)
+            ]
+        else:
+            self.aclips = []
+        self.sel_v = sel_v if self.vclips else -1
+        self.sel_a = sel_a if self.aclips else -1
+        self._mirror_sel()
         self._recompute_span()
         self.queue_draw()
+
+    def _mirror_sel(self) -> None:
+        if 0 <= self.sel_v < len(self.vclips):
+            c = self.vclips[self.sel_v]
+            self.video_start = c.start
+            self.in_s = c.in_s
+            self.out_s = c.out_s
+        if 0 <= self.sel_a < len(self.aclips):
+            c = self.aclips[self.sel_a]
+            self.audio_start = c.start
+            self.audio_in = c.in_s
+            self.audio_out = c.out_s
 
     def set_range(self, in_s: float, out_s: float) -> None:
         self.in_s = max(0.0, float(in_s))
         self.out_s = max(self.in_s, float(out_s))
+        if 0 <= self.sel_v < len(self.vclips):
+            self.vclips[self.sel_v].in_s = self.in_s
+            self.vclips[self.sel_v].out_s = self.out_s
         self._recompute_span()
-        if self.duration > 0:
-            self.out_s = min(self.out_s, self.duration)
         self.queue_draw()
 
     def set_playhead(self, t: float) -> None:
@@ -362,19 +412,44 @@ class Timeline(Gtk.DrawingArea):
             return self._drag_span
         return self.duration
 
-    def _video_used(self) -> tuple[float, float]:
-        inn = max(0.0, self.in_s)
-        out = self.out_s if self.out_s > inn else self.video_dur
-        if self.video_dur > 0:
-            out = min(out, self.video_dur)
+    def _clip_used(self, c: ClipInst, src_dur: float) -> tuple[float, float]:
+        inn = max(0.0, c.in_s)
+        out = c.out_s if c.out_s > inn else src_dur
+        if src_dur > 0:
+            out = min(out, src_dur)
         return inn, max(inn, out)
 
+    def _clip_times(self, c: ClipInst, src_dur: float) -> tuple[float, float]:
+        inn, out = self._clip_used(c, src_dur)
+        return c.start + inn, c.start + out
+
+    def _video_used(self) -> tuple[float, float]:
+        c = self._vclip()
+        if c is None:
+            return 0.0, 0.0
+        return self._clip_used(c, self.video_dur)
+
     def _audio_used(self) -> tuple[float, float]:
-        inn = max(0.0, self.audio_in)
-        out = self.audio_out if self.audio_out > inn else self.audio_dur
-        if self.audio_dur > 0:
-            out = min(out, self.audio_dur)
-        return inn, max(inn, out)
+        c = self._aclip()
+        if c is None:
+            return 0.0, 0.0
+        return self._clip_used(c, self.audio_dur)
+
+    def _vclip(self, idx: int | None = None) -> ClipInst | None:
+        i = self._drag_index if idx is None and self._drag_mode.startswith("video") else idx
+        if i is None:
+            i = self.sel_v
+        if 0 <= i < len(self.vclips):
+            return self.vclips[i]
+        return None
+
+    def _aclip(self, idx: int | None = None) -> ClipInst | None:
+        i = self._drag_index if idx is None and self._drag_mode.startswith("audio") else idx
+        if i is None:
+            i = self.sel_a
+        if 0 <= i < len(self.aclips):
+            return self.aclips[i]
+        return None
 
     def _x_to_t(self, x: float) -> float:
         left, inner = self._inner(max(1.0, float(self.get_width())))
@@ -417,35 +492,53 @@ class Timeline(Gtk.DrawingArea):
             x1 - x0 <= 2 * self._EDGE and x0 - 2 <= x <= x1 + 2
         )
 
-    def _video_times(self) -> tuple[float, float]:
-        inn, out = self._video_used()
-        return self.video_start + inn, self.video_start + out
+    def _video_times(self, idx: int | None = None) -> tuple[float, float]:
+        c = self._vclip(idx)
+        if c is None:
+            return 0.0, 0.0
+        return self._clip_times(c, self.video_dur)
 
-    def _audio_times(self) -> tuple[float, float]:
-        inn, out = self._audio_used()
-        return self.audio_start + inn, self.audio_start + out
+    def _audio_times(self, idx: int | None = None) -> tuple[float, float]:
+        c = self._aclip(idx)
+        if c is None:
+            return 0.0, 0.0
+        return self._clip_times(c, self.audio_dur)
+
+    def _hit_lane_clip(
+        self, x: float, y: float, clips: list[ClipInst], src_dur: float, lane_y: float
+    ) -> tuple[int, str]:
+        if not self._in_lane(y, lane_y):
+            return -1, ""
+        for i in range(len(clips) - 1, -1, -1):
+            t0, t1 = self._clip_times(clips[i], src_dur)
+            edge = self._hit_edge(x, y, t0, t1, lane_y)
+            if edge:
+                return i, edge
+            if self._hit_clip(x, y, t0, t1, lane_y):
+                return i, "body"
+        return -1, ""
 
     def _hit_video(self, x: float, y: float) -> bool:
-        t0, t1 = self._video_times()
-        return self._hit_clip(x, y, t0, t1, self._RULER_H)
+        i, part = self._hit_lane_clip(x, y, self.vclips, self.video_dur, self._RULER_H)
+        return i >= 0 and part == "body"
 
     def _hit_audio(self, x: float, y: float) -> bool:
         if self.audio_kind == "source":
             return False
         a_y = self._RULER_H + self._LANE_H + self._LANE_GAP
-        t0, t1 = self._audio_times()
-        return self._hit_clip(x, y, t0, t1, a_y)
+        i, part = self._hit_lane_clip(x, y, self.aclips, self.audio_dur, a_y)
+        return i >= 0 and part == "body"
 
     def _hit_video_edge(self, x: float, y: float) -> str:
-        t0, t1 = self._video_times()
-        return self._hit_edge(x, y, t0, t1, self._RULER_H)
+        i, part = self._hit_lane_clip(x, y, self.vclips, self.video_dur, self._RULER_H)
+        return part if part in ("in", "out") else ""
 
     def _hit_audio_edge(self, x: float, y: float) -> str:
         if self.audio_kind == "source":
             return ""
         a_y = self._RULER_H + self._LANE_H + self._LANE_GAP
-        t0, t1 = self._audio_times()
-        return self._hit_edge(x, y, t0, t1, a_y)
+        i, part = self._hit_lane_clip(x, y, self.aclips, self.audio_dur, a_y)
+        return part if part in ("in", "out") else ""
 
     def _seek_x(self, x: float) -> None:
         t = self._x_to_t(x)
@@ -454,13 +547,27 @@ class Timeline(Gtk.DrawingArea):
         if callable(self.on_seek):
             self.on_seek(t)
 
+    def _select_hit(self, x: float, y: float) -> bool:
+        vi, vp = self._hit_lane_clip(x, y, self.vclips, self.video_dur, self._RULER_H)
+        if vi >= 0:
+            self.sel_v = vi
+            self._mirror_sel()
+            if callable(self.on_select):
+                self.on_select("video", vi)
+            return True
+        if self.audio_kind != "source":
+            a_y = self._RULER_H + self._LANE_H + self._LANE_GAP
+            ai, ap = self._hit_lane_clip(x, y, self.aclips, self.audio_dur, a_y)
+            if ai >= 0:
+                self.sel_a = ai
+                self._mirror_sel()
+                if callable(self.on_select):
+                    self.on_select("audio", ai)
+                return True
+        return False
+
     def _on_pressed(self, _g: Gtk.GestureClick, _n: int, x: float, y: float) -> None:
-        if (
-            self._hit_video_edge(x, y)
-            or self._hit_audio_edge(x, y)
-            or self._hit_video(x, y)
-            or self._hit_audio(x, y)
-        ):
+        if self._select_hit(x, y):
             return
         self._seek_x(x)
 
@@ -483,34 +590,52 @@ class Timeline(Gtk.DrawingArea):
         _left, inner = self._inner(max(1.0, float(self.get_width())))
         self._drag_inner = inner
         self._drag_span = max(self.duration, 0.01)
-        ved = self._hit_video_edge(ox, oy)
-        aed = self._hit_audio_edge(ox, oy)
-        if ved == "in":
-            self._drag_mode = "video-in"
-            self._drag_v0 = self.in_s
-            self.set_cursor_from_name("ew-resize")
-        elif ved == "out":
-            self._drag_mode = "video-out"
-            self._drag_v0 = self.out_s
-            self.set_cursor_from_name("ew-resize")
-        elif aed == "in":
-            self._drag_mode = "audio-in"
-            self._drag_v0 = self.audio_in
-            self.set_cursor_from_name("ew-resize")
-        elif aed == "out":
-            self._drag_mode = "audio-out"
-            self._drag_v0 = self.audio_out if self.audio_out > 0 else self.audio_dur
-            self.set_cursor_from_name("ew-resize")
-        elif self._hit_video(ox, oy):
-            self._drag_mode = "video"
-            self._drag_v0 = self.video_start
-            self.set_cursor_from_name("grabbing")
-        elif self._hit_audio(ox, oy):
-            self._drag_mode = "audio"
-            self._drag_v0 = self.audio_start
-            self.set_cursor_from_name("grabbing")
+        vi, vp = self._hit_lane_clip(ox, oy, self.vclips, self.video_dur, self._RULER_H)
+        a_y = self._RULER_H + self._LANE_H + self._LANE_GAP
+        ai, ap = (-1, "")
+        if self.audio_kind != "source":
+            ai, ap = self._hit_lane_clip(ox, oy, self.aclips, self.audio_dur, a_y)
+        if vp in ("in", "out", "body"):
+            self.sel_v = vi
+            self._drag_index = vi
+            c = self.vclips[vi]
+            self._mirror_sel()
+            if callable(self.on_select):
+                self.on_select("video", vi)
+            if vp == "in":
+                self._drag_mode = "video-in"
+                self._drag_v0 = c.in_s
+                self.set_cursor_from_name("ew-resize")
+            elif vp == "out":
+                self._drag_mode = "video-out"
+                self._drag_v0 = c.out_s
+                self.set_cursor_from_name("ew-resize")
+            else:
+                self._drag_mode = "video"
+                self._drag_v0 = c.start
+                self.set_cursor_from_name("grabbing")
+        elif ap in ("in", "out", "body"):
+            self.sel_a = ai
+            self._drag_index = ai
+            c = self.aclips[ai]
+            self._mirror_sel()
+            if callable(self.on_select):
+                self.on_select("audio", ai)
+            if ap == "in":
+                self._drag_mode = "audio-in"
+                self._drag_v0 = c.in_s
+                self.set_cursor_from_name("ew-resize")
+            elif ap == "out":
+                self._drag_mode = "audio-out"
+                self._drag_v0 = c.out_s if c.out_s > 0 else self.audio_dur
+                self.set_cursor_from_name("ew-resize")
+            else:
+                self._drag_mode = "audio"
+                self._drag_v0 = c.start
+                self.set_cursor_from_name("grabbing")
         else:
             self._drag_mode = "seek"
+            self._drag_index = -1
             self._seek_x(ox)
 
     def _dt(self, dx: float) -> float:
@@ -521,15 +646,20 @@ class Timeline(Gtk.DrawingArea):
         return max(0.04, self._SNAP_PX / inner * self._map_span())
 
     def _other_edges(self, which: str) -> list[float]:
-        if which == "video":
-            if self.audio_dur <= 0 or self.audio_kind == "source":
-                return []
-            t0, t1 = self._audio_times()
-        else:
-            if self.video_dur <= 0:
-                return []
-            t0, t1 = self._video_times()
-        return [t0, t1]
+        skip = self._drag_index
+        times: list[float] = []
+        for i, c in enumerate(self.vclips):
+            if which == "video" and i == skip:
+                continue
+            t0, t1 = self._clip_times(c, self.video_dur)
+            times += [t0, t1]
+        if self.audio_kind != "source":
+            for i, c in enumerate(self.aclips):
+                if which == "audio" and i == skip:
+                    continue
+                t0, t1 = self._clip_times(c, self.audio_dur)
+                times += [t0, t1]
+        return times
 
     def _snap_time(self, t: float, targets: list[float]) -> float:
         self._snap_line = None
@@ -574,68 +704,92 @@ class Timeline(Gtk.DrawingArea):
     def _on_drag_update(self, gesture: Gtk.GestureDrag, dx: float, _dy: float) -> None:
         dt = self._dt(dx)
         if self._drag_mode == "video-in":
-            _inn, out = self._video_used()
+            c = self._vclip()
+            if c is None:
+                return
+            _inn, out = self._clip_used(c, self.video_dur)
             raw = min(max(0.0, self._drag_v0 + dt), out - self._MIN)
-            snapped = self._snap_time(self.video_start + raw, self._other_edges("video"))
-            self.in_s = min(max(0.0, snapped - self.video_start), out - self._MIN)
-            if abs((self.video_start + self.in_s) - snapped) > 1e-4:
+            snapped = self._snap_time(c.start + raw, self._other_edges("video"))
+            c.in_s = min(max(0.0, snapped - c.start), out - self._MIN)
+            self.in_s = c.in_s
+            if abs((c.start + c.in_s) - snapped) > 1e-4:
                 self._snap_line = None
             if callable(self.on_video_trim):
-                self.on_video_trim(self.in_s, out, False)
+                self.on_video_trim(self._drag_index, c.in_s, out, False)
             self.queue_draw()
             return
         if self._drag_mode == "video-out":
-            inn, _out = self._video_used()
+            c = self._vclip()
+            if c is None:
+                return
+            inn, _out = self._clip_used(c, self.video_dur)
             top = self.video_dur if self.video_dur > 0 else self._drag_v0 + dt
             raw = max(inn + self._MIN, min(top, self._drag_v0 + dt))
-            snapped = self._snap_time(self.video_start + raw, self._other_edges("video"))
-            self.out_s = max(inn + self._MIN, min(top, snapped - self.video_start))
-            if abs((self.video_start + self.out_s) - snapped) > 1e-4:
+            snapped = self._snap_time(c.start + raw, self._other_edges("video"))
+            c.out_s = max(inn + self._MIN, min(top, snapped - c.start))
+            self.out_s = c.out_s
+            if abs((c.start + c.out_s) - snapped) > 1e-4:
                 self._snap_line = None
             if callable(self.on_video_trim):
-                self.on_video_trim(inn, self.out_s, False)
+                self.on_video_trim(self._drag_index, inn, c.out_s, False)
             self.queue_draw()
             return
         if self._drag_mode == "audio-in":
-            _ain, aout = self._audio_used()
+            c = self._aclip()
+            if c is None:
+                return
+            _ain, aout = self._clip_used(c, self.audio_dur)
             raw = min(max(0.0, self._drag_v0 + dt), aout - self._MIN)
-            snapped = self._snap_time(self.audio_start + raw, self._other_edges("audio"))
-            self.audio_in = min(max(0.0, snapped - self.audio_start), aout - self._MIN)
-            if abs((self.audio_start + self.audio_in) - snapped) > 1e-4:
+            snapped = self._snap_time(c.start + raw, self._other_edges("audio"))
+            c.in_s = min(max(0.0, snapped - c.start), aout - self._MIN)
+            self.audio_in = c.in_s
+            if abs((c.start + c.in_s) - snapped) > 1e-4:
                 self._snap_line = None
             if callable(self.on_audio_trim):
-                self.on_audio_trim(self.audio_in, aout, False)
+                self.on_audio_trim(self._drag_index, c.in_s, aout, False)
             self.queue_draw()
             return
         if self._drag_mode == "audio-out":
-            ain, _aout = self._audio_used()
+            c = self._aclip()
+            if c is None:
+                return
+            ain, _aout = self._clip_used(c, self.audio_dur)
             top = self.audio_dur if self.audio_dur > 0 else self._drag_v0 + dt
             raw = max(ain + self._MIN, min(top, self._drag_v0 + dt))
-            snapped = self._snap_time(self.audio_start + raw, self._other_edges("audio"))
-            self.audio_out = max(ain + self._MIN, min(top, snapped - self.audio_start))
-            if abs((self.audio_start + self.audio_out) - snapped) > 1e-4:
+            snapped = self._snap_time(c.start + raw, self._other_edges("audio"))
+            c.out_s = max(ain + self._MIN, min(top, snapped - c.start))
+            self.audio_out = c.out_s
+            if abs((c.start + c.out_s) - snapped) > 1e-4:
                 self._snap_line = None
             if callable(self.on_audio_trim):
-                self.on_audio_trim(ain, self.audio_out, False)
+                self.on_audio_trim(self._drag_index, ain, c.out_s, False)
             self.queue_draw()
             return
         if self._drag_mode in ("video", "audio"):
             if self._drag_mode == "video":
-                inn, out = self._video_used()
+                c = self._vclip()
+                if c is None:
+                    return
+                inn, out = self._clip_used(c, self.video_dur)
                 start = max(-inn, self._drag_v0 + dt)
                 start = self._snap_move(start, inn, out, self._other_edges("video"))
                 start = max(-inn, start)
+                c.start = start
                 self.video_start = start
                 if callable(self.on_video_move):
-                    self.on_video_move(start, False)
+                    self.on_video_move(self._drag_index, start, False)
             else:
-                inn, out = self._audio_used()
+                c = self._aclip()
+                if c is None:
+                    return
+                inn, out = self._clip_used(c, self.audio_dur)
                 start = max(-inn, self._drag_v0 + dt)
                 start = self._snap_move(start, inn, out, self._other_edges("audio"))
                 start = max(-inn, start)
+                c.start = start
                 self.audio_start = start
                 if callable(self.on_audio_move):
-                    self.on_audio_move(start, False)
+                    self.on_audio_move(self._drag_index, start, False)
             self.queue_draw()
             return
         ok, ox, _oy = gesture.get_start_point()
@@ -647,27 +801,102 @@ class Timeline(Gtk.DrawingArea):
         self._drag_mode = ""
         self._snap_line = None
         self._recompute_span()
+        idx = self._drag_index
+        self._drag_index = -1
         if mode == "video":
             self.set_cursor_from_name("grab")
-            if callable(self.on_video_move):
-                self.on_video_move(self.video_start, True)
+            c = self._vclip(idx)
+            if c is not None and callable(self.on_video_move):
+                self.on_video_move(idx, c.start, True)
         elif mode == "audio":
             self.set_cursor_from_name("grab")
-            if callable(self.on_audio_move):
-                self.on_audio_move(self.audio_start, True)
+            c = self._aclip(idx)
+            if c is not None and callable(self.on_audio_move):
+                self.on_audio_move(idx, c.start, True)
         elif mode in ("video-in", "video-out"):
             self.set_cursor_from_name("ew-resize")
-            inn, out = self._video_used()
-            if callable(self.on_video_trim):
-                self.on_video_trim(inn, out, True)
+            c = self._vclip(idx)
+            if c is not None and callable(self.on_video_trim):
+                inn, out = self._clip_used(c, self.video_dur)
+                self.on_video_trim(idx, inn, out, True)
         elif mode in ("audio-in", "audio-out"):
             self.set_cursor_from_name("ew-resize")
-            inn, out = self._audio_used()
-            if callable(self.on_audio_trim):
-                self.on_audio_trim(inn, out, True)
+            c = self._aclip(idx)
+            if c is not None and callable(self.on_audio_trim):
+                inn, out = self._clip_used(c, self.audio_dur)
+                self.on_audio_trim(idx, inn, out, True)
         elif mode == "seek" and callable(self.on_seek):
             self.on_seek(self.playhead)
         self.queue_draw()
+
+    def _drop_kind(self, target: Gtk.DropTarget) -> str:
+        try:
+            val = target.get_value()
+        except (GLib.Error, ValueError, TypeError):
+            return ""
+        if val is None:
+            return ""
+        text = str(val).strip().lower()
+        if text in ("video", "audio"):
+            return text
+        return ""
+
+    def _bin_action(self, target: Gtk.DropTarget, x: float, y: float) -> Gdk.DragAction:
+        kind = self._drop_kind(target)
+        t = self._x_to_t(x)
+        v_y = self._RULER_H
+        a_y = self._RULER_H + self._LANE_H + self._LANE_GAP
+        hover: tuple[str, float] | None = None
+        action = Gdk.DragAction(0)
+        if kind == "video" and self._in_lane(y, v_y) and self.video_dur > 0:
+            hover = ("video", t)
+            action = Gdk.DragAction.COPY
+        elif (
+            kind == "audio"
+            and self._in_lane(y, a_y)
+            and self.audio_kind == "replace"
+            and self.audio_dur > 0
+        ):
+            hover = ("audio", t)
+            action = Gdk.DragAction.COPY
+        if hover != self._drop_hover:
+            self._drop_hover = hover
+            self.queue_draw()
+        return action
+
+    def _on_bin_enter(self, target: Gtk.DropTarget, x: float, y: float) -> Gdk.DragAction:
+        kind = self._drop_kind(target)
+        if kind not in ("video", "audio") and kind:
+            return Gdk.DragAction(0)
+        action = self._bin_action(target, x, y)
+        if int(action):
+            return action
+        return Gdk.DragAction.COPY
+
+    def _on_bin_motion(self, target: Gtk.DropTarget, x: float, y: float) -> Gdk.DragAction:
+        return self._bin_action(target, x, y)
+
+    def _on_bin_leave(self, _t: Gtk.DropTarget) -> None:
+        if self._drop_hover is not None:
+            self._drop_hover = None
+            self.queue_draw()
+
+    def _on_bin_drop(self, _t: Gtk.DropTarget, value: object, x: float, y: float) -> bool:
+        kind = str(value or "").strip().lower()
+        t = self._x_to_t(x)
+        v_y = self._RULER_H
+        a_y = self._RULER_H + self._LANE_H + self._LANE_GAP
+        self._drop_hover = None
+        self.queue_draw()
+        if kind == "video" and self._in_lane(y, v_y):
+            if callable(self.on_place):
+                self.on_place("video", t)
+            return True
+        if kind == "audio" and self._in_lane(y, a_y) and self.audio_kind == "replace":
+            if callable(self.on_place):
+                self.on_place("audio", t)
+            return True
+        return False
 
     def _draw_clip(
         self,
@@ -743,50 +972,72 @@ class Timeline(Gtk.DrawingArea):
 
         clip_y = 3.0
         clip_h = self._LANE_H - 6
-        if self.video_dur > 0:
-            gx0 = self._t_to_x(self.video_start, width)
-            gx1 = self._t_to_x(self.video_start + self.video_dur, width)
+        for i, c in enumerate(self.vclips):
+            inn, out = self._clip_used(c, self.video_dur)
+            gx0 = self._t_to_x(c.start, width)
+            gx1 = self._t_to_x(c.start + self.video_dur, width)
             self._draw_clip(cr, gx0, v_y + clip_y, max(3.0, gx1 - gx0), clip_h, sel, "", 0.28)
-            inn, out = self._video_used()
-            x0 = self._t_to_x(self.video_start + inn, width)
-            x1 = self._t_to_x(self.video_start + out, width)
+            x0 = self._t_to_x(c.start + inn, width)
+            x1 = self._t_to_x(c.start + out, width)
+            name = self.video_name if i == self.sel_v or len(self.vclips) == 1 else ""
             self._draw_clip(
-                cr, x0, v_y + clip_y, max(3.0, x1 - x0), clip_h, sel, self.video_name
+                cr, x0, v_y + clip_y, max(3.0, x1 - x0), clip_h, sel, name
             )
             self._draw_handles(cr, x0, x1, v_y + clip_y, clip_h, fg)
+            if i == self.sel_v:
+                cr.set_source_rgb(*fg)
+                cr.set_line_width(1)
+                cr.rectangle(x0, v_y + clip_y, max(3.0, x1 - x0), clip_h)
+                cr.stroke()
 
-        if self.audio_dur > 0:
-            color = green if self.audio_kind != "source" else muted
-            gx0 = self._t_to_x(self.audio_start, width)
-            gx1 = self._t_to_x(self.audio_start + self.audio_dur, width)
+        color = green if self.audio_kind != "source" else muted
+        for i, c in enumerate(self.aclips):
+            inn, out = self._clip_used(c, self.audio_dur)
+            gx0 = self._t_to_x(c.start, width)
+            gx1 = self._t_to_x(c.start + self.audio_dur, width)
             self._draw_clip(cr, gx0, a_y + clip_y, max(3.0, gx1 - gx0), clip_h, color, "", 0.28)
-            inn, out = self._audio_used()
-            x0 = self._t_to_x(self.audio_start + inn, width)
-            x1 = self._t_to_x(self.audio_start + out, width)
+            x0 = self._t_to_x(c.start + inn, width)
+            x1 = self._t_to_x(c.start + out, width)
+            name = self.audio_name if i == self.sel_a or len(self.aclips) == 1 else ""
             self._draw_clip(
-                cr, x0, a_y + clip_y, max(3.0, x1 - x0), clip_h, color, self.audio_name
+                cr, x0, a_y + clip_y, max(3.0, x1 - x0), clip_h, color, name
             )
             if self.audio_kind != "source":
                 self._draw_handles(cr, x0, x1, a_y + clip_y, clip_h, fg)
+            if i == self.sel_a:
+                cr.set_source_rgb(*fg)
+                cr.set_line_width(1)
+                cr.rectangle(x0, a_y + clip_y, max(3.0, x1 - x0), clip_h)
+                cr.stroke()
 
-        if self.duration > 0 and self.out_s > self.in_s:
-            x_in = self._t_to_x(self.video_start + self.in_s, width)
-            x_out = self._t_to_x(self.video_start + self.out_s, width)
-            cr.set_source_rgba(*bg, 0.55)
-            if x_in > left:
-                cr.rectangle(left, v_y, x_in - left, lanes_bottom - v_y)
-                cr.fill()
-            right_end = left + inner
-            if x_out < right_end:
-                cr.rectangle(x_out, v_y, right_end - x_out, lanes_bottom - v_y)
-                cr.fill()
-            cr.set_source_rgb(*fg)
-            cr.set_line_width(2)
-            cr.move_to(x_in, v_y - 2)
-            cr.line_to(x_in, lanes_bottom + 2)
-            cr.move_to(x_out, v_y - 2)
-            cr.line_to(x_out, lanes_bottom + 2)
-            cr.stroke()
+        if self._drop_hover is not None:
+            kind, t = self._drop_hover
+            if kind == "video" and self.video_dur > 0:
+                gx0 = self._t_to_x(t, width)
+                gx1 = self._t_to_x(t + self.video_dur, width)
+                self._draw_clip(
+                    cr, gx0, v_y + clip_y, max(3.0, gx1 - gx0), clip_h, sel, "", 0.5
+                )
+            elif kind == "audio" and self.audio_dur > 0:
+                gx0 = self._t_to_x(t, width)
+                gx1 = self._t_to_x(t + self.audio_dur, width)
+                self._draw_clip(
+                    cr, gx0, a_y + clip_y, max(3.0, gx1 - gx0), clip_h, green, "", 0.5
+                )
+
+        if 0 <= self.sel_v < len(self.vclips):
+            c = self.vclips[self.sel_v]
+            inn, out = self._clip_used(c, self.video_dur)
+            if out > inn:
+                x_in = self._t_to_x(c.start + inn, width)
+                x_out = self._t_to_x(c.start + out, width)
+                cr.set_source_rgb(*fg)
+                cr.set_line_width(1)
+                cr.move_to(x_in, v_y - 2)
+                cr.line_to(x_in, lanes_bottom + 2)
+                cr.move_to(x_out, v_y - 2)
+                cr.line_to(x_out, lanes_bottom + 2)
+                cr.stroke()
 
         cr.set_source_rgb(*muted)
         cr.set_line_width(1)
@@ -840,6 +1091,129 @@ class Timeline(Gtk.DrawingArea):
             cr.show_text(label)
 
 
+class MediaCard(Gtk.Box):
+    """One video or audio slot in the lower-right media box."""
+
+    def __init__(self) -> None:
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.add_css_class("card")
+        self.set_margin_start(4)
+        self.set_margin_end(4)
+        self.set_margin_top(2)
+        self.set_margin_bottom(2)
+        self._kind = "empty"
+        self._payload = ""
+        drag = Gtk.DragSource()
+        drag.set_actions(Gdk.DragAction.COPY)
+        drag.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        drag.connect("prepare", self._drag_prepare)
+        drag.connect("drag-begin", self._drag_begin)
+        self.add_controller(drag)
+        self._swatch = Gtk.DrawingArea()
+        self._swatch.set_content_width(5)
+        self._swatch.set_hexpand(False)
+        self._swatch.set_draw_func(self._draw_swatch)
+        self.append(self._swatch)
+        self.picture = Gtk.Picture()
+        self.picture.set_content_fit(Gtk.ContentFit.COVER)
+        self.picture.set_size_request(72, 48)
+        self.picture.set_can_shrink(True)
+        self.append(self.picture)
+        self.icon = Gtk.Image.new_from_icon_name("audio-x-generic-symbolic")
+        self.icon.set_pixel_size(28)
+        self.icon.set_valign(Gtk.Align.CENTER)
+        self.append(self.icon)
+        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        texts.set_hexpand(True)
+        texts.set_valign(Gtk.Align.CENTER)
+        self.title = Gtk.Label(xalign=0)
+        self.title.set_wrap(True)
+        self.title.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        self.title.set_max_width_chars(22)
+        self.meta = Gtk.Label(xalign=0)
+        self.meta.add_css_class("dim-label")
+        self.meta.set_wrap(True)
+        self.meta.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        self.meta.set_max_width_chars(22)
+        texts.append(self.title)
+        texts.append(self.meta)
+        self.append(texts)
+        self.set_empty("none")
+
+    def _drag_prepare(self, _s: Gtk.DragSource, _x: float, _y: float) -> Gdk.ContentProvider | None:
+        if not self._payload:
+            return None
+        typed = Gdk.ContentProvider.new_for_value(self._payload)
+        raw = Gdk.ContentProvider.new_for_bytes(
+            "text/plain", GLib.Bytes.new(self._payload.encode("utf-8"))
+        )
+        return Gdk.ContentProvider.new_union([typed, raw])
+
+    def _drag_begin(self, source: Gtk.DragSource, _drag: Gdk.Drag) -> None:
+        source.set_icon(Gtk.WidgetPaintable.new(self), 16, 16)
+
+    def _draw_swatch(self, _area: Gtk.DrawingArea, cr, width: int, height: int) -> None:  # noqa: ANN001
+        keys = {
+            "video": ("accent", (0.49, 0.51, 0.85)),
+            "audio": ("green", (0.22, 0.62, 0.45)),
+            "source": ("muted", (0.43, 0.49, 0.71)),
+            "empty": ("muted", (0.43, 0.49, 0.71)),
+        }
+        name, fb = keys.get(self._kind, keys["empty"])
+        cr.set_source_rgb(*theme_rgb(name, fb))
+        cr.rectangle(0, 0, width, height)
+        cr.fill()
+
+    def set_empty(self, text: str) -> None:
+        self._kind = "empty"
+        self._payload = ""
+        self.title.set_text(text)
+        self.meta.set_text("")
+        self.picture.set_paintable(None)
+        self.picture.set_visible(False)
+        self.icon.set_visible(False)
+        self._swatch.queue_draw()
+        self.set_tooltip_text("")
+        self.set_cursor_from_name(None)
+
+    def set_item(
+        self,
+        *,
+        kind: str,
+        title: str,
+        meta: str,
+        pixbuf: GdkPixbuf.Pixbuf | None = None,
+        tooltip: str = "",
+    ) -> None:
+        self._kind = kind
+        self._payload = "video" if kind == "video" else ("audio" if kind == "audio" else "")
+        self.title.set_text(title)
+        self.meta.set_text(meta)
+        if pixbuf is not None:
+            if pixbuf.get_width() > 96:
+                scale = 96 / pixbuf.get_width()
+                pixbuf = pixbuf.scale_simple(
+                    96,
+                    max(1, int(pixbuf.get_height() * scale)),
+                    GdkPixbuf.InterpType.BILINEAR,
+                )
+            self.picture.set_paintable(Gdk.Texture.new_for_pixbuf(pixbuf))
+            self.picture.set_visible(True)
+            self.icon.set_visible(False)
+        else:
+            self.picture.set_paintable(None)
+            self.picture.set_visible(False)
+            self.icon.set_visible(kind in ("audio", "source"))
+        hint = ""
+        if kind == "video":
+            hint = "Drag onto the V track to place a copy"
+        elif kind == "audio":
+            hint = "Drag onto the A track to place a copy"
+        self.set_tooltip_text("\n".join(p for p in (tooltip, hint) if p))
+        self.set_cursor_from_name("grab" if self._payload else None)
+        self._swatch.queue_draw()
+
+
 class EditorWindow(Adw.ApplicationWindow):
     def __init__(self, **kwargs: object) -> None:
         super().__init__(**kwargs)
@@ -856,6 +1230,10 @@ class EditorWindow(Adw.ApplicationWindow):
         self.audio_start = 0.0
         self.audio_in = 0.0
         self.audio_out: float | None = None
+        self.video_clips: list[ClipInst] = []
+        self.audio_clips: list[ClipInst] = []
+        self.sel_v = -1
+        self.sel_a = -1
         self._clip_playing = False
         self._audio_pending = False
         self.project_path: Path | None = None
@@ -936,12 +1314,12 @@ class EditorWindow(Adw.ApplicationWindow):
         self.timeline.on_audio_move = self._on_audio_move
         self.timeline.on_video_trim = self._on_video_trim
         self.timeline.on_audio_trim = self._on_audio_trim
+        self.timeline.on_place = self._place_clip
+        self.timeline.on_select = self._on_clip_select
         left.append(self.timeline)
 
         right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        right.set_size_request(320, -1)
-        right.set_hexpand(False)
-        right.set_hexpand_set(True)
+        right.set_margin_end(4)
 
         right.append(self._section("Video"))
         row = Gtk.Box(spacing=8)
@@ -1029,8 +1407,25 @@ class EditorWindow(Adw.ApplicationWindow):
         self.status.add_css_class("dim-label")
         right.append(self.status)
 
+        right.append(self._section("Media"))
+        media = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.media_video = MediaCard()
+        self.media_audio = MediaCard()
+        media.append(self.media_video)
+        media.append(self.media_audio)
+        right.append(media)
+        self._install_drop(media)
+
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_propagate_natural_width(True)
+        scroller.set_min_content_width(320)
+        scroller.set_hexpand(False)
+        scroller.set_hexpand_set(True)
+        scroller.set_child(right)
+
         root.append(left)
-        root.append(right)
+        root.append(scroller)
         toolbar.set_content(root)
         self.set_content(toolbar)
         self.connect("close-request", self._on_close)
@@ -1114,6 +1509,8 @@ class EditorWindow(Adw.ApplicationWindow):
             round(float(p.audio_start), 3),
             round(float(p.audio_in), 3),
             None if p.audio_out is None else round(float(p.audio_out), 3),
+            tuple((round(c.start, 3), round(c.in_s, 3), round(c.out_s, 3)) for c in p.video_clips),
+            tuple((round(c.start, 3), round(c.in_s, 3), round(c.out_s, 3)) for c in p.audio_clips),
             bool(p.audio_follows_in),
             bool(p.audio_fit),
             str(p.path) if p.path else "",
@@ -1215,6 +1612,8 @@ class EditorWindow(Adw.ApplicationWindow):
             audio_start=self.audio_start,
             audio_in=self.audio_in,
             audio_out=self.audio_out,
+            video_clips=[c.copy() for c in self.video_clips],
+            audio_clips=[c.copy() for c in self.audio_clips],
             audio_follows_in=self.follow_in.get_active(),
             audio_fit=self.audio_fit,
             path=self.project_path,
@@ -1266,6 +1665,9 @@ class EditorWindow(Adw.ApplicationWindow):
         self.crop_label.set_text("")
         self.export_name.set_text("name is assigned on export (.mp4)")
         self.export_name.set_tooltip_text("")
+        self.video_clips = []
+        self.sel_v = -1
+        self._refresh_media()
 
     def _unload_audio(self) -> None:
         self.audio_path = None
@@ -1278,6 +1680,9 @@ class EditorWindow(Adw.ApplicationWindow):
         self.audio_start = 0.0
         self.audio_in = 0.0
         self.audio_out = None
+        self.audio_clips = []
+        self.sel_a = -1
+        self._refresh_media()
 
     def _apply_project(self, proj: Project) -> None:
         self._loading = True
@@ -1317,6 +1722,20 @@ class EditorWindow(Adw.ApplicationWindow):
             self.audio_start = float(proj.audio_start or 0.0)
             self.audio_in = max(0.0, float(proj.audio_in or 0.0))
             self.audio_out = proj.audio_out
+            self.video_clips = [c.copy() for c in proj.video_clips]
+            self.audio_clips = [c.copy() for c in proj.audio_clips]
+            if self.video_path and not self.video_clips:
+                dur = float((self.video_info or {}).get("duration") or 0)
+                self.video_clips = [
+                    ClipInst(start=self.video_start, in_s=self.in_spin.get_value(), out_s=self.out_spin.get_value() or dur)
+                ]
+            if self.audio_path and not self.audio_clips:
+                dur = float((self.audio_info or {}).get("duration") or 0)
+                self.audio_clips = [
+                    ClipInst(start=self.audio_start, in_s=self.audio_in, out_s=self.audio_out or dur)
+                ]
+            self.sel_v = 0 if self.video_clips else -1
+            self.sel_a = 0 if self.audio_clips else -1
             self.project_path = proj.path
             self._refresh_fit()
             self._update_title()
@@ -1382,6 +1801,10 @@ class EditorWindow(Adw.ApplicationWindow):
         self.audio_start = 0.0
         self.audio_in = 0.0
         self.audio_out = None
+        self.video_clips = []
+        self.audio_clips = []
+        self.sel_v = -1
+        self.sel_a = -1
         self.btn_play.set_label("Play")
         self.progress.set_fraction(0)
         self.timeline.set_clips()
@@ -1389,6 +1812,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.timeline.set_range(0.0, 0.0)
         self.timeline.set_duration(0.0)
         self.preview.set_blank(False)
+        self._refresh_media()
 
     def _on_new_project(self, *_args: object) -> None:
         if self.exporting:
@@ -1509,7 +1933,15 @@ class EditorWindow(Adw.ApplicationWindow):
         return max(0.0, float(self.audio_info["duration"]) - self._audio_start())
 
     def _program_end(self) -> float:
-        return max(self.video_start + self.out_spin.get_value(), 0.05)
+        ends = [0.05]
+        for c in self.video_clips:
+            _inn, out = c.used()
+            if out <= _inn:
+                out = float((self.video_info or {}).get("duration") or 0)
+            ends.append(c.start + out)
+        for c in self.audio_clips:
+            ends.append(c.start + c.out_s)
+        return max(ends)
 
     def _timeline_now(self) -> float:
         if self.playing:
@@ -1530,7 +1962,7 @@ class EditorWindow(Adw.ApplicationWindow):
     def _install_drop(self, widget: Gtk.Widget) -> None:
         actions = Gdk.DragAction.COPY | Gdk.DragAction.MOVE
         dt = Gtk.DropTarget.new(Gdk.FileList, actions)
-        dt.set_gtypes([Gdk.FileList, Gio.File, str])
+        dt.set_gtypes([Gdk.FileList, Gio.File])
         dt.set_preload(True)
         dt.connect("enter", self._on_drop_enter)
         dt.connect("drop", self._on_drop)
@@ -1577,31 +2009,45 @@ class EditorWindow(Adw.ApplicationWindow):
     def _sync_timeline_clips(self) -> None:
         vname = self.video_path.name if self.video_path else ""
         vdur = float((self.video_info or {}).get("duration") or 0)
-        if self.follow_in.get_active() and self.audio_path:
-            self.audio_start = self.video_start
+        if self.follow_in.get_active() and self.audio_clips and self.video_clips:
+            vs = self.video_clips[self.sel_v] if 0 <= self.sel_v < len(self.video_clips) else self.video_clips[0]
+            if 0 <= self.sel_a < len(self.audio_clips):
+                self.audio_clips[self.sel_a].start = vs.start
+                self.audio_start = vs.start
         if self.audio_path and self.audio_info:
             aname = self.audio_path.name
             adur = float(self.audio_info.get("duration") or 0)
-            astart = self.audio_start
-            if self.audio_out is None or self.audio_out <= self.audio_in:
-                self.audio_out = adur
+            for c in self.audio_clips:
+                if c.out_s <= c.in_s:
+                    c.out_s = adur
             kind = "replace"
+            if not self.audio_clips:
+                self.audio_clips = [ClipInst(start=self.audio_start, in_s=self.audio_in, out_s=adur)]
+                self.sel_a = 0
         elif self.video_info and self.video_info.get("has_audio"):
             aname = "video soundtrack"
             adur = vdur
-            astart = self.video_start
             kind = "source"
+            self.audio_clips = []
         else:
             aname = ""
             adur = 0.0
-            astart = 0.0
             kind = ""
+            self.audio_clips = []
+        if 0 <= self.sel_v < len(self.video_clips):
+            c = self.video_clips[self.sel_v]
+            self.video_start = c.start
+        if 0 <= self.sel_a < len(self.audio_clips):
+            c = self.audio_clips[self.sel_a]
+            self.audio_start = c.start
+            self.audio_in = c.in_s
+            self.audio_out = c.out_s
         self.timeline.set_clips(
             video_name=vname,
             video_dur=vdur,
             video_start=self.video_start,
             audio_name=aname,
-            audio_start=astart,
+            audio_start=self.audio_start,
             audio_dur=adur,
             audio_in=self.audio_in if kind == "replace" else 0.0,
             audio_out=(
@@ -1610,10 +2056,52 @@ class EditorWindow(Adw.ApplicationWindow):
                 else adur
             ),
             audio_kind=kind,
+            vclips=self.video_clips,
+            aclips=self.audio_clips if kind == "replace" else [],
+            sel_v=self.sel_v,
+            sel_a=self.sel_a,
         )
-        self.timeline.set_range(self.in_spin.get_value(), self.out_spin.get_value())
+        if 0 <= self.sel_v < len(self.video_clips):
+            c = self.video_clips[self.sel_v]
+            self.timeline.set_range(c.in_s, c.out_s)
+        self._refresh_media()
+
+    def _refresh_media(self) -> None:
+        if self.video_path and self.video_info:
+            info = self.video_info
+            dur = float(info.get("duration") or 0)
+            self.media_video.set_item(
+                kind="video",
+                title=self.video_path.name,
+                meta=f"{info.get('width')}×{info.get('height')} · {dur:.2f}s",
+                pixbuf=self.preview.pixbuf,
+                tooltip=str(self.video_path),
+            )
+        else:
+            self.media_video.set_empty("none")
+        if self.audio_path and self.audio_info:
+            dur = float(self.audio_info.get("duration") or 0)
+            self.media_audio.set_item(
+                kind="audio",
+                title=self.audio_path.name,
+                meta=f"{dur:.2f}s",
+                tooltip=str(self.audio_path),
+            )
+        elif self.video_info and self.video_info.get("has_audio"):
+            dur = float(self.video_info.get("duration") or 0)
+            self.media_audio.set_item(
+                kind="source",
+                title="video soundtrack",
+                meta=f"{dur:.2f}s",
+                tooltip="audio from the video file",
+            )
+        else:
+            self.media_audio.set_empty("none")
 
     def _refresh_fit(self) -> None:
+        if 0 <= self.sel_v < len(self.video_clips) and not self._loading:
+            self.video_clips[self.sel_v].in_s = self.in_spin.get_value()
+            self.video_clips[self.sel_v].out_s = self.out_spin.get_value()
         v = self._edit_dur()
         a = self._audio_usable()
         longer = bool(self.audio_path) and a > v + 0.05 and v > 0.04
@@ -1697,6 +2185,8 @@ class EditorWindow(Adw.ApplicationWindow):
         return out
 
     def _on_drop(self, _t: Gtk.DropTarget, value: object, _x: float, _y: float) -> bool:
+        if isinstance(value, str) and value.strip().lower() in ("video", "audio"):
+            return False
         dropped = self._paths_from_drop(value)
         if not dropped:
             return False
@@ -1747,6 +2237,8 @@ class EditorWindow(Adw.ApplicationWindow):
                 self.in_spin.set_value(0)
                 self.out_spin.set_value(dur)
                 self.video_start = 0.0
+                self.video_clips = [ClipInst(start=0.0, in_s=0.0, out_s=dur)]
+                self.sel_v = 0
             self.timeline.set_duration(dur)
             self.timeline.set_playhead(self.video_start)
             self.timeline.set_range(
@@ -1785,6 +2277,10 @@ class EditorWindow(Adw.ApplicationWindow):
                 )
                 self.audio_in = 0.0
                 self.audio_out = float(info.get("duration") or 0)
+                self.audio_clips = [
+                    ClipInst(start=self.audio_start, in_s=0.0, out_s=self.audio_out)
+                ]
+                self.sel_a = 0
             self.btn_clear_audio.set_sensitive(True)
             self._set_status(f"Opened {path.name}")
             if self._audio_usable() > self._edit_dur() + 0.05:
@@ -1803,19 +2299,30 @@ class EditorWindow(Adw.ApplicationWindow):
         self._set_status("Audio cleared")
 
     def _on_follow_in(self, *_args: object) -> None:
-        if self.follow_in.get_active() and self.audio_path:
-            self.audio_start = self.video_start
+        if self.follow_in.get_active() and self.audio_clips and self.video_clips:
+            vs = (
+                self.video_clips[self.sel_v]
+                if 0 <= self.sel_v < len(self.video_clips)
+                else self.video_clips[0]
+            )
+            if 0 <= self.sel_a < len(self.audio_clips):
+                self.audio_clips[self.sel_a].start = vs.start
+            self.audio_start = vs.start
         self._refresh_fit()
 
     def _on_fit(self, *_args: object) -> None:
-        if not self.audio_path:
+        if not self.audio_path or not self.audio_clips:
             return
         v, a = self._edit_dur(), self._audio_usable()
         if a <= v + 0.05:
             self._set_status("Audio is already no longer than the video")
             return
         self.audio_fit = True
-        self.audio_out = self.audio_in + v
+        idx = self.sel_a if 0 <= self.sel_a < len(self.audio_clips) else 0
+        c = self.audio_clips[idx]
+        c.out_s = c.in_s + v
+        self.audio_in = c.in_s
+        self.audio_out = c.out_s
         self._refresh_fit()
         self._checkpoint()
         self._set_status(f"Cut audio to {v:.2f}s (from {a:.2f}s)")
@@ -1839,16 +2346,17 @@ class EditorWindow(Adw.ApplicationWindow):
         self._refresh_fit()
         self._checkpoint()
 
-    def _on_video_move(self, start: float, done: bool) -> None:
-        inn = max(0.0, self.in_spin.get_value())
-        self.video_start = max(-inn, float(start))
-        if self.follow_in.get_active() and self.audio_path:
-            self.audio_start = self.video_start
-            self.timeline.audio_start = self.audio_start
-        elif not self.audio_path:
-            self.timeline.audio_start = self.video_start
+    def _on_video_move(self, index: int, start: float, done: bool) -> None:
+        if not 0 <= index < len(self.video_clips):
+            return
+        inn = max(0.0, self.video_clips[index].in_s)
+        self.video_clips[index].start = max(-inn, float(start))
+        if index == self.sel_v:
+            self.video_start = self.video_clips[index].start
+        if self.follow_in.get_active() and 0 <= self.sel_a < len(self.audio_clips):
+            self.audio_clips[self.sel_a].start = self.video_clips[index].start
+            self.audio_start = self.audio_clips[self.sel_a].start
         if not done:
-            self.timeline.queue_draw()
             return
         self._sync_timeline_clips()
         t = self.timeline.playhead
@@ -1856,11 +2364,15 @@ class EditorWindow(Adw.ApplicationWindow):
         self._apply_timeline_frame(t, start_media=False)
         self._checkpoint()
         self._schedule_autosave()
-        self._set_status(f"Video at {self.video_start + inn:.2f}s")
+        self._set_status(f"Video at {self.video_clips[index].start + inn:.2f}s")
 
-    def _on_audio_move(self, start: float, done: bool) -> None:
-        inn = max(0.0, self.audio_in)
-        self.audio_start = max(-inn, float(start))
+    def _on_audio_move(self, index: int, start: float, done: bool) -> None:
+        if not 0 <= index < len(self.audio_clips):
+            return
+        inn = max(0.0, self.audio_clips[index].in_s)
+        self.audio_clips[index].start = max(-inn, float(start))
+        if index == self.sel_a:
+            self.audio_start = self.audio_clips[index].start
         if not done:
             return
         if self.follow_in.get_active():
@@ -1868,11 +2380,16 @@ class EditorWindow(Adw.ApplicationWindow):
         self._sync_timeline_clips()
         self._checkpoint()
         self._schedule_autosave()
-        self._set_status(f"Audio at {self.audio_start + inn:.2f}s")
+        self._set_status(f"Audio at {self.audio_clips[index].start + inn:.2f}s")
 
-    def _on_video_trim(self, in_s: float, out_s: float, done: bool) -> None:
+    def _on_video_trim(self, index: int, in_s: float, out_s: float, done: bool) -> None:
+        if not 0 <= index < len(self.video_clips):
+            return
+        self.video_clips[index].in_s = in_s
+        self.video_clips[index].out_s = out_s
         if not done:
             return
+        self.sel_v = index
         self._loading = True
         try:
             self.in_spin.set_value(in_s)
@@ -1884,17 +2401,81 @@ class EditorWindow(Adw.ApplicationWindow):
         self._schedule_autosave()
         self._set_status(f"Video {in_s:.2f}s–{out_s:.2f}s")
 
-    def _on_audio_trim(self, in_s: float, out_s: float, done: bool) -> None:
-        self.audio_in = max(0.0, in_s)
-        self.audio_out = max(self.audio_in + 0.05, out_s)
+    def _on_audio_trim(self, index: int, in_s: float, out_s: float, done: bool) -> None:
+        if not 0 <= index < len(self.audio_clips):
+            return
+        self.audio_clips[index].in_s = max(0.0, in_s)
+        self.audio_clips[index].out_s = max(in_s + 0.05, out_s)
+        if index == self.sel_a:
+            self.audio_in = self.audio_clips[index].in_s
+            self.audio_out = self.audio_clips[index].out_s
         if not done:
             return
+        self.sel_a = index
         if self.follow_in.get_active():
             self.follow_in.set_active(False)
         self._refresh_fit()
         self._checkpoint()
         self._schedule_autosave()
-        self._set_status(f"Audio {self.audio_in:.2f}s–{self.audio_out:.2f}s")
+        self._set_status(
+            f"Audio {self.audio_clips[index].in_s:.2f}s–{self.audio_clips[index].out_s:.2f}s"
+        )
+
+    def _on_clip_select(self, kind: str, index: int) -> None:
+        if kind == "video" and 0 <= index < len(self.video_clips):
+            self.sel_v = index
+            c = self.video_clips[index]
+            self.video_start = c.start
+            self._loading = True
+            try:
+                self.in_spin.set_value(c.in_s)
+                self.out_spin.set_value(c.out_s)
+            finally:
+                self._loading = False
+        elif kind == "audio" and 0 <= index < len(self.audio_clips):
+            self.sel_a = index
+            c = self.audio_clips[index]
+            self.audio_start = c.start
+            self.audio_in = c.in_s
+            self.audio_out = c.out_s
+
+    def _place_clip(self, kind: str, t: float) -> None:
+        t = max(0.0, float(t))
+        if kind == "video":
+            if not self.video_path or not self.video_info:
+                return
+            dur = float(self.video_info.get("duration") or 0)
+            if dur <= 0.04:
+                return
+            self.video_clips.append(ClipInst(start=t, in_s=0.0, out_s=dur))
+            self.sel_v = len(self.video_clips) - 1
+            self._loading = True
+            try:
+                self.in_spin.set_value(0)
+                self.out_spin.set_value(dur)
+            finally:
+                self._loading = False
+            self.video_start = t
+            self._set_status(f"Placed video at {t:.2f}s")
+        elif kind == "audio":
+            if not self.audio_path or not self.audio_info:
+                return
+            dur = float(self.audio_info.get("duration") or 0)
+            if dur <= 0.04:
+                return
+            self.audio_clips.append(ClipInst(start=t, in_s=0.0, out_s=dur))
+            self.sel_a = len(self.audio_clips) - 1
+            self.audio_start = t
+            self.audio_in = 0.0
+            self.audio_out = dur
+            if self.follow_in.get_active():
+                self.follow_in.set_active(False)
+            self._set_status(f"Placed audio at {t:.2f}s")
+        else:
+            return
+        self._sync_timeline_clips()
+        self._checkpoint()
+        self._schedule_autosave()
 
     def _on_timeline_seek(self, value: float) -> None:
         if self._syncing_scrub:
@@ -1917,28 +2498,36 @@ class EditorWindow(Adw.ApplicationWindow):
         return False
 
     def _audio_begins_at(self) -> float | None:
-        if self.audio_path:
-            return self.audio_start + self.audio_in
-        if self.video_path and self.video_info and self.video_info.get("has_audio"):
-            return self.video_start + self.in_spin.get_value()
-        return None
+        starts: list[float] = []
+        if self.audio_clips:
+            dur = float((self.audio_info or {}).get("duration") or 0)
+            for c in self.audio_clips:
+                t0, _t1 = self._clip_span(c, dur)
+                starts.append(t0)
+        elif self.video_path and self.video_info and self.video_info.get("has_audio"):
+            dur = float(self.video_info.get("duration") or 0)
+            for c in self.video_clips:
+                t0, _t1 = self._clip_span(c, dur)
+                starts.append(t0)
+        return min(starts) if starts else None
 
     def _preview_cmd(self, timeline_t: float) -> list[str] | None:
-        end = self._program_end()
-        if self.audio_path and self.audio_out is not None:
-            end = min(end, self.audio_start + self.audio_out)
-        remaining = max(0.05, end - timeline_t)
-        begins = self._audio_begins_at()
-        if begins is None:
-            return None
-        if timeline_t < begins - 0.02:
-            return None
-        if self.audio_path:
+        if self.audio_path and self.audio_clips:
+            ac = self._audio_at(timeline_t)
+            if ac is None:
+                return None
             path = self.audio_path
-            start = timeline_t - self.audio_start
+            start = timeline_t - ac.start
+            _t0, t1 = self._clip_span(ac, float((self.audio_info or {}).get("duration") or 0))
+            remaining = max(0.05, t1 - timeline_t)
         elif self.video_path and self.video_info and self.video_info.get("has_audio"):
+            vc = self._video_at(timeline_t)
+            if vc is None:
+                return None
             path = self.video_path
-            start = timeline_t - self.video_start
+            start = timeline_t - vc.start
+            _t0, t1 = self._clip_span(vc, float(self.video_info.get("duration") or 0))
+            remaining = max(0.05, t1 - timeline_t)
         else:
             return None
         start = max(0.0, start)
@@ -1989,16 +2578,41 @@ class EditorWindow(Adw.ApplicationWindow):
             except OSError:
                 pass
 
+    def _clip_span(self, c: ClipInst, src_dur: float) -> tuple[float, float]:
+        inn = max(0.0, c.in_s)
+        out = c.out_s if c.out_s > inn else src_dur
+        if src_dur > 0:
+            out = min(out, src_dur)
+        return c.start + inn, c.start + out
+
+    def _video_at(self, t: float) -> ClipInst | None:
+        hit = None
+        dur = float((self.video_info or {}).get("duration") or 0)
+        for c in self.video_clips:
+            t0, t1 = self._clip_span(c, dur)
+            if t0 - 0.02 <= t < t1:
+                hit = c
+        return hit
+
+    def _audio_at(self, t: float) -> ClipInst | None:
+        hit = None
+        dur = float((self.audio_info or {}).get("duration") or 0)
+        for c in self.audio_clips:
+            t0, t1 = self._clip_span(c, dur)
+            if t0 - 0.02 <= t < t1:
+                hit = c
+        return hit
+
     def _apply_timeline_frame(self, timeline_t: float, *, start_media: bool) -> None:
-        v0 = self.video_start + self.in_spin.get_value()
-        if timeline_t < v0 - 0.02 or self._vmedia is None:
+        clip = self._video_at(timeline_t)
+        if clip is None or self._vmedia is None:
             self.preview.set_blank(True)
             if self._vmedia is not None:
                 self._vmedia.pause()
             self._clip_playing = False
             return
         self.preview.set_blank(False)
-        source = max(0.0, timeline_t - self.video_start)
+        source = max(0.0, timeline_t - clip.start)
         dur = float((self.video_info or {}).get("duration") or 0)
         if dur > 0:
             source = min(source, dur)
@@ -2113,7 +2727,7 @@ class EditorWindow(Adw.ApplicationWindow):
             self._vmedia.pause()
         self.preview.set_media(None)
         t = self.timeline.playhead
-        self.preview.set_blank(t < self.video_start + self.in_spin.get_value() - 0.02)
+        self.preview.set_blank(self._video_at(t) is None)
         if self._tick is not None:
             GLib.source_remove(self._tick)
             self._tick = None
@@ -2130,6 +2744,8 @@ class EditorWindow(Adw.ApplicationWindow):
         self._play_mono = time.monotonic()
         self._clip_playing = False
         self._audio_pending = False
+        self._video_play_clip = None
+        self._audio_play_clip = None
         self._syncing_scrub = True
         self.timeline.set_playhead(0.0)
         self._syncing_scrub = False
@@ -2151,13 +2767,25 @@ class EditorWindow(Adw.ApplicationWindow):
         self.timeline.set_playhead(t)
         self._syncing_scrub = False
         self.clock.set_text(f"{t:.2f} / {end:.2f}")
-        if t < self.video_start + self.in_spin.get_value() - 0.02:
+        vclip = self._video_at(t)
+        if vclip is None:
             self._apply_timeline_frame(t, start_media=False)
-        elif not self._clip_playing:
+        elif not self._clip_playing or vclip is not getattr(self, "_video_play_clip", None):
+            self._video_play_clip = vclip
             self._apply_timeline_frame(t, start_media=True)
         else:
             self.preview.queue_draw()
-        if self._audio_pending and self._preview_proc is None:
+        aclip = self._audio_at(t) if self.audio_clips else None
+        if self.audio_clips:
+            prev = getattr(self, "_audio_play_clip", None)
+            if aclip is not prev:
+                self._audio_play_clip = aclip
+                if aclip is not None:
+                    self._start_preview_audio(t)
+                else:
+                    self._stop_preview_audio()
+                    self._audio_pending = True
+        elif self._audio_pending and self._preview_proc is None:
             begins = self._audio_begins_at()
             if begins is not None and t >= begins - 0.02:
                 self._start_preview_audio(t)
@@ -2185,6 +2813,8 @@ class EditorWindow(Adw.ApplicationWindow):
         a_start = self.audio_start
         a_in = self.audio_in
         a_out = self.audio_out
+        v_clips = [c.copy() for c in self.video_clips]
+        a_clips = [c.copy() for c in self.audio_clips]
         out = default_out_path(video, aspect)
 
         def progress(pct: float, _state: str) -> None:
@@ -2206,6 +2836,8 @@ class EditorWindow(Adw.ApplicationWindow):
                     audio_start=a_start,
                     audio_in=a_in,
                     audio_out=a_out,
+                    video_clips=v_clips or None,
+                    audio_clips=a_clips or None,
                     progress=progress,
                 )
                 GLib.idle_add(self._export_done, result, None)

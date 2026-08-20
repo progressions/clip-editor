@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 FORMAT = "clip-editor-project"
@@ -22,6 +22,62 @@ AUTOSAVE_PATH = STATE_DIR / "autosave.clip.json"
 
 class ProjectError(RuntimeError):
     pass
+
+
+@dataclass
+class ClipInst:
+    """One instance of the project video or audio on the timeline."""
+
+    start: float = 0.0
+    in_s: float = 0.0
+    out_s: float = 0.0
+
+    def used(self) -> tuple[float, float]:
+        inn = max(0.0, float(self.in_s))
+        out = float(self.out_s) if self.out_s > inn else inn
+        return inn, out
+
+    def used_times(self) -> tuple[float, float]:
+        inn, out = self.used()
+        return self.start + inn, self.start + out
+
+    def copy(self) -> ClipInst:
+        return ClipInst(start=self.start, in_s=self.in_s, out_s=self.out_s)
+
+
+def clip_to_dict(c: ClipInst) -> dict:
+    return {"start": float(c.start), "in_s": float(c.in_s), "out_s": float(c.out_s)}
+
+
+def clip_from_dict(data: object) -> ClipInst | None:
+    if not isinstance(data, dict):
+        return None
+    try:
+        start = float(data.get("start") or 0.0)
+        inn = max(0.0, float(data.get("in_s") or 0.0))
+        out = float(data.get("out_s") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    return ClipInst(start=start, in_s=inn, out_s=out)
+
+
+def _clips_from_data(
+    data: dict,
+    key: str,
+    *,
+    legacy_start: float,
+    legacy_in: float,
+    legacy_out: float | None,
+    present: bool,
+) -> list[ClipInst]:
+    raw = data.get(key)
+    if isinstance(raw, list) and raw:
+        clips = [c for c in (clip_from_dict(item) for item in raw) if c is not None]
+        if clips:
+            return clips
+    if not present:
+        return []
+    return [ClipInst(start=legacy_start, in_s=legacy_in, out_s=float(legacy_out or 0.0))]
 
 
 @dataclass
@@ -39,6 +95,8 @@ class Project:
     audio_out: float | None = None
     audio_follows_in: bool = False
     audio_fit: bool = False
+    video_clips: list[ClipInst] = field(default_factory=list)
+    audio_clips: list[ClipInst] = field(default_factory=list)
     path: Path | None = None
 
 
@@ -104,6 +162,8 @@ def to_dict(proj: Project) -> dict:
         "audio_out": None if proj.audio_out is None else float(proj.audio_out),
         "audio_follows_in": bool(proj.audio_follows_in),
         "audio_fit": bool(proj.audio_fit),
+        "video_clips": [clip_to_dict(c) for c in proj.video_clips],
+        "audio_clips": [clip_to_dict(c) for c in proj.audio_clips],
         "video": str(video) if video else None,
         "video_rel": _rel(video, origin),
         "audio": str(audio) if audio else None,
@@ -161,6 +221,34 @@ def from_dict(data: dict, *, origin: Path | None = None) -> Project:
         ),
         audio_follows_in=bool(data.get("audio_follows_in") or False),
         audio_fit=bool(data.get("audio_fit") or False),
+        video_clips=_clips_from_data(
+            data,
+            "video_clips",
+            legacy_start=float(data.get("video_start") or 0.0),
+            legacy_in=float(data.get("in_s") or 0.0),
+            legacy_out=None if out_raw is None or out_raw == "" else float(out_raw),
+            present=video is not None,
+        ),
+        audio_clips=_clips_from_data(
+            data,
+            "audio_clips",
+            legacy_start=(
+                float(data["audio_start"])
+                if data.get("audio_start") is not None
+                else (
+                    float(data.get("video_start") or 0.0)
+                    if data.get("audio_follows_in")
+                    else float(data.get("in_s") or 0.0)
+                )
+            ),
+            legacy_in=max(0.0, float(data.get("audio_in") or 0.0)),
+            legacy_out=(
+                None
+                if data.get("audio_out") is None or data.get("audio_out") == ""
+                else float(data.get("audio_out"))
+            ),
+            present=audio is not None,
+        ),
         path=path,
     )
 
