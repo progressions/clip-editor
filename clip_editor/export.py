@@ -40,6 +40,9 @@ def build_cmd(
     audio_follows_in: bool,
     audio_offset: float,
     video_start: float = 0.0,
+    audio_start: float = 0.0,
+    audio_in: float = 0.0,
+    audio_out: float | None = None,
     src: dict[str, Any] | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     """Return (ffmpeg argv, meta dict with crop/duration/dest)."""
@@ -85,26 +88,33 @@ def build_cmd(
     if a_start < 0:
         a_start = 0.0
     v_start = max(0.0, float(video_start or 0.0))
+    a_place = max(0.0, float(audio_start or 0.0))
     out_dur = duration + v_start
     if v_start > 0.04:
         vchain.append(f"tpad=start_duration={v_start:.6f}:color=black")
 
     # Original soundtrack stays locked to the picture. Replacement audio
     # only follows the in-point when the user asks (driver sync).
-    # A video_start lead-in is black; a music bed plays from timeline 0.
+    # Otherwise the A clip sits at audio_start on the timeline.
     picture_locked = use_source_audio or (use_replacement and audio_follows_in)
+    ain = max(0.0, float(audio_in or 0.0))
     if picture_locked:
         a_start += in_s
         a_len = duration
+        delay = v_start
     else:
-        a_len = out_dur
+        delay = a_place + ain
+        a_start += ain
+        used = None if audio_out is None else max(0.05, float(audio_out) - ain)
+        remain = max(0.05, out_dur - delay)
+        a_len = remain if used is None else min(used, remain)
 
     achain = [
         f"atrim=start={a_start:.6f}:duration={a_len:.6f}",
         "asetpts=PTS-STARTPTS",
     ]
-    if picture_locked and v_start > 0.04:
-        ms = int(round(v_start * 1000.0))
+    if delay > 0.04:
+        ms = int(round(delay * 1000.0))
         achain.append(f"adelay={ms}:all=1")
     achain += [
         f"apad=whole_dur={out_dur:.6f}",
@@ -167,6 +177,7 @@ def build_cmd(
         "audio_follows_in": bool(audio_follows_in),
         "audio_offset": a_start if (use_replacement or use_source_audio) else None,
         "video_start": v_start,
+        "audio_start": a_place,
     }
     return cmd, meta
 
@@ -205,6 +216,9 @@ def run_export(
     audio_follows_in: bool = False,
     audio_offset: float = 0.0,
     video_start: float = 0.0,
+    audio_start: float = 0.0,
+    audio_in: float = 0.0,
+    audio_out: float | None = None,
     progress: ProgressCb | None = None,
     timeout: float = 1800.0,
 ) -> dict[str, Any]:
@@ -232,6 +246,9 @@ def run_export(
         audio_follows_in=audio_follows_in,
         audio_offset=audio_offset,
         video_start=video_start,
+        audio_start=audio_start,
+        audio_in=audio_in,
+        audio_out=audio_out,
         src=src,
     )
     out.parent.mkdir(parents=True, exist_ok=True)

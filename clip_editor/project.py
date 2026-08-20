@@ -34,6 +34,9 @@ class Project:
     in_s: float = 0.0
     out_s: float | None = None
     video_start: float = 0.0
+    audio_start: float = 0.0
+    audio_in: float = 0.0
+    audio_out: float | None = None
     audio_follows_in: bool = False
     audio_fit: bool = False
     path: Path | None = None
@@ -96,6 +99,9 @@ def to_dict(proj: Project) -> dict:
         "in_s": float(proj.in_s),
         "out_s": None if proj.out_s is None else float(proj.out_s),
         "video_start": float(proj.video_start),
+        "audio_start": float(proj.audio_start),
+        "audio_in": float(proj.audio_in),
+        "audio_out": None if proj.audio_out is None else float(proj.audio_out),
         "audio_follows_in": bool(proj.audio_follows_in),
         "audio_fit": bool(proj.audio_fit),
         "video": str(video) if video else None,
@@ -138,6 +144,21 @@ def from_dict(data: dict, *, origin: Path | None = None) -> Project:
         in_s=float(data.get("in_s") or 0.0),
         out_s=None if out_raw is None or out_raw == "" else float(out_raw),
         video_start=max(0.0, float(data.get("video_start") or 0.0)),
+        audio_start=(
+            max(0.0, float(data["audio_start"]))
+            if data.get("audio_start") is not None
+            else (
+                max(0.0, float(data.get("video_start") or 0.0))
+                if data.get("audio_follows_in")
+                else float(data.get("in_s") or 0.0)
+            )
+        ),
+        audio_in=max(0.0, float(data.get("audio_in") or 0.0)),
+        audio_out=(
+            None
+            if data.get("audio_out") is None or data.get("audio_out") == ""
+            else float(data.get("audio_out"))
+        ),
         audio_follows_in=bool(data.get("audio_follows_in") or False),
         audio_fit=bool(data.get("audio_fit") or False),
         path=path,

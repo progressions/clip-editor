@@ -51,6 +51,26 @@ def _add_export_args(p: argparse.ArgumentParser) -> None:
         default=0.0,
         help="timeline offset of the video clip (seconds)",
     )
+    p.add_argument(
+        "--audio-start",
+        type=float,
+        default=0.0,
+        help="timeline offset of the replacement audio clip (seconds)",
+    )
+    p.add_argument(
+        "--audio-in",
+        dest="audio_in",
+        type=float,
+        default=0.0,
+        help="start of used replacement audio, seconds into the file",
+    )
+    p.add_argument(
+        "--audio-out",
+        dest="audio_out",
+        type=float,
+        default=None,
+        help="end of used replacement audio, seconds into the file",
+    )
     p.add_argument("--json", action="store_true", help="print result as JSON")
 
 
@@ -70,6 +90,9 @@ def cmd_export(args: argparse.Namespace) -> int:
             audio_follows_in=args.audio_follows_in,
             audio_offset=args.audio_offset,
             video_start=args.video_start,
+            audio_start=args.audio_start,
+            audio_in=args.audio_in,
+            audio_out=args.audio_out,
             progress=None
             if args.json
             else (lambda pct, st: print(f"\r{st} {pct*100:5.1f}%", end="", file=sys.stderr, flush=True)),
@@ -213,6 +236,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_serve)
 
     g = sub.add_parser("gui", help="native GTK window")
+    g.add_argument("--video", help="open this video")
+    g.add_argument(
+        "--audio",
+        help="add this audio to the current project (same as dropping it on the window)",
+    )
+    g.add_argument("video_path", nargs="?", help="video to open")
     g.set_defaults(func=cmd_gui)
 
     t = sub.add_parser("selftest", help="crop math + a 2s lavfi encode")
@@ -220,10 +249,11 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def cmd_gui(_args: argparse.Namespace) -> int:
+def cmd_gui(args: argparse.Namespace) -> int:
     from clip_editor.ui import run
 
-    return run()
+    video = getattr(args, "video", None) or getattr(args, "video_path", None)
+    return run(open_video=video, open_audio=getattr(args, "audio", None))
 
 
 def main(argv: list[str] | None = None) -> int:
