@@ -87,11 +87,14 @@ def build_cmd(
     a_start = float(audio_offset or 0.0)
     if a_start < 0:
         a_start = 0.0
-    v_start = max(0.0, float(video_start or 0.0))
-    a_place = max(0.0, float(audio_start or 0.0))
-    out_dur = duration + v_start
-    if v_start > 0.04:
-        vchain.append(f"tpad=start_duration={v_start:.6f}:color=black")
+    v_place = float(video_start or 0.0)
+    a_place = float(audio_start or 0.0)
+    # Black lead-in is the used clip’s left edge, not unused source
+    # sitting before timeline 0.
+    lead = max(0.0, v_place + in_s)
+    out_dur = duration + lead
+    if lead > 0.04:
+        vchain.append(f"tpad=start_duration={lead:.6f}:color=black")
 
     # Original soundtrack stays locked to the picture. Replacement audio
     # only follows the in-point when the user asks (driver sync).
@@ -101,11 +104,12 @@ def build_cmd(
     if picture_locked:
         a_start += in_s
         a_len = duration
-        delay = v_start
+        delay = lead
     else:
-        delay = a_place + ain
-        a_start += ain
-        used = None if audio_out is None else max(0.05, float(audio_out) - ain)
+        delay = max(0.0, a_place + ain)
+        skip = max(0.0, -(a_place + ain))
+        a_start += ain + skip
+        used = None if audio_out is None else max(0.05, float(audio_out) - ain - skip)
         remain = max(0.05, out_dur - delay)
         a_len = remain if used is None else min(used, remain)
 
@@ -176,7 +180,7 @@ def build_cmd(
         "audio": str(audio_path) if audio_path else None,
         "audio_follows_in": bool(audio_follows_in),
         "audio_offset": a_start if (use_replacement or use_source_audio) else None,
-        "video_start": v_start,
+        "video_start": v_place,
         "audio_start": a_place,
     }
     return cmd, meta

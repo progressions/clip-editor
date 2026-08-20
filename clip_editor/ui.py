@@ -325,9 +325,9 @@ class Timeline(Gtk.DrawingArea):
     ) -> None:
         self.video_name = video_name
         self.video_dur = max(0.0, float(video_dur))
-        self.video_start = max(0.0, float(video_start))
+        self.video_start = float(video_start)
         self.audio_name = audio_name
-        self.audio_start = max(0.0, float(audio_start))
+        self.audio_start = float(audio_start)
         self.audio_dur = max(0.0, float(audio_dur))
         self.audio_in = max(0.0, float(audio_in))
         aout = float(audio_out) if audio_out else 0.0
@@ -569,7 +569,7 @@ class Timeline(Gtk.DrawingArea):
         if line is None:
             return start
         self._snap_line = line
-        return max(0.0, best)
+        return max(-used_in, best)
 
     def _on_drag_update(self, gesture: Gtk.GestureDrag, dx: float, _dy: float) -> None:
         dt = self._dt(dx)
@@ -620,16 +620,19 @@ class Timeline(Gtk.DrawingArea):
             self.queue_draw()
             return
         if self._drag_mode in ("video", "audio"):
-            start = max(0.0, self._drag_v0 + dt)
             if self._drag_mode == "video":
                 inn, out = self._video_used()
+                start = max(-inn, self._drag_v0 + dt)
                 start = self._snap_move(start, inn, out, self._other_edges("video"))
+                start = max(-inn, start)
                 self.video_start = start
                 if callable(self.on_video_move):
                     self.on_video_move(start, False)
             else:
                 inn, out = self._audio_used()
+                start = max(-inn, self._drag_v0 + dt)
                 start = self._snap_move(start, inn, out, self._other_edges("audio"))
+                start = max(-inn, start)
                 self.audio_start = start
                 if callable(self.on_audio_move):
                     self.on_audio_move(start, False)
@@ -1310,8 +1313,8 @@ class EditorWindow(Adw.ApplicationWindow):
                 self.out_spin.set_value(dur)
             self.follow_in.set_active(proj.audio_follows_in)
             self.audio_fit = proj.audio_fit
-            self.video_start = max(0.0, float(proj.video_start or 0.0))
-            self.audio_start = max(0.0, float(proj.audio_start or 0.0))
+            self.video_start = float(proj.video_start or 0.0)
+            self.audio_start = float(proj.audio_start or 0.0)
             self.audio_in = max(0.0, float(proj.audio_in or 0.0))
             self.audio_out = proj.audio_out
             self.project_path = proj.path
@@ -1837,7 +1840,8 @@ class EditorWindow(Adw.ApplicationWindow):
         self._checkpoint()
 
     def _on_video_move(self, start: float, done: bool) -> None:
-        self.video_start = max(0.0, float(start))
+        inn = max(0.0, self.in_spin.get_value())
+        self.video_start = max(-inn, float(start))
         if self.follow_in.get_active() and self.audio_path:
             self.audio_start = self.video_start
             self.timeline.audio_start = self.audio_start
@@ -1852,10 +1856,11 @@ class EditorWindow(Adw.ApplicationWindow):
         self._apply_timeline_frame(t, start_media=False)
         self._checkpoint()
         self._schedule_autosave()
-        self._set_status(f"Video starts at {self.video_start:.2f}s")
+        self._set_status(f"Video at {self.video_start + inn:.2f}s")
 
     def _on_audio_move(self, start: float, done: bool) -> None:
-        self.audio_start = max(0.0, float(start))
+        inn = max(0.0, self.audio_in)
+        self.audio_start = max(-inn, float(start))
         if not done:
             return
         if self.follow_in.get_active():
@@ -1863,7 +1868,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self._sync_timeline_clips()
         self._checkpoint()
         self._schedule_autosave()
-        self._set_status(f"Audio starts at {self.audio_start:.2f}s")
+        self._set_status(f"Audio at {self.audio_start + inn:.2f}s")
 
     def _on_video_trim(self, in_s: float, out_s: float, done: bool) -> None:
         if not done:

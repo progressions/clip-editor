@@ -143,12 +143,12 @@ def from_dict(data: dict, *, origin: Path | None = None) -> Project:
         pan_y=float(data.get("pan_y") if data.get("pan_y") is not None else 0.5),
         in_s=float(data.get("in_s") or 0.0),
         out_s=None if out_raw is None or out_raw == "" else float(out_raw),
-        video_start=max(0.0, float(data.get("video_start") or 0.0)),
+        video_start=float(data.get("video_start") or 0.0),
         audio_start=(
-            max(0.0, float(data["audio_start"]))
+            float(data["audio_start"])
             if data.get("audio_start") is not None
             else (
-                max(0.0, float(data.get("video_start") or 0.0))
+                float(data.get("video_start") or 0.0)
                 if data.get("audio_follows_in")
                 else float(data.get("in_s") or 0.0)
             )
