@@ -34,6 +34,18 @@ from clip_editor.project import (
 )
 
 APP_ID = "local.clip.Editor"
+HISTORY_LIMIT = 80
+
+
+def _same_path(a: Path | None, b: Path | None) -> bool:
+    if a is None and b is None:
+        return True
+    if a is None or b is None:
+        return False
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return a == b
 
 
 def _load_frame(path: Path) -> GdkPixbuf.Pixbuf:
@@ -84,6 +96,7 @@ class CoverPreview(Gtk.Widget):
         self.pan_x = 0.5
         self.pan_y = 0.5
         self.on_pan = None
+        self.on_pan_end = None
         self._drag_pan = (0.5, 0.5)
         self._texture: Gdk.Texture | None = None
         self._media: Gtk.MediaFile | None = None
@@ -95,7 +108,7 @@ class CoverPreview(Gtk.Widget):
         drag = Gtk.GestureDrag()
         drag.connect("drag-begin", self._drag_begin)
         drag.connect("drag-update", self._drag_update)
-        drag.connect("drag-end", lambda *_: self.set_cursor_from_name("grab"))
+        drag.connect("drag-end", self._drag_end)
         self.add_controller(drag)
 
     def do_measure(self, orientation: Gtk.Orientation, for_size: int) -> tuple[int, int, int, int]:  # noqa: N802
@@ -189,6 +202,11 @@ class CoverPreview(Gtk.Widget):
         self.queue_draw()
         if callable(self.on_pan):
             self.on_pan()
+
+    def _drag_end(self, *_args: object) -> None:
+        self.set_cursor_from_name("grab")
+        if callable(self.on_pan_end):
+            self.on_pan_end()
 
 
 def _round_rect(cr, x: float, y: float, w: float, h: float, r: float) -> None:  # noqa: ANN001
@@ -500,14 +518,26 @@ class EditorWindow(Adw.ApplicationWindow):
         self._tick: int | None = None
         self._prep_handler: int = 0
         self._space_held = False
+        self._history: list[Project] = []
+        self._hist_i = -1
+        self._ckpt_src: int = 0
+        self._applying_history = False
+        self._undo_action: Gio.SimpleAction | None = None
+        self._redo_action: Gio.SimpleAction | None = None
 
         toolbar = Adw.ToolbarView()
         header = Adw.HeaderBar()
+        file_menu = Gio.Menu()
+        file_menu.append("New", "win.new-project")
+        file_menu.append("Open project…", "win.open-project")
+        file_menu.append("Save", "win.save")
+        file_menu.append("Save As…", "win.save-as")
+        edit_menu = Gio.Menu()
+        edit_menu.append("Undo", "win.undo")
+        edit_menu.append("Redo", "win.redo")
         menu = Gio.Menu()
-        menu.append("New", "win.new-project")
-        menu.append("Open project…", "win.open-project")
-        menu.append("Save", "win.save")
-        menu.append("Save As…", "win.save-as")
+        menu.append_section(None, file_menu)
+        menu.append_section(None, edit_menu)
         mb = Gtk.MenuButton(icon_name="open-menu-symbolic")
         mb.set_menu_model(menu)
         mb.set_tooltip_text("Project")
@@ -528,6 +558,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.aspect_frame.set_vexpand(True)
         self.preview = CoverPreview()
         self.preview.on_pan = self._refresh_crop
+        self.preview.on_pan_end = self._checkpoint
         self.aspect_frame.set_child(self.preview)
         left.append(self.aspect_frame)
 
@@ -669,9 +700,31 @@ class EditorWindow(Adw.ApplicationWindow):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", handler)
             self.add_action(action)
+        self._undo_action = Gio.SimpleAction.new("undo", None)
+        self._undo_action.connect("activate", self._on_undo)
+        self._undo_action.set_enabled(False)
+        self.add_action(self._undo_action)
+        self._redo_action = Gio.SimpleAction.new("redo", None)
+        self._redo_action.connect("activate", self._on_redo)
+        self._redo_action.set_enabled(False)
+        self.add_action(self._redo_action)
 
     def _on_key_pressed(self, _c: Gtk.EventControllerKey, keyval: int, _code: int, state: int) -> bool:
         mods = state & Gtk.accelerator_get_default_mod_mask()
+        ctrl = bool(mods & Gdk.ModifierType.CONTROL_MASK)
+        shift = bool(mods & Gdk.ModifierType.SHIFT_MASK)
+        extra = mods & ~(Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK)
+        if extra:
+            return False
+        if ctrl and keyval in (Gdk.KEY_z, Gdk.KEY_Z):
+            if shift:
+                self._on_redo()
+            else:
+                self._on_undo()
+            return True
+        if ctrl and not shift and keyval in (Gdk.KEY_y, Gdk.KEY_Y):
+            self._on_redo()
+            return True
         if mods:
             return False
         if keyval not in (Gdk.KEY_space, Gdk.KEY_KP_Space):
@@ -686,6 +739,105 @@ class EditorWindow(Adw.ApplicationWindow):
         if keyval in (Gdk.KEY_space, Gdk.KEY_KP_Space):
             self._space_held = False
         return False
+
+    def _snapshot_key(self, proj: Project | None = None) -> tuple:
+        p = proj if proj is not None else self._current_project()
+        out = None if p.out_s is None else round(float(p.out_s), 3)
+        return (
+            str(p.video) if p.video else "",
+            str(p.audio) if p.audio else "",
+            p.aspect,
+            round(float(p.pan_x), 4),
+            round(float(p.pan_y), 4),
+            round(float(p.in_s), 3),
+            out,
+            bool(p.audio_follows_in),
+            bool(p.audio_fit),
+            str(p.path) if p.path else "",
+        )
+
+    def _update_history_actions(self) -> None:
+        if self._undo_action is not None:
+            self._undo_action.set_enabled(self._hist_i > 0)
+        if self._redo_action is not None:
+            self._redo_action.set_enabled(
+                self._hist_i >= 0 and self._hist_i < len(self._history) - 1
+            )
+
+    def _checkpoint(self, *_args: object) -> None:
+        if self._loading or self._applying_history:
+            return
+        if self._ckpt_src:
+            GLib.source_remove(self._ckpt_src)
+            self._ckpt_src = 0
+        snap = self._current_project()
+        key = self._snapshot_key(snap)
+        if (
+            self._history
+            and 0 <= self._hist_i < len(self._history)
+            and self._snapshot_key(self._history[self._hist_i]) == key
+        ):
+            self._update_history_actions()
+            return
+        self._history = self._history[: self._hist_i + 1]
+        self._history.append(snap)
+        if len(self._history) > HISTORY_LIMIT:
+            extra = len(self._history) - HISTORY_LIMIT
+            self._history = self._history[extra:]
+        self._hist_i = len(self._history) - 1
+        self._update_history_actions()
+
+    def _schedule_checkpoint(self) -> None:
+        if self._loading or self._applying_history:
+            return
+        if self._ckpt_src:
+            GLib.source_remove(self._ckpt_src)
+        self._ckpt_src = GLib.timeout_add(400, self._checkpoint_timeout)
+
+    def _checkpoint_timeout(self) -> bool:
+        self._ckpt_src = 0
+        self._checkpoint()
+        return False
+
+    def _flush_checkpoint(self) -> None:
+        if self._ckpt_src:
+            GLib.source_remove(self._ckpt_src)
+            self._ckpt_src = 0
+            self._checkpoint()
+
+    def _on_undo(self, *_args: object) -> None:
+        if self.exporting or self._applying_history:
+            return
+        self._flush_checkpoint()
+        if self._hist_i <= 0:
+            self._set_status("Nothing to undo")
+            return
+        self._hist_i -= 1
+        self._applying_history = True
+        try:
+            self._apply_project(self._history[self._hist_i])
+        finally:
+            self._applying_history = False
+        self._update_history_actions()
+        self._schedule_autosave()
+        self._set_status("Undo")
+
+    def _on_redo(self, *_args: object) -> None:
+        if self.exporting or self._applying_history:
+            return
+        self._flush_checkpoint()
+        if self._hist_i < 0 or self._hist_i >= len(self._history) - 1:
+            self._set_status("Nothing to redo")
+            return
+        self._hist_i += 1
+        self._applying_history = True
+        try:
+            self._apply_project(self._history[self._hist_i])
+        finally:
+            self._applying_history = False
+        self._update_history_actions()
+        self._schedule_autosave()
+        self._set_status("Redo")
 
     def _current_project(self) -> Project:
         return Project(
@@ -734,32 +886,64 @@ class EditorWindow(Adw.ApplicationWindow):
             self._autosave_src = 0
         self._autosave_now()
 
+    def _unload_video(self) -> None:
+        self._dispose_media()
+        self.video_path = None
+        self.video_info = None
+        self.preview.set_pixbuf(None)
+        self.preview.set_media(None)
+        self.video_label.set_text("none")
+        self.btn_play.set_sensitive(False)
+        self.btn_export.set_sensitive(False)
+        self.clock.set_text("0.00 / 0.00")
+        self.crop_label.set_text("")
+        self.export_name.set_text("name is assigned on export (.mp4)")
+        self.export_name.set_tooltip_text("")
+
+    def _unload_audio(self) -> None:
+        self.audio_path = None
+        self.audio_info = None
+        self.audio_fit = False
+        self.btn_clear_audio.set_sensitive(False)
+        self.btn_fit.set_sensitive(False)
+        self.btn_fit.set_label("Fit")
+        self.audio_label.set_text("none — keeps the video’s audio if it has one")
+
     def _apply_project(self, proj: Project) -> None:
         self._loading = True
         self._stop()
         try:
-            if proj.video is not None:
-                if proj.video.is_file():
+            if proj.video is not None and proj.video.is_file():
+                if not _same_path(self.video_path, proj.video):
                     self._open_path("video", proj.video, from_project=True)
-                else:
+            else:
+                if proj.video is not None:
                     self._set_status(f"Video missing: {proj.video}")
-            if proj.audio is not None:
-                if proj.audio.is_file():
+                self._unload_video()
+            if proj.audio is not None and proj.audio.is_file():
+                if not _same_path(self.audio_path, proj.audio):
                     self._open_path("audio", proj.audio, from_project=True)
-                else:
+            else:
+                if proj.audio is not None:
                     self._set_status(f"Audio missing: {proj.audio}")
+                self._unload_audio()
             if proj.aspect in self.aspect_buttons:
                 self.aspect_buttons[proj.aspect].set_active(True)
+                self.aspect = proj.aspect
+                dw, dh = dest_size(proj.aspect)
+                self.aspect_frame.set_ratio(dw / dh)
             self.preview.pan_x = min(1.0, max(0.0, proj.pan_x))
             self.preview.pan_y = min(1.0, max(0.0, proj.pan_y))
             self.preview.queue_draw()
             self.in_spin.set_value(proj.in_s)
             if proj.out_s is not None:
                 self.out_spin.set_value(proj.out_s)
+            else:
+                dur = float((self.video_info or {}).get("duration") or 0)
+                self.out_spin.set_value(dur)
             self.follow_in.set_active(proj.audio_follows_in)
             self.audio_fit = proj.audio_fit
-            if proj.path is not None:
-                self.project_path = proj.path
+            self.project_path = proj.path
             self._refresh_fit()
             self._update_title()
         finally:
@@ -771,20 +955,22 @@ class EditorWindow(Adw.ApplicationWindow):
         except ProjectError as exc:
             self._set_status(str(exc))
             return
+        self._checkpoint()
         self.project_path = path
         self._apply_project(proj)
         self.project_path = path
         self._update_title()
+        self._checkpoint()
         self._schedule_autosave()
         self._set_status(f"Opened {path.name}")
 
     def _restore_autosave(self) -> bool:
         proj = read_autosave()
-        if proj is None or (proj.video is None and proj.audio is None):
-            return False
-        self._apply_project(proj)
-        if self.video_path or self.audio_path:
-            self._set_status("Restored last session")
+        if proj is not None and (proj.video is not None or proj.audio is not None):
+            self._apply_project(proj)
+            if self.video_path or self.audio_path:
+                self._set_status("Restored last session")
+        self._checkpoint()
         return False
 
     def _project_dialog_filters(self) -> Gio.ListStore:
@@ -801,12 +987,8 @@ class EditorWindow(Adw.ApplicationWindow):
 
     def _clear_session(self) -> None:
         self._stop()
-        self._dispose_media()
-        self.video_path = None
-        self.audio_path = None
-        self.video_info = None
-        self.audio_info = None
-        self.audio_fit = False
+        self._unload_video()
+        self._unload_audio()
         self.project_path = None
         self.aspect = "9:16"
         dw, dh = dest_size("9:16")
@@ -814,26 +996,13 @@ class EditorWindow(Adw.ApplicationWindow):
         nine = self.aspect_buttons.get("9:16")
         if nine is not None and not nine.get_active():
             nine.set_active(True)
-        self.preview.set_pixbuf(None)
-        self.preview.set_media(None)
         self.preview.pan_x = 0.5
         self.preview.pan_y = 0.5
         self.preview.queue_draw()
         self.in_spin.set_value(0)
         self.out_spin.set_value(0)
         self.follow_in.set_active(False)
-        self.video_label.set_text("none")
-        self.audio_label.set_text("none — keeps the video’s audio if it has one")
-        self.btn_play.set_sensitive(False)
         self.btn_play.set_label("Play")
-        self.btn_export.set_sensitive(False)
-        self.btn_fit.set_sensitive(False)
-        self.btn_fit.set_label("Fit")
-        self.btn_clear_audio.set_sensitive(False)
-        self.clock.set_text("0.00 / 0.00")
-        self.crop_label.set_text("")
-        self.export_name.set_text("name is assigned on export (.mp4)")
-        self.export_name.set_tooltip_text("")
         self.progress.set_fraction(0)
         self.timeline.set_clips()
         self.timeline.set_playhead(0)
@@ -843,6 +1012,7 @@ class EditorWindow(Adw.ApplicationWindow):
     def _on_new_project(self, *_args: object) -> None:
         if self.exporting:
             return
+        self._checkpoint()
         self._loading = True
         try:
             if self.project_path is not None:
@@ -856,6 +1026,7 @@ class EditorWindow(Adw.ApplicationWindow):
             self._loading = False
         self._update_title()
         self._refresh_fit()
+        self._checkpoint()
         self._set_status("New project")
 
     def _on_open_project(self, *_args: object) -> None:
@@ -917,6 +1088,7 @@ class EditorWindow(Adw.ApplicationWindow):
                 return
             self.project_path = written
             self._update_title()
+            self._checkpoint()
             self._schedule_autosave()
             self._set_status(f"Saved {written.name}")
 
@@ -978,6 +1150,9 @@ class EditorWindow(Adw.ApplicationWindow):
 
     def _on_close(self, *_args: object) -> bool:
         self._stop()
+        if self._ckpt_src:
+            GLib.source_remove(self._ckpt_src)
+            self._ckpt_src = 0
         self._flush_autosave()
         return False
 
@@ -1045,6 +1220,7 @@ class EditorWindow(Adw.ApplicationWindow):
         if not self.audio_path:
             self.btn_fit.set_label("Fit")
             self._schedule_autosave()
+            self._schedule_checkpoint()
             return
         name = self.audio_path.name
         dur = float(self.audio_info["duration"]) if self.audio_info else 0.0
@@ -1058,6 +1234,7 @@ class EditorWindow(Adw.ApplicationWindow):
                 self.audio_fit = False
         self._refresh_crop()
         self._schedule_autosave()
+        self._schedule_checkpoint()
 
     def _pick(self, kind: str) -> None:
         dialog = Gtk.FileDialog(title="Open video" if kind == "video" else "Open audio")
@@ -1207,6 +1384,8 @@ class EditorWindow(Adw.ApplicationWindow):
                 )
         self._refresh_fit()
         self._schedule_autosave()
+        if not from_project:
+            self._checkpoint()
 
     def _on_clear_audio(self, *_args: object) -> None:
         self.audio_path = None
@@ -1215,6 +1394,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.btn_clear_audio.set_sensitive(False)
         self.audio_label.set_text("none — keeps the video’s audio if it has one")
         self._refresh_fit()
+        self._checkpoint()
         self._set_status("Audio cleared")
 
     def _on_fit(self, *_args: object) -> None:
@@ -1226,6 +1406,7 @@ class EditorWindow(Adw.ApplicationWindow):
             return
         self.audio_fit = True
         self._refresh_fit()
+        self._checkpoint()
         self._set_status(f"Cut audio to {v:.2f}s (from {a:.2f}s)")
 
     def _on_aspect(self, btn: Gtk.ToggleButton, name: str) -> None:
@@ -1235,14 +1416,17 @@ class EditorWindow(Adw.ApplicationWindow):
         w, h = dest_size(name)
         self.aspect_frame.set_ratio(w / h)
         self._refresh_crop()
+        self._checkpoint()
 
     def _set_in(self, *_args: object) -> None:
         self.in_spin.set_value(self._playhead())
         self._refresh_fit()
+        self._checkpoint()
 
     def _set_out(self, *_args: object) -> None:
         self.out_spin.set_value(self._playhead())
         self._refresh_fit()
+        self._checkpoint()
 
     def _on_timeline_seek(self, value: float) -> None:
         if self._syncing_scrub:
@@ -1538,6 +1722,8 @@ class EditorApp(Adw.Application):
             self.set_accels_for_action("win.save", ["<Control>s"])
             self.set_accels_for_action("win.save-as", ["<Control><Shift>s"])
             self.set_accels_for_action("win.open-project", ["<Control>o"])
+            self.set_accels_for_action("win.undo", ["<Control>z"])
+            self.set_accels_for_action("win.redo", ["<Control><Shift>z", "<Control>y"])
         win.present()
 
 
