@@ -24,9 +24,9 @@ from clip_editor.eagle import apply_omarchy_theme, theme_rgb
 from clip_editor.export import ExportError, default_out_path, run_export
 from clip_editor.probe import ProbeError, probe, which_ffmpeg
 from clip_editor.project import (
-    AUTOSAVE_PATH,
     Project,
     ProjectError,
+    clear_autosave,
     read_autosave,
     read_project,
     write_autosave,
@@ -499,10 +499,12 @@ class EditorWindow(Adw.ApplicationWindow):
         self._seek_audio_src: int = 0
         self._tick: int | None = None
         self._prep_handler: int = 0
+        self._space_held = False
 
         toolbar = Adw.ToolbarView()
         header = Adw.HeaderBar()
         menu = Gio.Menu()
+        menu.append("New", "win.new-project")
         menu.append("Open project…", "win.open-project")
         menu.append("Save", "win.save")
         menu.append("Save As…", "win.save-as")
@@ -536,6 +538,7 @@ class EditorWindow(Adw.ApplicationWindow):
         transport = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.btn_play = Gtk.Button(label="Play")
         self.btn_play.set_sensitive(False)
+        self.btn_play.set_tooltip_text("Play / pause (Space)")
         self.btn_play.connect("clicked", self._on_play)
         transport.append(self.btn_play)
         self.clock = Gtk.Label(label="0.00 / 0.00")
@@ -648,17 +651,41 @@ class EditorWindow(Adw.ApplicationWindow):
         self._install_drop(toolbar)
         self._install_drop(root)
         self._install_drop(self.preview)
+        keys = Gtk.EventControllerKey()
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self._on_key_pressed)
+        keys.connect("key-released", self._on_key_released)
+        self.add_controller(keys)
         GLib.idle_add(self._restore_autosave)
 
     def _install_project_actions(self) -> None:
         for name, handler in (
+            ("new-project", self._on_new_project),
             ("open-project", self._on_open_project),
             ("save", self._on_save),
             ("save-as", self._on_save_as),
+            ("play-pause", self._on_play),
         ):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", handler)
             self.add_action(action)
+
+    def _on_key_pressed(self, _c: Gtk.EventControllerKey, keyval: int, _code: int, state: int) -> bool:
+        mods = state & Gtk.accelerator_get_default_mod_mask()
+        if mods:
+            return False
+        if keyval not in (Gdk.KEY_space, Gdk.KEY_KP_Space):
+            return False
+        if self._space_held:
+            return True
+        self._space_held = True
+        self._on_play()
+        return True
+
+    def _on_key_released(self, _c: Gtk.EventControllerKey, keyval: int, _code: int, _state: int) -> bool:
+        if keyval in (Gdk.KEY_space, Gdk.KEY_KP_Space):
+            self._space_held = False
+        return False
 
     def _current_project(self) -> Project:
         return Project(
@@ -771,6 +798,65 @@ class EditorWindow(Adw.ApplicationWindow):
         store.append(filt)
         store.append(allf)
         return store
+
+    def _clear_session(self) -> None:
+        self._stop()
+        self._dispose_media()
+        self.video_path = None
+        self.audio_path = None
+        self.video_info = None
+        self.audio_info = None
+        self.audio_fit = False
+        self.project_path = None
+        self.aspect = "9:16"
+        dw, dh = dest_size("9:16")
+        self.aspect_frame.set_ratio(dw / dh)
+        nine = self.aspect_buttons.get("9:16")
+        if nine is not None and not nine.get_active():
+            nine.set_active(True)
+        self.preview.set_pixbuf(None)
+        self.preview.set_media(None)
+        self.preview.pan_x = 0.5
+        self.preview.pan_y = 0.5
+        self.preview.queue_draw()
+        self.in_spin.set_value(0)
+        self.out_spin.set_value(0)
+        self.follow_in.set_active(False)
+        self.video_label.set_text("none")
+        self.audio_label.set_text("none — keeps the video’s audio if it has one")
+        self.btn_play.set_sensitive(False)
+        self.btn_play.set_label("Play")
+        self.btn_export.set_sensitive(False)
+        self.btn_fit.set_sensitive(False)
+        self.btn_fit.set_label("Fit")
+        self.btn_clear_audio.set_sensitive(False)
+        self.clock.set_text("0.00 / 0.00")
+        self.crop_label.set_text("")
+        self.export_name.set_text("name is assigned on export (.mp4)")
+        self.export_name.set_tooltip_text("")
+        self.progress.set_fraction(0)
+        self.timeline.set_clips()
+        self.timeline.set_playhead(0)
+        self.timeline.set_range(0.0, 0.0)
+        self.timeline.set_duration(0.0)
+
+    def _on_new_project(self, *_args: object) -> None:
+        if self.exporting:
+            return
+        self._loading = True
+        try:
+            if self.project_path is not None:
+                self._flush_autosave()
+            elif self._autosave_src:
+                GLib.source_remove(self._autosave_src)
+                self._autosave_src = 0
+            self._clear_session()
+            clear_autosave()
+        finally:
+            self._loading = False
+        self._update_title()
+        self._refresh_fit()
+        self._set_status("New project")
 
     def _on_open_project(self, *_args: object) -> None:
         dialog = Gtk.FileDialog(title="Open project")
@@ -1341,6 +1427,8 @@ class EditorWindow(Adw.ApplicationWindow):
             self._tick = None
 
     def _on_play(self, *_args: object) -> None:
+        if self.exporting:
+            return
         if not self.video_path and not self.audio_path:
             return
         if self.playing:
@@ -1446,6 +1534,7 @@ class EditorApp(Adw.Application):
         win = self.props.active_window
         if win is None:
             win = EditorWindow(application=self)
+            self.set_accels_for_action("win.new-project", ["<Control>n"])
             self.set_accels_for_action("win.save", ["<Control>s"])
             self.set_accels_for_action("win.save-as", ["<Control><Shift>s"])
             self.set_accels_for_action("win.open-project", ["<Control>o"])

@@ -181,3 +181,13 @@ def read_autosave() -> Project | None:
         return read_project(AUTOSAVE_PATH)
     except ProjectError:
         return None
+
+
+def clear_autosave() -> None:
+    try:
+        AUTOSAVE_PATH.unlink(missing_ok=True)
+    except OSError:
+        try:
+            _atomic_write(AUTOSAVE_PATH, Project())
+        except OSError:
+            pass
