@@ -120,7 +120,10 @@ class CoverPreview(Gtk.Widget):
 
     def _paintable(self) -> Gdk.Paintable | None:
         if self._media is not None:
-            return self._media
+            iw = int(self._media.get_intrinsic_width() or 0)
+            ih = int(self._media.get_intrinsic_height() or 0)
+            if iw > 0 and ih > 0:
+                return self._media
         return self._texture
 
     def do_snapshot(self, snapshot: Gtk.Snapshot) -> None:  # noqa: N802
@@ -188,6 +191,161 @@ class CoverPreview(Gtk.Widget):
             self.on_pan()
 
 
+class Timeline(Gtk.DrawingArea):
+    """Full-clip ruler: selected in/out range and a draggable playhead."""
+
+    __gtype_name__ = "ClipTimeline"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.duration = 0.0
+        self.in_s = 0.0
+        self.out_s = 0.0
+        self.playhead = 0.0
+        self.on_seek = None
+        self._dragging = False
+        self.set_hexpand(True)
+        self.set_content_width(200)
+        self.set_content_height(56)
+        self.set_draw_func(self._draw)
+        self.set_sensitive(False)
+        self.set_cursor_from_name("col-resize")
+        self.set_tooltip_text("Drag the playhead. Highlight is the in/out range.")
+        click = Gtk.GestureClick()
+        click.connect("pressed", self._on_pressed)
+        self.add_controller(click)
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-begin", self._on_drag_begin)
+        drag.connect("drag-update", self._on_drag_update)
+        drag.connect("drag-end", self._on_drag_end)
+        self.add_controller(drag)
+
+    def set_duration(self, duration: float) -> None:
+        self.duration = max(0.0, float(duration))
+        if self.out_s <= 0 or self.out_s > self.duration:
+            self.out_s = self.duration
+        self.set_sensitive(self.duration > 0.04)
+        self.queue_draw()
+
+    def set_range(self, in_s: float, out_s: float) -> None:
+        self.in_s = max(0.0, float(in_s))
+        self.out_s = max(self.in_s, float(out_s))
+        if self.duration > 0:
+            self.out_s = min(self.out_s, self.duration)
+        self.queue_draw()
+
+    def set_playhead(self, t: float) -> None:
+        if self._dragging:
+            return
+        self.playhead = max(0.0, float(t))
+        if self.duration > 0:
+            self.playhead = min(self.playhead, self.duration)
+        self.queue_draw()
+
+    def _x_to_t(self, x: float) -> float:
+        w = max(1.0, float(self.get_width()))
+        pad = 8.0
+        inner = max(1.0, w - 2 * pad)
+        t = ((x - pad) / inner) * self.duration
+        return max(0.0, min(self.duration, t))
+
+    def _t_to_x(self, t: float, width: float) -> float:
+        pad = 8.0
+        inner = max(1.0, width - 2 * pad)
+        if self.duration <= 0:
+            return pad
+        return pad + (max(0.0, min(self.duration, t)) / self.duration) * inner
+
+    def _seek_x(self, x: float) -> None:
+        t = self._x_to_t(x)
+        self.playhead = t
+        self.queue_draw()
+        if callable(self.on_seek):
+            self.on_seek(t)
+
+    def _on_pressed(self, _g: Gtk.GestureClick, _n: int, x: float, _y: float) -> None:
+        self._seek_x(x)
+
+    def _on_drag_begin(self, gesture: Gtk.GestureDrag, _x: float, _y: float) -> None:
+        self._dragging = True
+        ok, ox, _oy = gesture.get_start_point()
+        if ok:
+            self._seek_x(ox)
+
+    def _on_drag_update(self, gesture: Gtk.GestureDrag, dx: float, _dy: float) -> None:
+        ok, ox, _oy = gesture.get_start_point()
+        if ok:
+            self._seek_x(ox + dx)
+
+    def _on_drag_end(self, *_args: object) -> None:
+        self._dragging = False
+        if callable(self.on_seek):
+            self.on_seek(self.playhead)
+
+    def _draw(self, _area: Gtk.DrawingArea, cr, width: int, height: int) -> None:  # noqa: ANN001
+        bg = theme_rgb("dark_background", (0.04, 0.05, 0.08))
+        track = theme_rgb("lighter_background", (0.12, 0.14, 0.22))
+        sel = theme_rgb("accent", (0.49, 0.51, 0.85))
+        fg = theme_rgb("foreground", (1.0, 0.8, 0.68))
+        muted = theme_rgb("muted", (0.43, 0.49, 0.71))
+        cr.set_source_rgb(*bg)
+        cr.paint()
+        pad_x, pad_y = 8.0, 16.0
+        track_h = 10.0
+        track_y = (height - track_h) / 2.0
+        inner_w = max(1.0, width - 2 * pad_x)
+
+        def _round_rect(x: float, y: float, w: float, h: float, r: float) -> None:
+            r = min(r, h / 2.0, w / 2.0)
+            cr.new_sub_path()
+            cr.arc(x + w - r, y + r, r, -1.5708, 0)
+            cr.arc(x + w - r, y + h - r, r, 0, 1.5708)
+            cr.arc(x + r, y + h - r, r, 1.5708, 3.1416)
+            cr.arc(x + r, y + r, r, 3.1416, 4.7124)
+            cr.close_path()
+
+        _round_rect(pad_x, track_y, inner_w, track_h, 3)
+        cr.set_source_rgb(*track)
+        cr.fill()
+
+        if self.duration > 0 and self.out_s > self.in_s:
+            x0 = self._t_to_x(self.in_s, width)
+            x1 = self._t_to_x(self.out_s, width)
+            sel_h = track_h + 6
+            _round_rect(x0, track_y - 3, max(2.0, x1 - x0), sel_h, 3)
+            cr.set_source_rgba(*sel, 0.92)
+            cr.fill()
+            cr.set_source_rgb(*fg)
+            cr.set_line_width(2)
+            cr.move_to(x0, pad_y - 6)
+            cr.line_to(x0, height - pad_y + 6)
+            cr.move_to(x1, pad_y - 6)
+            cr.line_to(x1, height - pad_y + 6)
+            cr.stroke()
+
+        px = self._t_to_x(self.playhead, width)
+        cr.set_source_rgb(*fg)
+        cr.set_line_width(2)
+        cr.move_to(px, 4)
+        cr.line_to(px, height - 4)
+        cr.stroke()
+        cr.move_to(px, 4)
+        cr.line_to(px - 6, 14)
+        cr.line_to(px + 6, 14)
+        cr.close_path()
+        cr.fill()
+
+        cr.set_source_rgb(*muted)
+        cr.set_font_size(11)
+        cr.move_to(pad_x, height - 3)
+        cr.show_text(f"{self.playhead:.2f}s")
+        if self.duration > 0:
+            label = f"{self.duration:.2f}s"
+            ext = cr.text_extents(label)
+            cr.move_to(width - pad_x - ext.width, height - 3)
+            cr.show_text(label)
+
+
 class EditorWindow(Adw.ApplicationWindow):
     def __init__(self, **kwargs: object) -> None:
         super().__init__(**kwargs)
@@ -210,6 +368,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self._play_t0 = 0.0
         self._play_mono = 0.0
         self._syncing_scrub = False
+        self._seek_audio_src: int = 0
         self._tick: int | None = None
         self._prep_handler: int = 0
 
@@ -254,13 +413,10 @@ class EditorWindow(Adw.ApplicationWindow):
         self.clock = Gtk.Label(label="0.00 / 0.00")
         self.clock.add_css_class("dim-label")
         transport.append(self.clock)
-        self.scrub = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 0.01)
-        self.scrub.set_hexpand(True)
-        self.scrub.set_draw_value(False)
-        self.scrub.set_sensitive(False)
-        self.scrub.connect("change-value", self._on_scrub)
-        transport.append(self.scrub)
         left.append(transport)
+        self.timeline = Timeline()
+        self.timeline.on_seek = self._on_timeline_seek
+        left.append(self.timeline)
 
         right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         right.set_size_request(320, -1)
@@ -592,7 +748,7 @@ class EditorWindow(Adw.ApplicationWindow):
                 return ts / 1_000_000.0
         if self.playing:
             return self._play_t0 + (time.monotonic() - self._play_mono)
-        return self.scrub.get_value()
+        return self.timeline.playhead
 
     def _install_drop(self, widget: Gtk.Widget) -> None:
         actions = Gdk.DragAction.COPY | Gdk.DragAction.MOVE
@@ -643,6 +799,7 @@ class EditorWindow(Adw.ApplicationWindow):
         a = self._audio_usable()
         longer = bool(self.audio_path) and a > v + 0.05 and v > 0.04
         self.btn_fit.set_sensitive(bool(self.audio_path))
+        self.timeline.set_range(self.in_spin.get_value(), self.out_spin.get_value())
         if not self.audio_path:
             self.btn_fit.set_label("Fit")
             self._schedule_autosave()
@@ -767,9 +924,12 @@ class EditorWindow(Adw.ApplicationWindow):
             if not from_project:
                 self.in_spin.set_value(0)
                 self.out_spin.set_value(dur)
-            self.scrub.set_range(0, max(dur, 0.01))
-            self.scrub.set_value(0)
-            self.scrub.set_sensitive(True)
+            self.timeline.set_duration(dur)
+            self.timeline.set_playhead(0)
+            self.timeline.set_range(
+                self.in_spin.get_value(),
+                self.out_spin.get_value() if from_project else dur,
+            )
             self.btn_play.set_sensitive(True)
             self.btn_export.set_sensitive(True)
             self.video_label.set_text(
@@ -842,19 +1002,30 @@ class EditorWindow(Adw.ApplicationWindow):
         self.out_spin.set_value(self._playhead())
         self._refresh_fit()
 
-    def _on_scrub(self, _s: Gtk.Scale, _t: Gtk.ScrollType, value: float) -> bool:
+    def _on_timeline_seek(self, value: float) -> None:
         if self._syncing_scrub:
-            return False
+            return
         dur = float((self.video_info or {}).get("duration") or 0)
         self.clock.set_text(f"{value:.2f} / {dur:.2f}")
+        if self._vmedia is not None:
+            if not self.playing:
+                self.preview.set_media(self._vmedia)
+            try:
+                self._vmedia.seek(int(max(0.0, value) * 1_000_000))
+            except GLib.Error:
+                pass
+            self.preview.queue_draw()
+        if not self.playing:
+            return
+        self._play_t0 = value
+        self._play_mono = time.monotonic()
+        if self._seek_audio_src:
+            GLib.source_remove(self._seek_audio_src)
+        self._seek_audio_src = GLib.timeout_add(80, self._restart_seek_audio, value)
+
+    def _restart_seek_audio(self, value: float) -> bool:
+        self._seek_audio_src = 0
         if self.playing:
-            self._play_t0 = value
-            self._play_mono = time.monotonic()
-            if self._vmedia is not None:
-                try:
-                    self._vmedia.seek(int(max(0.0, value) * 1_000_000))
-                except GLib.Error:
-                    pass
             self._start_preview_audio(value)
         return False
 
@@ -1002,6 +1173,9 @@ class EditorWindow(Adw.ApplicationWindow):
         self.playing = False
         self.btn_play.set_label("Play")
         self._stop_preview_audio()
+        if self._seek_audio_src:
+            GLib.source_remove(self._seek_audio_src)
+            self._seek_audio_src = 0
         if self._vmedia is not None:
             self._vmedia.pause()
         self.preview.set_media(None)
@@ -1037,7 +1211,7 @@ class EditorWindow(Adw.ApplicationWindow):
         out = self.out_spin.get_value()
         dur = float((self.video_info or {}).get("duration") or 0)
         self._syncing_scrub = True
-        self.scrub.set_value(t)
+        self.timeline.set_playhead(t)
         self._syncing_scrub = False
         self.clock.set_text(f"{t:.2f} / {dur:.2f}")
         self.preview.queue_draw()
