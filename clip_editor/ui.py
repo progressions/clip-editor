@@ -289,7 +289,7 @@ class Timeline(Gtk.DrawingArea):
         self.set_cursor_from_name("col-resize")
         self.set_tooltip_text(
             "Drag a clip to slide it. Drag either edge to trim. "
-            "Drag the ruler or playhead to seek."
+            "Drag the ruler or playhead to seek. Del removes the selected clip."
         )
         click = Gtk.GestureClick()
         click.connect("pressed", self._on_pressed)
@@ -319,7 +319,12 @@ class Timeline(Gtk.DrawingArea):
             ends.append(c.start + max(c.out_s, self.audio_dur))
             ends.append(c.start + c.out_s)
         self.duration = max(ends)
-        self.set_sensitive(self.duration > 0.04 or bool(self.vclips or self.aclips))
+        self.set_sensitive(
+            self.duration > 0.04
+            or bool(self.vclips or self.aclips)
+            or self.video_dur > 0.04
+            or (self.audio_kind == "replace" and self.audio_dur > 0.04)
+        )
 
     def set_duration(self, duration: float) -> None:
         self.video_dur = max(0.0, float(duration))
@@ -1234,6 +1239,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.audio_clips: list[ClipInst] = []
         self.sel_v = -1
         self.sel_a = -1
+        self.sel_kind = ""
         self._clip_playing = False
         self._audio_pending = False
         self.project_path: Path | None = None
@@ -1481,6 +1487,8 @@ class EditorWindow(Adw.ApplicationWindow):
             return True
         if mods:
             return False
+        if keyval in (Gdk.KEY_Delete, Gdk.KEY_KP_Delete):
+            return self._delete_selected_clip()
         if keyval not in (Gdk.KEY_space, Gdk.KEY_KP_Space):
             return False
         if self._space_held:
@@ -1667,6 +1675,8 @@ class EditorWindow(Adw.ApplicationWindow):
         self.export_name.set_tooltip_text("")
         self.video_clips = []
         self.sel_v = -1
+        if self.sel_kind == "video":
+            self.sel_kind = "audio" if self.audio_clips else ""
         self._refresh_media()
 
     def _unload_audio(self) -> None:
@@ -1682,6 +1692,8 @@ class EditorWindow(Adw.ApplicationWindow):
         self.audio_out = None
         self.audio_clips = []
         self.sel_a = -1
+        if self.sel_kind == "audio":
+            self.sel_kind = "video" if self.video_clips else ""
         self._refresh_media()
 
     def _apply_project(self, proj: Project) -> None:
@@ -1736,6 +1748,12 @@ class EditorWindow(Adw.ApplicationWindow):
                 ]
             self.sel_v = 0 if self.video_clips else -1
             self.sel_a = 0 if self.audio_clips else -1
+            if self.video_clips:
+                self.sel_kind = "video"
+            elif self.audio_clips:
+                self.sel_kind = "audio"
+            else:
+                self.sel_kind = ""
             self.project_path = proj.path
             self._refresh_fit()
             self._update_title()
@@ -1805,6 +1823,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.audio_clips = []
         self.sel_v = -1
         self.sel_a = -1
+        self.sel_kind = ""
         self.btn_play.set_label("Play")
         self.progress.set_fraction(0)
         self.timeline.set_clips()
@@ -2021,9 +2040,6 @@ class EditorWindow(Adw.ApplicationWindow):
                 if c.out_s <= c.in_s:
                     c.out_s = adur
             kind = "replace"
-            if not self.audio_clips:
-                self.audio_clips = [ClipInst(start=self.audio_start, in_s=self.audio_in, out_s=adur)]
-                self.sel_a = 0
         elif self.video_info and self.video_info.get("has_audio"):
             aname = "video soundtrack"
             adur = vdur
@@ -2064,6 +2080,7 @@ class EditorWindow(Adw.ApplicationWindow):
         if 0 <= self.sel_v < len(self.video_clips):
             c = self.video_clips[self.sel_v]
             self.timeline.set_range(c.in_s, c.out_s)
+        self.btn_export.set_sensitive(bool(self.video_clips) and not self.exporting)
         self._refresh_media()
 
     def _refresh_media(self) -> None:
@@ -2239,6 +2256,7 @@ class EditorWindow(Adw.ApplicationWindow):
                 self.video_start = 0.0
                 self.video_clips = [ClipInst(start=0.0, in_s=0.0, out_s=dur)]
                 self.sel_v = 0
+                self.sel_kind = "video"
             self.timeline.set_duration(dur)
             self.timeline.set_playhead(self.video_start)
             self.timeline.set_range(
@@ -2281,6 +2299,8 @@ class EditorWindow(Adw.ApplicationWindow):
                     ClipInst(start=self.audio_start, in_s=0.0, out_s=self.audio_out)
                 ]
                 self.sel_a = 0
+                if not self.video_clips:
+                    self.sel_kind = "audio"
             self.btn_clear_audio.set_sensitive(True)
             self._set_status(f"Opened {path.name}")
             if self._audio_usable() > self._edit_dur() + 0.05:
@@ -2390,6 +2410,7 @@ class EditorWindow(Adw.ApplicationWindow):
         if not done:
             return
         self.sel_v = index
+        self.sel_kind = "video"
         self._loading = True
         try:
             self.in_spin.set_value(in_s)
@@ -2412,6 +2433,7 @@ class EditorWindow(Adw.ApplicationWindow):
         if not done:
             return
         self.sel_a = index
+        self.sel_kind = "audio"
         if self.follow_in.get_active():
             self.follow_in.set_active(False)
         self._refresh_fit()
@@ -2424,6 +2446,7 @@ class EditorWindow(Adw.ApplicationWindow):
     def _on_clip_select(self, kind: str, index: int) -> None:
         if kind == "video" and 0 <= index < len(self.video_clips):
             self.sel_v = index
+            self.sel_kind = "video"
             c = self.video_clips[index]
             self.video_start = c.start
             self._loading = True
@@ -2434,6 +2457,7 @@ class EditorWindow(Adw.ApplicationWindow):
                 self._loading = False
         elif kind == "audio" and 0 <= index < len(self.audio_clips):
             self.sel_a = index
+            self.sel_kind = "audio"
             c = self.audio_clips[index]
             self.audio_start = c.start
             self.audio_in = c.in_s
@@ -2449,6 +2473,7 @@ class EditorWindow(Adw.ApplicationWindow):
                 return
             self.video_clips.append(ClipInst(start=t, in_s=0.0, out_s=dur))
             self.sel_v = len(self.video_clips) - 1
+            self.sel_kind = "video"
             self._loading = True
             try:
                 self.in_spin.set_value(0)
@@ -2465,6 +2490,7 @@ class EditorWindow(Adw.ApplicationWindow):
                 return
             self.audio_clips.append(ClipInst(start=t, in_s=0.0, out_s=dur))
             self.sel_a = len(self.audio_clips) - 1
+            self.sel_kind = "audio"
             self.audio_start = t
             self.audio_in = 0.0
             self.audio_out = dur
@@ -2476,6 +2502,72 @@ class EditorWindow(Adw.ApplicationWindow):
         self._sync_timeline_clips()
         self._checkpoint()
         self._schedule_autosave()
+
+    def _selected_clip_kind(self) -> str:
+        if self.sel_kind == "video" and 0 <= self.sel_v < len(self.video_clips):
+            return "video"
+        if self.sel_kind == "audio" and 0 <= self.sel_a < len(self.audio_clips):
+            return "audio"
+        if 0 <= self.sel_v < len(self.video_clips):
+            return "video"
+        if 0 <= self.sel_a < len(self.audio_clips):
+            return "audio"
+        return ""
+
+    def _delete_selected_clip(self) -> bool:
+        if self.exporting:
+            return False
+        kind = self._selected_clip_kind()
+        if kind == "video":
+            idx = self.sel_v
+            if not 0 <= idx < len(self.video_clips):
+                return False
+            self._stop()
+            del self.video_clips[idx]
+            if self.video_clips:
+                self.sel_v = min(idx, len(self.video_clips) - 1)
+                self.sel_kind = "video"
+                c = self.video_clips[self.sel_v]
+                self.video_start = c.start
+                self._loading = True
+                try:
+                    self.in_spin.set_value(c.in_s)
+                    self.out_spin.set_value(c.out_s)
+                finally:
+                    self._loading = False
+            else:
+                self.sel_v = -1
+                self.video_start = 0.0
+                self.sel_kind = "audio" if self.audio_clips else ""
+            self._set_status("Removed video clip")
+        elif kind == "audio":
+            idx = self.sel_a
+            if not 0 <= idx < len(self.audio_clips):
+                return False
+            self._stop()
+            del self.audio_clips[idx]
+            if self.audio_clips:
+                self.sel_a = min(idx, len(self.audio_clips) - 1)
+                self.sel_kind = "audio"
+                c = self.audio_clips[self.sel_a]
+                self.audio_start = c.start
+                self.audio_in = c.in_s
+                self.audio_out = c.out_s
+            else:
+                self.sel_a = -1
+                self.sel_kind = "video" if self.video_clips else ""
+                if self.follow_in.get_active():
+                    self.follow_in.set_active(False)
+            self._set_status("Removed audio clip")
+        else:
+            return False
+        self._sync_timeline_clips()
+        t = self.timeline.playhead
+        self.clock.set_text(f"{t:.2f} / {self._program_end():.2f}")
+        self._apply_timeline_frame(t, start_media=False)
+        self._checkpoint()
+        self._schedule_autosave()
+        return True
 
     def _on_timeline_seek(self, value: float) -> None:
         if self._syncing_scrub:
@@ -2796,6 +2888,9 @@ class EditorWindow(Adw.ApplicationWindow):
 
     def _on_export(self, *_args: object) -> None:
         if not self.video_path or self.exporting:
+            return
+        if not self.video_clips:
+            self._set_status("No video on the timeline")
             return
         self._stop()
         self.exporting = True
