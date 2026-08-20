@@ -222,7 +222,7 @@ def _round_rect(cr, x: float, y: float, w: float, h: float, r: float) -> None:  
 
 
 class Timeline(Gtk.DrawingArea):
-    """Ruler plus video and audio lanes. Playhead is draggable; clips are not."""
+    """Ruler plus video and audio lanes. Drag the video clip or the playhead."""
 
     __gtype_name__ = "ClipTimeline"
 
@@ -237,6 +237,7 @@ class Timeline(Gtk.DrawingArea):
         super().__init__()
         self.duration = 0.0
         self.video_dur = 0.0
+        self.video_start = 0.0
         self.video_name = ""
         self.audio_name = ""
         self.audio_start = 0.0
@@ -246,7 +247,11 @@ class Timeline(Gtk.DrawingArea):
         self.out_s = 0.0
         self.playhead = 0.0
         self.on_seek = None
-        self._dragging = False
+        self.on_video_move = None
+        self._drag_mode = ""
+        self._drag_v0 = 0.0
+        self._drag_span = 0.0
+        self._drag_inner = 1.0
         self.set_hexpand(True)
         self.set_vexpand(False)
         self.set_content_width(200)
@@ -255,7 +260,10 @@ class Timeline(Gtk.DrawingArea):
         self.set_draw_func(self._draw)
         self.set_sensitive(False)
         self.set_cursor_from_name("col-resize")
-        self.set_tooltip_text("Drag the playhead. Bars are the video and audio clips.")
+        self.set_tooltip_text(
+            "Drag the video clip to slide it on the timeline. "
+            "Drag the ruler or playhead to seek."
+        )
         click = Gtk.GestureClick()
         click.connect("pressed", self._on_pressed)
         self.add_controller(click)
@@ -264,12 +272,15 @@ class Timeline(Gtk.DrawingArea):
         drag.connect("drag-update", self._on_drag_update)
         drag.connect("drag-end", self._on_drag_end)
         self.add_controller(drag)
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", self._on_motion)
+        self.add_controller(motion)
 
     def _recompute_span(self) -> None:
         self.duration = max(
-            self.video_dur,
+            self.video_start + self.video_dur,
             self.audio_start + self.audio_dur,
-            self.out_s,
+            self.video_start + self.out_s,
             0.0,
         )
         self.set_sensitive(self.duration > 0.04)
@@ -286,6 +297,7 @@ class Timeline(Gtk.DrawingArea):
         *,
         video_name: str = "",
         video_dur: float = 0.0,
+        video_start: float = 0.0,
         audio_name: str = "",
         audio_start: float = 0.0,
         audio_dur: float = 0.0,
@@ -293,6 +305,7 @@ class Timeline(Gtk.DrawingArea):
     ) -> None:
         self.video_name = video_name
         self.video_dur = max(0.0, float(video_dur))
+        self.video_start = max(0.0, float(video_start))
         self.audio_name = audio_name
         self.audio_start = max(0.0, float(audio_start))
         self.audio_dur = max(0.0, float(audio_dur))
@@ -309,7 +322,7 @@ class Timeline(Gtk.DrawingArea):
         self.queue_draw()
 
     def set_playhead(self, t: float) -> None:
-        if self._dragging:
+        if self._drag_mode:
             return
         self.playhead = max(0.0, float(t))
         if self.duration > 0:
@@ -321,16 +334,36 @@ class Timeline(Gtk.DrawingArea):
         inner = max(1.0, float(width) - left - self._PAD_RIGHT)
         return left, inner
 
+    def _map_span(self) -> float:
+        if self._drag_mode == "video" and self._drag_span > 0:
+            return self._drag_span
+        return self.duration
+
     def _x_to_t(self, x: float) -> float:
         left, inner = self._inner(max(1.0, float(self.get_width())))
-        t = ((x - left) / inner) * self.duration
-        return max(0.0, min(self.duration, t))
+        span = self._map_span()
+        t = ((x - left) / inner) * span
+        return max(0.0, min(span, t))
 
     def _t_to_x(self, t: float, width: float) -> float:
         left, inner = self._inner(width)
-        if self.duration <= 0:
+        span = self._map_span()
+        if span <= 0:
             return left
-        return left + (max(0.0, min(self.duration, t)) / self.duration) * inner
+        return left + (t / span) * inner
+
+    def _hit_video(self, x: float, y: float) -> bool:
+        if self.video_dur <= 0:
+            return False
+        v_y = self._RULER_H
+        if y < v_y or y > v_y + self._LANE_H:
+            return False
+        w = max(1.0, float(self.get_width()))
+        x0 = self._t_to_x(self.video_start, w)
+        x1 = self._t_to_x(self.video_start + self.video_dur, w)
+        if x1 < x0:
+            x0, x1 = x1, x0
+        return (x0 - 2) <= x <= (x1 + 2)
 
     def _seek_x(self, x: float) -> None:
         t = self._x_to_t(x)
@@ -339,24 +372,57 @@ class Timeline(Gtk.DrawingArea):
         if callable(self.on_seek):
             self.on_seek(t)
 
-    def _on_pressed(self, _g: Gtk.GestureClick, _n: int, x: float, _y: float) -> None:
+    def _on_pressed(self, _g: Gtk.GestureClick, _n: int, x: float, y: float) -> None:
+        if self._hit_video(x, y):
+            return
         self._seek_x(x)
 
+    def _on_motion(self, _c: Gtk.EventControllerMotion, x: float, y: float) -> None:
+        if self._drag_mode == "video":
+            self.set_cursor_from_name("grabbing")
+        elif self._hit_video(x, y):
+            self.set_cursor_from_name("grab")
+        else:
+            self.set_cursor_from_name("col-resize")
+
     def _on_drag_begin(self, gesture: Gtk.GestureDrag, _x: float, _y: float) -> None:
-        self._dragging = True
-        ok, ox, _oy = gesture.get_start_point()
-        if ok:
+        ok, ox, oy = gesture.get_start_point()
+        if not ok:
+            return
+        left, inner = self._inner(max(1.0, float(self.get_width())))
+        self._drag_inner = inner
+        self._drag_span = max(self.duration, 0.01)
+        if self._hit_video(ox, oy):
+            self._drag_mode = "video"
+            self._drag_v0 = self.video_start
+            self.set_cursor_from_name("grabbing")
+        else:
+            self._drag_mode = "seek"
             self._seek_x(ox)
 
     def _on_drag_update(self, gesture: Gtk.GestureDrag, dx: float, _dy: float) -> None:
+        if self._drag_mode == "video":
+            dt = dx / self._drag_inner * self._drag_span
+            self.video_start = max(0.0, self._drag_v0 + dt)
+            self.queue_draw()
+            if callable(self.on_video_move):
+                self.on_video_move(self.video_start, False)
+            return
         ok, ox, _oy = gesture.get_start_point()
         if ok:
             self._seek_x(ox + dx)
 
     def _on_drag_end(self, *_args: object) -> None:
-        self._dragging = False
-        if callable(self.on_seek):
+        mode = self._drag_mode
+        self._drag_mode = ""
+        self._recompute_span()
+        if mode == "video":
+            self.set_cursor_from_name("grab")
+            if callable(self.on_video_move):
+                self.on_video_move(self.video_start, True)
+        elif mode == "seek" and callable(self.on_seek):
             self.on_seek(self.playhead)
+        self.queue_draw()
 
     def _draw_clip(
         self,
@@ -415,8 +481,8 @@ class Timeline(Gtk.DrawingArea):
         cr.show_text("A")
 
         if self.video_dur > 0:
-            x0 = self._t_to_x(0.0, width)
-            x1 = self._t_to_x(self.video_dur, width)
+            x0 = self._t_to_x(self.video_start, width)
+            x1 = self._t_to_x(self.video_start + self.video_dur, width)
             self._draw_clip(
                 cr, x0, v_y + 3, max(3.0, x1 - x0), self._LANE_H - 6, sel, self.video_name
             )
@@ -430,8 +496,8 @@ class Timeline(Gtk.DrawingArea):
             )
 
         if self.duration > 0 and self.out_s > self.in_s:
-            x_in = self._t_to_x(self.in_s, width)
-            x_out = self._t_to_x(self.out_s, width)
+            x_in = self._t_to_x(self.video_start + self.in_s, width)
+            x_out = self._t_to_x(self.video_start + self.out_s, width)
             cr.set_source_rgba(*bg, 0.55)
             if x_in > left:
                 cr.rectangle(left, v_y, x_in - left, lanes_bottom - v_y)
@@ -504,6 +570,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.audio_info: dict | None = None
         self.aspect = "9:16"
         self.audio_fit = False
+        self.video_start = 0.0
         self.project_path: Path | None = None
         self._loading = False
         self._autosave_src: int = 0
@@ -578,6 +645,7 @@ class EditorWindow(Adw.ApplicationWindow):
         left.append(transport)
         self.timeline = Timeline()
         self.timeline.on_seek = self._on_timeline_seek
+        self.timeline.on_video_move = self._on_video_move
         left.append(self.timeline)
 
         right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
@@ -751,6 +819,7 @@ class EditorWindow(Adw.ApplicationWindow):
             round(float(p.pan_y), 4),
             round(float(p.in_s), 3),
             out,
+            round(float(p.video_start), 3),
             bool(p.audio_follows_in),
             bool(p.audio_fit),
             str(p.path) if p.path else "",
@@ -848,6 +917,7 @@ class EditorWindow(Adw.ApplicationWindow):
             pan_y=self.preview.pan_y,
             in_s=self.in_spin.get_value(),
             out_s=self.out_spin.get_value(),
+            video_start=self.video_start,
             audio_follows_in=self.follow_in.get_active(),
             audio_fit=self.audio_fit,
             path=self.project_path,
@@ -943,6 +1013,7 @@ class EditorWindow(Adw.ApplicationWindow):
                 self.out_spin.set_value(dur)
             self.follow_in.set_active(proj.audio_follows_in)
             self.audio_fit = proj.audio_fit
+            self.video_start = max(0.0, float(proj.video_start or 0.0))
             self.project_path = proj.path
             self._refresh_fit()
             self._update_title()
@@ -1002,6 +1073,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.in_spin.set_value(0)
         self.out_spin.set_value(0)
         self.follow_in.set_active(False)
+        self.video_start = 0.0
         self.btn_play.set_label("Play")
         self.progress.set_fraction(0)
         self.timeline.set_clips()
@@ -1134,7 +1206,11 @@ class EditorWindow(Adw.ApplicationWindow):
                 return ts / 1_000_000.0
         if self.playing:
             return self._play_t0 + (time.monotonic() - self._play_mono)
-        return self.timeline.playhead
+        src = self.timeline.playhead - self.video_start
+        dur = float((self.video_info or {}).get("duration") or 0)
+        if dur > 0:
+            return min(max(0.0, src), dur)
+        return src
 
     def _install_drop(self, widget: Gtk.Widget) -> None:
         actions = Gdk.DragAction.COPY | Gdk.DragAction.MOVE
@@ -1189,12 +1265,12 @@ class EditorWindow(Adw.ApplicationWindow):
         if self.audio_path and self.audio_info:
             aname = self.audio_path.name
             adur = float(self.audio_info.get("duration") or 0)
-            astart = 0.0 if self.follow_in.get_active() else self.in_spin.get_value()
+            astart = self.video_start if self.follow_in.get_active() else self.in_spin.get_value()
             kind = "replace"
         elif self.video_info and self.video_info.get("has_audio"):
             aname = "video soundtrack"
             adur = vdur
-            astart = 0.0
+            astart = self.video_start
             kind = "source"
         else:
             aname = ""
@@ -1204,6 +1280,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.timeline.set_clips(
             video_name=vname,
             video_dur=vdur,
+            video_start=self.video_start,
             audio_name=aname,
             audio_start=astart,
             audio_dur=adur,
@@ -1343,8 +1420,9 @@ class EditorWindow(Adw.ApplicationWindow):
             if not from_project:
                 self.in_spin.set_value(0)
                 self.out_spin.set_value(dur)
+                self.video_start = 0.0
             self.timeline.set_duration(dur)
-            self.timeline.set_playhead(0)
+            self.timeline.set_playhead(self.video_start)
             self.timeline.set_range(
                 self.in_spin.get_value(),
                 self.out_spin.get_value() if from_project else dur,
@@ -1428,12 +1506,27 @@ class EditorWindow(Adw.ApplicationWindow):
         self._refresh_fit()
         self._checkpoint()
 
+    def _on_video_move(self, start: float, done: bool) -> None:
+        self.video_start = max(0.0, float(start))
+        if not done:
+            return
+        self._sync_timeline_clips()
+        dur = float((self.video_info or {}).get("duration") or 0)
+        source = self.timeline.playhead - self.video_start
+        self.clock.set_text(f"{source:.2f} / {dur:.2f}")
+        self._checkpoint()
+        self._schedule_autosave()
+        self._set_status(f"Video starts at {self.video_start:.2f}s")
+
     def _on_timeline_seek(self, value: float) -> None:
         if self._syncing_scrub:
             return
         dur = float((self.video_info or {}).get("duration") or 0)
-        self.clock.set_text(f"{value:.2f} / {dur:.2f}")
-        seek_t = min(value, dur) if dur > 0 else value
+        source = value - self.video_start
+        self.clock.set_text(f"{source:.2f} / {dur:.2f}")
+        seek_t = source
+        if dur > 0:
+            seek_t = min(max(0.0, source), dur)
         if self._vmedia is not None:
             if not self.playing:
                 self.preview.set_media(self._vmedia)
@@ -1444,11 +1537,11 @@ class EditorWindow(Adw.ApplicationWindow):
             self.preview.queue_draw()
         if not self.playing:
             return
-        self._play_t0 = value
+        self._play_t0 = seek_t
         self._play_mono = time.monotonic()
         if self._seek_audio_src:
             GLib.source_remove(self._seek_audio_src)
-        self._seek_audio_src = GLib.timeout_add(80, self._restart_seek_audio, value)
+        self._seek_audio_src = GLib.timeout_add(80, self._restart_seek_audio, seek_t)
 
     def _restart_seek_audio(self, value: float) -> bool:
         self._seek_audio_src = 0
@@ -1460,7 +1553,10 @@ class EditorWindow(Adw.ApplicationWindow):
         remaining = max(0.05, self.out_spin.get_value() - at_s)
         if self.audio_path:
             path = self.audio_path
-            start = self._audio_start() + (at_s - self.in_spin.get_value())
+            if self.follow_in.get_active():
+                start = at_s
+            else:
+                start = self.video_start + (at_s - self.in_spin.get_value())
         elif self.video_path and self.video_info and self.video_info.get("has_audio"):
             path = self.video_path
             start = at_s
@@ -1640,7 +1736,7 @@ class EditorWindow(Adw.ApplicationWindow):
         out = self.out_spin.get_value()
         dur = float((self.video_info or {}).get("duration") or 0)
         self._syncing_scrub = True
-        self.timeline.set_playhead(t)
+        self.timeline.set_playhead(t + self.video_start)
         self._syncing_scrub = False
         self.clock.set_text(f"{t:.2f} / {dur:.2f}")
         self.preview.queue_draw()
@@ -1664,6 +1760,7 @@ class EditorWindow(Adw.ApplicationWindow):
         in_s = self.in_spin.get_value()
         out_s = self.out_spin.get_value()
         follows = self.follow_in.get_active()
+        v_start = self.video_start
         out = default_out_path(video, aspect)
 
         def progress(pct: float, _state: str) -> None:
@@ -1681,6 +1778,7 @@ class EditorWindow(Adw.ApplicationWindow):
                     in_s=in_s,
                     out_s=out_s,
                     audio_follows_in=follows,
+                    video_start=v_start,
                     progress=progress,
                 )
                 GLib.idle_add(self._export_done, result, None)

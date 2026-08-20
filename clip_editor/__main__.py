@@ -45,6 +45,12 @@ def _add_export_args(p: argparse.ArgumentParser) -> None:
         default=0.0,
         help="seconds into the audio file to start",
     )
+    p.add_argument(
+        "--video-start",
+        type=float,
+        default=0.0,
+        help="timeline offset of the video clip (seconds)",
+    )
     p.add_argument("--json", action="store_true", help="print result as JSON")
 
 
@@ -63,6 +69,7 @@ def cmd_export(args: argparse.Namespace) -> int:
             out_s=args.out_s,
             audio_follows_in=args.audio_follows_in,
             audio_offset=args.audio_offset,
+            video_start=args.video_start,
             progress=None
             if args.json
             else (lambda pct, st: print(f"\r{st} {pct*100:5.1f}%", end="", file=sys.stderr, flush=True)),

@@ -39,6 +39,7 @@ def build_cmd(
     out_s: float | None,
     audio_follows_in: bool,
     audio_offset: float,
+    video_start: float = 0.0,
     src: dict[str, Any] | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     """Return (ffmpeg argv, meta dict with crop/duration/dest)."""
@@ -83,10 +84,15 @@ def build_cmd(
     a_start = float(audio_offset or 0.0)
     if a_start < 0:
         a_start = 0.0
+    v_start = max(0.0, float(video_start or 0.0))
     # Original soundtrack stays locked to the picture. Replacement audio
     # only follows the in-point when the user asks (driver sync).
+    # Sliding the video clip (video_start) shifts which part of a music
+    # bed sits under the export.
     if use_source_audio or (use_replacement and audio_follows_in):
         a_start += in_s
+    elif use_replacement:
+        a_start += v_start
 
     achain = [
         f"atrim=start={a_start:.6f}:duration={duration:.6f}",
@@ -150,6 +156,7 @@ def build_cmd(
         "audio": str(audio_path) if audio_path else None,
         "audio_follows_in": bool(audio_follows_in),
         "audio_offset": a_start if (use_replacement or use_source_audio) else None,
+        "video_start": v_start,
     }
     return cmd, meta
 
@@ -187,6 +194,7 @@ def run_export(
     out_s: float | None = None,
     audio_follows_in: bool = False,
     audio_offset: float = 0.0,
+    video_start: float = 0.0,
     progress: ProgressCb | None = None,
     timeout: float = 1800.0,
 ) -> dict[str, Any]:
@@ -213,6 +221,7 @@ def run_export(
         out_s=out_s,
         audio_follows_in=audio_follows_in,
         audio_offset=audio_offset,
+        video_start=video_start,
         src=src,
     )
     out.parent.mkdir(parents=True, exist_ok=True)

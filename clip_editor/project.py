@@ -33,6 +33,7 @@ class Project:
     pan_y: float = 0.5
     in_s: float = 0.0
     out_s: float | None = None
+    video_start: float = 0.0
     audio_follows_in: bool = False
     audio_fit: bool = False
     path: Path | None = None
@@ -94,6 +95,7 @@ def to_dict(proj: Project) -> dict:
         "pan_y": float(proj.pan_y),
         "in_s": float(proj.in_s),
         "out_s": None if proj.out_s is None else float(proj.out_s),
+        "video_start": float(proj.video_start),
         "audio_follows_in": bool(proj.audio_follows_in),
         "audio_fit": bool(proj.audio_fit),
         "video": str(video) if video else None,
@@ -135,6 +137,7 @@ def from_dict(data: dict, *, origin: Path | None = None) -> Project:
         pan_y=float(data.get("pan_y") if data.get("pan_y") is not None else 0.5),
         in_s=float(data.get("in_s") or 0.0),
         out_s=None if out_raw is None or out_raw == "" else float(out_raw),
+        video_start=max(0.0, float(data.get("video_start") or 0.0)),
         audio_follows_in=bool(data.get("audio_follows_in") or False),
         audio_fit=bool(data.get("audio_fit") or False),
         path=path,
