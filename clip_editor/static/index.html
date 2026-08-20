@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Clip editor</title>
+  <link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+  <header class="top">
+    <h1>Clip editor</h1>
+    <p class="sub">Cover-crop · mux audio · H.264/AAC</p>
+  </header>
+
+  <main class="layout">
+    <section class="preview-col">
+      <div id="stage" class="stage" data-aspect="9:16" title="Drag to reframe">
+        <video id="vid" playsinline></video>
+        <div id="stageEmpty" class="stage-empty">Open a video</div>
+      </div>
+      <audio id="aud"></audio>
+      <p id="cropInfo" class="crop-info"></p>
+      <div class="transport">
+        <button type="button" id="btnPlay" disabled>Play</button>
+        <span id="clock">0.00 / 0.00</span>
+        <input type="range" id="scrub" min="0" max="1000" value="0" step="1" disabled />
+      </div>
+      <div class="trim-bar" id="trimBar">
+        <div id="trimRange" class="trim-range"></div>
+      </div>
+    </section>
+
+    <section class="controls">
+      <div class="field">
+        <label>Video</label>
+        <div class="row">
+          <button type="button" id="btnVideo">Browse</button>
+          <button type="button" id="btnVideoPath">Path…</button>
+        </div>
+        <p id="videoName" class="filename">none</p>
+        <input type="file" id="fileVideo" accept="video/*" hidden />
+      </div>
+
+      <div class="field">
+        <label>Audio</label>
+        <div class="row">
+          <button type="button" id="btnAudio">Browse</button>
+          <button type="button" id="btnAudioPath">Path…</button>
+          <button type="button" id="btnFitAudio" disabled title="Cut the music to the video length">Fit</button>
+          <button type="button" id="btnClearAudio" class="quiet" disabled>Clear</button>
+        </div>
+        <p id="audioName" class="filename">none — keeps the video’s audio if it has one</p>
+        <label class="check">
+          <input type="checkbox" id="audioFollowsIn" />
+          Audio follows video in-point
+        </label>
+        <input type="file" id="fileAudio" accept="audio/*,video/*" hidden />
+      </div>
+
+      <div class="field">
+        <label>Aspect</label>
+        <div class="aspects" id="aspects"></div>
+      </div>
+
+      <div class="field">
+        <label>Trim</label>
+        <div class="row trim-inputs">
+          <label>In <input type="number" id="inS" min="0" step="0.05" value="0" /></label>
+          <label>Out <input type="number" id="outS" min="0" step="0.05" value="0" /></label>
+        </div>
+        <div class="row">
+          <button type="button" id="btnSetIn" disabled>Set in at playhead</button>
+          <button type="button" id="btnSetOut" disabled>Set out at playhead</button>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>Export</label>
+        <p id="exportName" class="filename">name is assigned on export (.mp4)</p>
+        <button type="button" id="btnExport" class="primary" disabled>Export</button>
+        <div class="progress-wrap">
+          <div id="progressBar" class="progress-bar"></div>
+        </div>
+      </div>
+
+      <p id="status" class="status"></p>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

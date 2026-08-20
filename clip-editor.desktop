@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Editor
+GenericName=Clip editor
+Comment=Cover-crop, mux audio, export Buffer-safe H.264
+Exec=/home/isaac/.local/bin/clip-editor
+Icon=video-x-generic
+Terminal=false
+Categories=AudioVideo;Video;AudioVideoEditing;
+Keywords=editor;clip;video;ffmpeg;crop;kdenlive;
+StartupNotify=true
+StartupWMClass=local.clip.Editor

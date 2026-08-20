@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Launch the local clip editor. No args → native GTK window.
+set -euo pipefail
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+ROOT="$(cd "$(dirname "$SOURCE")" && pwd)"
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+if [[ $# -eq 0 ]]; then
+  exec python3 -m clip_editor gui
+fi
+exec python3 -m clip_editor "$@"
