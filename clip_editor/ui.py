@@ -243,6 +243,7 @@ class Timeline(Gtk.DrawingArea):
     _BOTTOM = 16.0
     _EDGE = 8.0
     _MIN = 0.05
+    _SNAP_PX = 10.0
 
     def __init__(self) -> None:
         super().__init__()
@@ -268,6 +269,7 @@ class Timeline(Gtk.DrawingArea):
         self._drag_v0 = 0.0
         self._drag_span = 0.0
         self._drag_inner = 1.0
+        self._snap_line: float | None = None
         self.set_hexpand(True)
         self.set_vexpand(False)
         self.set_content_width(200)
@@ -514,11 +516,70 @@ class Timeline(Gtk.DrawingArea):
     def _dt(self, dx: float) -> float:
         return dx / self._drag_inner * self._drag_span
 
+    def _snap_thresh(self) -> float:
+        inner = max(self._drag_inner, 1.0)
+        return max(0.04, self._SNAP_PX / inner * self._map_span())
+
+    def _other_edges(self, which: str) -> list[float]:
+        if which == "video":
+            if self.audio_dur <= 0 or self.audio_kind == "source":
+                return []
+            t0, t1 = self._audio_times()
+        else:
+            if self.video_dur <= 0:
+                return []
+            t0, t1 = self._video_times()
+        return [t0, t1]
+
+    def _snap_time(self, t: float, targets: list[float]) -> float:
+        self._snap_line = None
+        if not targets:
+            return t
+        thresh = self._snap_thresh()
+        best: float | None = None
+        best_d = thresh
+        for tgt in targets:
+            d = abs(t - tgt)
+            if d <= best_d:
+                best = tgt
+                best_d = d
+        if best is None:
+            return t
+        self._snap_line = best
+        return best
+
+    def _snap_move(
+        self, start: float, used_in: float, used_out: float, targets: list[float]
+    ) -> float:
+        self._snap_line = None
+        if not targets:
+            return start
+        thresh = self._snap_thresh()
+        best = start
+        best_d = thresh
+        line: float | None = None
+        for tgt in targets:
+            for off in (used_in, used_out):
+                cand = tgt - off
+                d = abs(start - cand)
+                if d <= best_d:
+                    best = cand
+                    best_d = d
+                    line = tgt
+        if line is None:
+            return start
+        self._snap_line = line
+        return max(0.0, best)
+
     def _on_drag_update(self, gesture: Gtk.GestureDrag, dx: float, _dy: float) -> None:
         dt = self._dt(dx)
         if self._drag_mode == "video-in":
-            inn, out = self._video_used()
-            self.in_s = min(max(0.0, self._drag_v0 + dt), out - self._MIN)
+            _inn, out = self._video_used()
+            raw = min(max(0.0, self._drag_v0 + dt), out - self._MIN)
+            snapped = self._snap_time(self.video_start + raw, self._other_edges("video"))
+            self.in_s = min(max(0.0, snapped - self.video_start), out - self._MIN)
+            if abs((self.video_start + self.in_s) - snapped) > 1e-4:
+                self._snap_line = None
             if callable(self.on_video_trim):
                 self.on_video_trim(self.in_s, out, False)
             self.queue_draw()
@@ -526,14 +587,22 @@ class Timeline(Gtk.DrawingArea):
         if self._drag_mode == "video-out":
             inn, _out = self._video_used()
             top = self.video_dur if self.video_dur > 0 else self._drag_v0 + dt
-            self.out_s = max(inn + self._MIN, min(top, self._drag_v0 + dt))
+            raw = max(inn + self._MIN, min(top, self._drag_v0 + dt))
+            snapped = self._snap_time(self.video_start + raw, self._other_edges("video"))
+            self.out_s = max(inn + self._MIN, min(top, snapped - self.video_start))
+            if abs((self.video_start + self.out_s) - snapped) > 1e-4:
+                self._snap_line = None
             if callable(self.on_video_trim):
                 self.on_video_trim(inn, self.out_s, False)
             self.queue_draw()
             return
         if self._drag_mode == "audio-in":
             _ain, aout = self._audio_used()
-            self.audio_in = min(max(0.0, self._drag_v0 + dt), aout - self._MIN)
+            raw = min(max(0.0, self._drag_v0 + dt), aout - self._MIN)
+            snapped = self._snap_time(self.audio_start + raw, self._other_edges("audio"))
+            self.audio_in = min(max(0.0, snapped - self.audio_start), aout - self._MIN)
+            if abs((self.audio_start + self.audio_in) - snapped) > 1e-4:
+                self._snap_line = None
             if callable(self.on_audio_trim):
                 self.on_audio_trim(self.audio_in, aout, False)
             self.queue_draw()
@@ -541,7 +610,11 @@ class Timeline(Gtk.DrawingArea):
         if self._drag_mode == "audio-out":
             ain, _aout = self._audio_used()
             top = self.audio_dur if self.audio_dur > 0 else self._drag_v0 + dt
-            self.audio_out = max(ain + self._MIN, min(top, self._drag_v0 + dt))
+            raw = max(ain + self._MIN, min(top, self._drag_v0 + dt))
+            snapped = self._snap_time(self.audio_start + raw, self._other_edges("audio"))
+            self.audio_out = max(ain + self._MIN, min(top, snapped - self.audio_start))
+            if abs((self.audio_start + self.audio_out) - snapped) > 1e-4:
+                self._snap_line = None
             if callable(self.on_audio_trim):
                 self.on_audio_trim(ain, self.audio_out, False)
             self.queue_draw()
@@ -549,10 +622,14 @@ class Timeline(Gtk.DrawingArea):
         if self._drag_mode in ("video", "audio"):
             start = max(0.0, self._drag_v0 + dt)
             if self._drag_mode == "video":
+                inn, out = self._video_used()
+                start = self._snap_move(start, inn, out, self._other_edges("video"))
                 self.video_start = start
                 if callable(self.on_video_move):
                     self.on_video_move(start, False)
             else:
+                inn, out = self._audio_used()
+                start = self._snap_move(start, inn, out, self._other_edges("audio"))
                 self.audio_start = start
                 if callable(self.on_audio_move):
                     self.on_audio_move(start, False)
@@ -565,6 +642,7 @@ class Timeline(Gtk.DrawingArea):
     def _on_drag_end(self, *_args: object) -> None:
         mode = self._drag_mode
         self._drag_mode = ""
+        self._snap_line = None
         self._recompute_span()
         if mode == "video":
             self.set_cursor_from_name("grab")
@@ -727,6 +805,14 @@ class Timeline(Gtk.DrawingArea):
                 cr.move_to(tx + 2, 12)
                 cr.show_text(label)
                 t += step
+
+        if self._snap_line is not None:
+            sx = self._t_to_x(self._snap_line, width)
+            cr.set_source_rgba(*sel, 0.95)
+            cr.set_line_width(1.5)
+            cr.move_to(sx, v_y - 2)
+            cr.line_to(sx, lanes_bottom + 2)
+            cr.stroke()
 
         px = self._t_to_x(self.playhead, width)
         cr.set_source_rgb(*fg)
