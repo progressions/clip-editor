@@ -5,13 +5,14 @@ from __future__ import annotations
 import os
 import subprocess
 import threading
+from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
 from clip_editor.aspects import cover_crop, dest_size
 from clip_editor.eagle import inbox_dir
 from clip_editor.probe import ProbeError, gate_h264, probe, which_ffmpeg
-from clip_editor.project import ClipInst
+from clip_editor.project import ClipInst, MediaItem
 
 ProgressCb = Callable[[float, str], None]
 
@@ -20,17 +21,32 @@ class ExportError(RuntimeError):
     pass
 
 
-def _flatten_clips(clips: list[ClipInst], src_dur: float) -> list[tuple[float, float, float, float]]:
-    """Return (timeline_t0, timeline_t1, source_in, source_out).
+def _dur_for(c: ClipInst, src_dur: float | dict[str, float]) -> float:
+    if isinstance(src_dur, dict):
+        if c.media_id and c.media_id in src_dur:
+            return float(src_dur[c.media_id] or 0.0)
+        if "" in src_dur:
+            return float(src_dur[""] or 0.0)
+        if len(src_dur) == 1:
+            return float(next(iter(src_dur.values())) or 0.0)
+        return 0.0
+    return float(src_dur or 0.0)
+
+
+def _flatten_clips(
+    clips: list[ClipInst], src_dur: float | dict[str, float]
+) -> list[tuple[float, float, float, float, str]]:
+    """Return (timeline_t0, timeline_t1, source_in, source_out, media_id).
 
     Later clips overwrite earlier ones on overlap, matching playback.
     """
-    segs: list[tuple[float, float, float, float]] = []
+    segs: list[tuple[float, float, float, float, str]] = []
     for c in clips:
+        dur = _dur_for(c, src_dur)
         inn = max(0.0, float(c.in_s))
-        out = float(c.out_s) if c.out_s > inn else (src_dur if src_dur > inn else inn)
-        if src_dur > 0:
-            out = min(out, src_dur)
+        out = float(c.out_s) if c.out_s > inn else (dur if dur > inn else inn)
+        if dur > 0:
+            out = min(out, dur)
         if out <= inn + 0.04:
             continue
         t0 = float(c.start) + inn
@@ -42,18 +58,19 @@ def _flatten_clips(clips: list[ClipInst], src_dur: float) -> list[tuple[float, f
             t0 = 0.0
         if out <= inn + 0.04:
             continue
-        nxt: list[tuple[float, float, float, float]] = []
-        for st0, st1, sinn, sout in segs:
+        mid = c.media_id or ""
+        nxt: list[tuple[float, float, float, float, str]] = []
+        for st0, st1, sinn, sout, smid in segs:
             if st1 <= t0 + 0.001 or st0 >= t1 - 0.001:
-                nxt.append((st0, st1, sinn, sout))
+                nxt.append((st0, st1, sinn, sout, smid))
                 continue
             if st0 < t0 - 0.001:
                 keep = t0 - st0
-                nxt.append((st0, t0, sinn, sinn + keep))
+                nxt.append((st0, t0, sinn, sinn + keep, smid))
             if st1 > t1 + 0.001:
                 skip = t1 - st0
-                nxt.append((t1, st1, sinn + skip, sout))
-        nxt.append((t0, t1, inn, out))
+                nxt.append((t1, st1, sinn + skip, sout, smid))
+        nxt.append((t0, t1, inn, out, mid))
         segs = nxt
     segs = [s for s in segs if s[1] > s[0] + 0.04]
     segs.sort(key=lambda row: row[0])
@@ -86,6 +103,9 @@ def build_cmd(
     audio_out: float | None = None,
     video_clips: list[ClipInst] | None = None,
     audio_clips: list[ClipInst] | None = None,
+    media: list[MediaItem] | None = None,
+    use_video_soundtrack: bool = True,
+    crossfade_s: float = 0.0,
     src: dict[str, Any] | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     """Return (ffmpeg argv, meta dict with crop/duration/dest)."""
@@ -116,10 +136,18 @@ def build_cmd(
 
     audio_path: Path | None = Path(audio) if audio else None
     use_replacement = audio_path is not None
-    use_source_audio = (not use_replacement) and bool(src.get("has_audio"))
+    use_source_audio = (
+        (not use_replacement)
+        and bool(src.get("has_audio"))
+        and use_video_soundtrack
+    )
     many = (video_clips is not None and len(video_clips) > 1) or (
         audio_clips is not None and len(audio_clips) > 1
     )
+    vmids = {c.media_id for c in (video_clips or []) if c.media_id}
+    amids = {c.media_id for c in (audio_clips or []) if c.media_id}
+    if len(vmids) > 1 or len(amids) > 1:
+        many = True
     if many:
         return _build_cmd_many(
             video,
@@ -132,6 +160,7 @@ def build_cmd(
             audio_offset=audio_offset,
             video_clips=video_clips or [],
             audio_clips=audio_clips,
+            media=media,
             src=src,
             src_w=src_w,
             src_h=src_h,
@@ -141,6 +170,7 @@ def build_cmd(
             crop=crop,
             use_replacement=use_replacement,
             use_source_audio=use_source_audio,
+            crossfade_s=crossfade_s,
         )
 
     vchain = []
@@ -254,15 +284,15 @@ def build_cmd(
     return cmd, meta
 
 
-def _timeline_parts(
-    flat: list[tuple[float, float, float, float]], out_dur: float
-) -> list[tuple]:
+def _timeline_parts(flat: list[tuple], out_dur: float) -> list[tuple]:
     parts: list[tuple] = []
     t = 0.0
-    for t0, t1, sinn, sout in flat:
+    for row in flat:
+        t0, t1, sinn = float(row[0]), float(row[1]), float(row[2])
+        mid = str(row[4]) if len(row) > 4 else ""
         if t0 > t + 0.02:
             parts.append(("gap", t0 - t))
-        parts.append(("seg", sinn, t1 - t0))
+        parts.append(("seg", sinn, t1 - t0, mid))
         t = t1
     if out_dur > t + 0.02:
         parts.append(("gap", out_dur - t))
@@ -295,6 +325,67 @@ def _encode_tail(out: Path, out_dur: float) -> list[str]:
     ]
 
 
+def _part_duration(part: tuple) -> float:
+    if part[0] == "gap":
+        return max(0.0, float(part[1]))
+    return max(0.0, float(part[2]))
+
+
+def _join_parts(
+    filters: list[str],
+    parts: list[tuple],
+    labels: list[str],
+    *,
+    kind: str,
+    crossfade_s: float,
+) -> tuple[str, float]:
+    """Join prepared timeline parts, dissolving only touching media segments."""
+    if not labels:
+        raise ExportError(f"no {kind} parts to join")
+    if len(labels) == 1:
+        return labels[0], _part_duration(parts[0])
+
+    current = labels[0]
+    duration = _part_duration(parts[0])
+    previous = parts[0]
+    requested = max(0.0, float(crossfade_s or 0.0))
+
+    for i, (part, label) in enumerate(zip(parts[1:], labels[1:]), start=1):
+        part_dur = _part_duration(part)
+        transition = 0.0
+        if requested > 0 and previous[0] == "seg" and part[0] == "seg":
+            transition = min(
+                requested,
+                max(0.0, _part_duration(previous) - 0.05),
+                max(0.0, part_dur - 0.05),
+            )
+
+        out_label = f"{kind[0]}join{i}"
+        if transition > 0.001:
+            if kind == "video":
+                offset = max(0.0, duration - transition)
+                filters.append(
+                    f"{current}{label}xfade=transition=fade:"
+                    f"duration={transition:.6f}:offset={offset:.6f}[{out_label}]"
+                )
+            else:
+                filters.append(
+                    f"{current}{label}acrossfade=d={transition:.6f}:c1=tri:c2=tri"
+                    f"[{out_label}]"
+                )
+            duration += part_dur - transition
+        else:
+            if kind == "video":
+                filters.append(f"{current}{label}concat=n=2:v=1:a=0[{out_label}]")
+            else:
+                filters.append(f"{current}{label}concat=n=2:v=0:a=1[{out_label}]")
+            duration += part_dur
+        current = f"[{out_label}]"
+        previous = part
+
+    return current, duration
+
+
 def _build_cmd_many(
     video: Path,
     out: Path,
@@ -316,21 +407,45 @@ def _build_cmd_many(
     crop: Any,
     use_replacement: bool,
     use_source_audio: bool,
+    crossfade_s: float = 0.0,
+    media: list[MediaItem] | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
-    fps = float(src.get("fps") or 30) or 30.0
-    if fps < 1:
-        fps = 30.0
-    vflat = _flatten_clips(video_clips, src_dur)
+    media = list(media or [])
+    if not any(m.kind == "video" for m in media):
+        media = [MediaItem(id="m1", path=video, kind="video")] + media
+    if use_replacement and audio_path is not None and not any(m.kind == "audio" for m in media):
+        media.append(MediaItem(id="m2", path=audio_path, kind="audio"))
+    by_id = {m.id: m for m in media}
+    prim_v = next((m.id for m in media if m.kind == "video"), "")
+    prim_a = next((m.id for m in media if m.kind == "audio"), "")
+    probes: dict[str, dict[str, Any]] = {}
+    durs: dict[str, float] = {}
+    for m in media:
+        try:
+            info = probe(m.path)
+        except ProbeError as exc:
+            raise ExportError(str(exc)) from exc
+        probes[m.id] = info
+        durs[m.id] = float(info.get("duration") or 0.0)
+    vwork = []
+    for c in video_clips:
+        cc = c.copy()
+        if not cc.media_id:
+            cc.media_id = prim_v
+        vwork.append(cc)
+    vflat = _flatten_clips(vwork, durs if durs else src_dur)
     if not vflat:
         raise ExportError("no video on the timeline")
-    a_src_dur = src_dur
-    if use_replacement and audio_path is not None:
-        ainfo = probe(audio_path)
-        a_src_dur = float(ainfo.get("duration") or 0.0)
     if use_replacement and audio_clips:
-        aflat = _flatten_clips(audio_clips, a_src_dur)
+        awork = []
+        for c in audio_clips:
+            cc = c.copy()
+            if not cc.media_id:
+                cc.media_id = prim_a or prim_v
+            awork.append(cc)
+        aflat = _flatten_clips(awork, durs if durs else src_dur)
     elif use_source_audio:
-        aflat = list(vflat)
+        aflat = [row for row in vflat if probes.get(row[4], {}).get("has_audio")]
     else:
         aflat = []
     out_dur = vflat[-1][1]
@@ -340,14 +455,45 @@ def _build_cmd_many(
     v_parts = _timeline_parts(vflat, out_dur)
     a_parts = _timeline_parts(aflat, out_dur) if aflat else []
 
+    inputs: list[Path] = []
+    idx_of: dict[str, int] = {}
+
+    def add_input(mid: str) -> int:
+        if mid in idx_of:
+            return idx_of[mid]
+        item = by_id.get(mid)
+        path = item.path.resolve() if item is not None else Path(video)
+        for i, existing in enumerate(inputs):
+            if existing == path:
+                idx_of[mid] = i
+                return i
+        idx_of[mid] = len(inputs)
+        inputs.append(path)
+        return idx_of[mid]
+
+    for row in vflat:
+        add_input(str(row[4]))
+    for row in aflat:
+        add_input(str(row[4]))
+    if not inputs:
+        inputs = [video]
+        idx_of[prim_v] = 0
+
+    fps = float(src.get("fps") or 30) or 30.0
+    if fps < 1:
+        fps = 30.0
+
+    v_mids = [str(p[3]) for p in v_parts if p[0] == "seg"]
+    v_idx_count = Counter(idx_of.get(mid, 0) for mid in v_mids)
     filters: list[str] = []
+    v_split_at = {i: 0 for i in v_idx_count}
+    for i, n in v_idx_count.items():
+        if n > 1:
+            filters.append(
+                f"[{i}:v]split={n}" + "".join(f"[vin{i}_{k}]" for k in range(n))
+            )
+
     v_labs: list[str] = []
-    v_seg_n = sum(1 for p in v_parts if p[0] != "gap")
-    if v_seg_n > 1:
-        filters.append(
-            "[0:v]split=" + str(v_seg_n) + "".join(f"[vv{i}]" for i in range(v_seg_n))
-        )
-    v_seg_i = 0
     for i, part in enumerate(v_parts):
         lab = "v" if len(v_parts) == 1 else f"vs{i}"
         if part[0] == "gap":
@@ -357,34 +503,54 @@ def _build_cmd_many(
                 f"format=yuv420p,setsar=1[{lab}]"
             )
         else:
-            sinn, sdur = float(part[1]), float(part[2])
+            sinn, sdur, mid = float(part[1]), float(part[2]), str(part[3])
+            ii = idx_of.get(mid, 0)
+            info = probes.get(mid) or src
+            dur = float(info.get("duration") or src_dur or 0)
+            try:
+                iw, ih = int(info.get("width") or src_w), int(info.get("height") or src_h)
+            except (TypeError, ValueError):
+                iw, ih = src_w, src_h
+            this_crop = cover_crop(iw, ih, dw, dh, pan_x, pan_y) if iw >= 2 and ih >= 2 else crop
             chain = []
-            if _trim_needed(sinn, sdur, src_dur):
+            if _trim_needed(sinn, sdur, dur):
                 chain.append(f"trim=start={sinn:.6f}:duration={sdur:.6f}")
                 chain.append("setpts=PTS-STARTPTS")
             chain += [
-                crop.as_ffmpeg(),
+                this_crop.as_ffmpeg(),
                 f"scale={dw}:{dh}:flags=lanczos",
+                f"fps={fps:.4f}",
+                "settb=AVTB",
                 "setsar=1",
                 "format=yuv420p",
             ]
-            src = f"[vv{v_seg_i}]" if v_seg_n > 1 else "[0:v]"
-            v_seg_i += 1
-            filters.append(f"{src}{','.join(chain)}[{lab}]")
+            if v_idx_count[ii] > 1:
+                k = v_split_at[ii]
+                v_split_at[ii] = k + 1
+                pad = f"[vin{ii}_{k}]"
+            else:
+                pad = f"[{ii}:v]"
+            filters.append(f"{pad}{','.join(chain)}[{lab}]")
         v_labs.append(f"[{lab}]")
+    video_duration = out_dur
     if len(v_labs) > 1:
-        filters.append("".join(v_labs) + f"concat=n={len(v_labs)}:v=1:a=0[v]")
+        v_label, video_duration = _join_parts(
+            filters, v_parts, v_labs, kind="video", crossfade_s=crossfade_s
+        )
+        if v_label != "[v]":
+            filters.append(f"{v_label}null[v]")
 
     have_audio = bool(a_parts) and (use_replacement or use_source_audio)
-    a_in = "[1:a]" if use_replacement else "[0:a]"
     if have_audio:
+        a_mids = [str(p[3]) for p in a_parts if p[0] == "seg"]
+        a_idx_count = Counter(idx_of.get(mid, 0) for mid in a_mids)
+        a_split_at = {i: 0 for i in a_idx_count}
+        for i, n in a_idx_count.items():
+            if n > 1:
+                filters.append(
+                    f"[{i}:a]asplit={n}" + "".join(f"[ain{i}_{k}]" for k in range(n))
+                )
         a_labs: list[str] = []
-        a_seg_n = sum(1 for p in a_parts if p[0] != "gap")
-        if a_seg_n > 1:
-            filters.append(
-                f"{a_in}asplit=" + str(a_seg_n) + "".join(f"[aa{i}]" for i in range(a_seg_n))
-            )
-        a_seg_i = 0
         for i, part in enumerate(a_parts):
             lab = "a" if len(a_parts) == 1 else f"as{i}"
             if part[0] == "gap":
@@ -394,18 +560,29 @@ def _build_cmd_many(
                     f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[{lab}]"
                 )
             else:
-                sinn, sdur = float(part[1]), float(part[2])
+                sinn, sdur, mid = float(part[1]), float(part[2]), str(part[3])
+                ii = idx_of.get(mid, 0)
                 off = max(0.0, float(audio_offset or 0.0))
-                src = f"[aa{a_seg_i}]" if a_seg_n > 1 else a_in
-                a_seg_i += 1
+                if a_idx_count[ii] > 1:
+                    k = a_split_at[ii]
+                    a_split_at[ii] = k + 1
+                    pad = f"[ain{ii}_{k}]"
+                else:
+                    pad = f"[{ii}:a]"
                 filters.append(
-                    f"{src}atrim=start={sinn + off:.6f}:duration={sdur:.6f},"
+                    f"{pad}atrim=start={sinn + off:.6f}:duration={sdur:.6f},"
                     f"asetpts=PTS-STARTPTS,"
                     f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[{lab}]"
                 )
             a_labs.append(f"[{lab}]")
         if len(a_labs) > 1:
-            filters.append("".join(a_labs) + f"concat=n={len(a_labs)}:v=0:a=1[a]")
+            a_label, _ = _join_parts(
+                filters, a_parts, a_labs, kind="audio", crossfade_s=crossfade_s
+            )
+            if a_label != "[a]":
+                filters.append(f"{a_label}anull[a]")
+
+    out_dur = max(0.05, video_duration)
 
     cmd = [
         which_ffmpeg(),
@@ -417,11 +594,9 @@ def _build_cmd_many(
         "-nostats",
         "-loglevel",
         "error",
-        "-i",
-        str(video),
     ]
-    if use_replacement:
-        cmd += ["-i", str(audio_path)]
+    for p in inputs:
+        cmd += ["-i", str(p)]
     cmd += ["-filter_complex", ";".join(filters)]
     if have_audio:
         cmd += ["-map", "[v]", "-map", "[a]"]
@@ -442,6 +617,8 @@ def _build_cmd_many(
         "video_start": float(video_clips[0].start) if video_clips else 0.0,
         "audio_start": float(audio_clips[0].start) if audio_clips else 0.0,
         "clips": len(vflat),
+        "inputs": len(inputs),
+        "crossfade_s": max(0.0, float(crossfade_s or 0.0)),
     }
     return cmd, meta
 
@@ -485,6 +662,9 @@ def run_export(
     audio_out: float | None = None,
     video_clips: list[ClipInst] | None = None,
     audio_clips: list[ClipInst] | None = None,
+    media: list[MediaItem] | None = None,
+    use_video_soundtrack: bool = True,
+    crossfade_s: float = 0.0,
     progress: ProgressCb | None = None,
     timeout: float = 1800.0,
 ) -> dict[str, Any]:
@@ -517,6 +697,9 @@ def run_export(
         audio_out=audio_out,
         video_clips=video_clips,
         audio_clips=audio_clips,
+        media=media,
+        use_video_soundtrack=use_video_soundtrack,
+        crossfade_s=crossfade_s,
         src=src,
     )
     out.parent.mkdir(parents=True, exist_ok=True)

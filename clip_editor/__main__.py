@@ -46,6 +46,12 @@ def _add_export_args(p: argparse.ArgumentParser) -> None:
         help="seconds into the audio file to start",
     )
     p.add_argument(
+        "--crossfade",
+        type=float,
+        default=0.0,
+        help="cross-fade seconds between adjacent clips (default off)",
+    )
+    p.add_argument(
         "--video-start",
         type=float,
         default=0.0,
@@ -89,6 +95,7 @@ def cmd_export(args: argparse.Namespace) -> int:
             out_s=args.out_s,
             audio_follows_in=args.audio_follows_in,
             audio_offset=args.audio_offset,
+            crossfade_s=args.crossfade,
             video_start=args.video_start,
             audio_start=args.audio_start,
             audio_in=args.audio_in,
@@ -251,6 +258,25 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
         g2 = result2["gate"]
         assert g2["gate_ok"], g2
         assert 1.0 <= float(g2["duration"]) <= 1.3, g2
+
+        out3 = td_p / "out_crossfade.mp4"
+        result3 = run_export(
+            video,
+            out3,
+            audio=None,
+            aspect="9:16",
+            in_s=0.0,
+            out_s=2.0,
+            video_clips=[
+                ClipInst(start=0.0, in_s=0.0, out_s=0.8),
+                ClipInst(start=0.0, in_s=0.8, out_s=1.6),
+            ],
+            crossfade_s=0.25,
+        )
+        g3 = result3["gate"]
+        assert g3["gate_ok"], g3
+        assert 1.25 <= float(g3["duration"]) <= 1.45, g3
+        assert abs(float(result3["meta"]["crossfade_s"]) - 0.25) < 1e-9
         print("selftest ok")
         print(f"  crop {result['meta']['crop']}")
         print(f"  {g['width']}x{g['height']} {g['vcodec']}+{g['acodec']} {g['duration']:.3f}s")
@@ -276,10 +302,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_serve)
 
     g = sub.add_parser("gui", help="native GTK window")
-    g.add_argument("--video", help="open this video")
+    g.add_argument("--video", help="add this video to the current project")
     g.add_argument(
         "--audio",
-        help="add this audio to the current project (same as dropping it on the window)",
+        help="add this audio to the current project (does not start a new project)",
+    )
+    g.add_argument(
+        "--new",
+        action="store_true",
+        help="start a new project before adding --video/--audio (Eagle Browse Ctrl+Shift+E)",
     )
     g.add_argument("video_path", nargs="?", help="video to open")
     g.set_defaults(func=cmd_gui)
@@ -293,7 +324,11 @@ def cmd_gui(args: argparse.Namespace) -> int:
     from clip_editor.ui import run
 
     video = getattr(args, "video", None) or getattr(args, "video_path", None)
-    return run(open_video=video, open_audio=getattr(args, "audio", None))
+    return run(
+        open_video=video,
+        open_audio=getattr(args, "audio", None),
+        new_project=bool(getattr(args, "new", False)),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

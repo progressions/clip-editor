@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 FORMAT = "clip-editor-project"
-VERSION = 1
+VERSION = 3
 SUFFIX = ".clip.json"
 STATE_DIR = Path.home() / ".local" / "state" / "clip-editor"
 AUTOSAVE_PATH = STATE_DIR / "autosave.clip.json"
@@ -25,12 +25,33 @@ class ProjectError(RuntimeError):
 
 
 @dataclass
+class MediaItem:
+    """A source file in the media bin."""
+
+    id: str
+    path: Path
+    kind: str  # "video" | "audio"
+
+    def copy(self) -> MediaItem:
+        return MediaItem(id=self.id, path=self.path, kind=self.kind)
+
+
+def next_media_id(items: list[MediaItem]) -> str:
+    used = {m.id for m in items}
+    n = 1
+    while f"m{n}" in used:
+        n += 1
+    return f"m{n}"
+
+
+@dataclass
 class ClipInst:
-    """One instance of the project video or audio on the timeline."""
+    """One instance of a bin item on the timeline."""
 
     start: float = 0.0
     in_s: float = 0.0
     out_s: float = 0.0
+    media_id: str = ""
 
     def used(self) -> tuple[float, float]:
         inn = max(0.0, float(self.in_s))
@@ -42,7 +63,9 @@ class ClipInst:
         return self.start + inn, self.start + out
 
     def copy(self) -> ClipInst:
-        return ClipInst(start=self.start, in_s=self.in_s, out_s=self.out_s)
+        return ClipInst(
+            start=self.start, in_s=self.in_s, out_s=self.out_s, media_id=self.media_id
+        )
 
     def split_at(
         self, timeline_t: float, src_dur: float = 0.0, *, min_len: float = 0.05
@@ -64,13 +87,18 @@ class ClipInst:
         if t <= t0 + min_len or t >= t1 - min_len:
             return None
         src_cut = t - float(self.start)
-        right = ClipInst(start=self.start, in_s=src_cut, out_s=out)
+        right = ClipInst(
+            start=self.start, in_s=src_cut, out_s=out, media_id=self.media_id
+        )
         self.out_s = src_cut
         return right
 
 
 def clip_to_dict(c: ClipInst) -> dict:
-    return {"start": float(c.start), "in_s": float(c.in_s), "out_s": float(c.out_s)}
+    d = {"start": float(c.start), "in_s": float(c.in_s), "out_s": float(c.out_s)}
+    if c.media_id:
+        d["media_id"] = c.media_id
+    return d
 
 
 def clip_from_dict(data: object) -> ClipInst | None:
@@ -82,7 +110,8 @@ def clip_from_dict(data: object) -> ClipInst | None:
         out = float(data.get("out_s") or 0.0)
     except (TypeError, ValueError):
         return None
-    return ClipInst(start=start, in_s=inn, out_s=out)
+    mid = str(data.get("media_id") or "")
+    return ClipInst(start=start, in_s=inn, out_s=out, media_id=mid)
 
 
 def _clips_from_data(
@@ -119,6 +148,9 @@ class Project:
     audio_out: float | None = None
     audio_follows_in: bool = False
     audio_fit: bool = False
+    use_video_soundtrack: bool = True
+    crossfade_s: float = 0.0
+    media: list[MediaItem] = field(default_factory=list)
     video_clips: list[ClipInst] = field(default_factory=list)
     audio_clips: list[ClipInst] = field(default_factory=list)
     path: Path | None = None
@@ -161,10 +193,82 @@ def ensure_suffix(path: Path) -> Path:
     return path.with_name(name + SUFFIX)
 
 
+def _primary(media: list[MediaItem], kind: str) -> Path | None:
+    for m in media:
+        if m.kind == kind:
+            return m.path
+    return None
+
+
+def _media_from_data(data: dict, origin: Path | None) -> list[MediaItem]:
+    raw = data.get("media")
+    items: list[MediaItem] = []
+    seen: set[str] = set()
+    if isinstance(raw, list):
+        for row in raw:
+            if not isinstance(row, dict):
+                continue
+            kind = str(row.get("kind") or "")
+            if kind not in ("video", "audio"):
+                continue
+            path = _resolve(row.get("path"), row.get("path_rel"), origin)
+            if path is None:
+                continue
+            mid = str(row.get("id") or next_media_id(items))
+            if mid in seen:
+                mid = next_media_id(items)
+            seen.add(mid)
+            items.append(MediaItem(id=mid, path=path, kind=kind))
+    return items
+
+
+def _ensure_media(
+    items: list[MediaItem], video: Path | None, audio: Path | None
+) -> list[MediaItem]:
+    out = list(items)
+
+    def has(path: Path, kind: str) -> bool:
+        for m in out:
+            if m.kind != kind:
+                continue
+            try:
+                if m.path.resolve() == path.resolve():
+                    return True
+            except OSError:
+                if m.path == path:
+                    return True
+        return False
+
+    if video is not None and not has(video, "video"):
+        out.append(MediaItem(id=next_media_id(out), path=video, kind="video"))
+    if audio is not None and not has(audio, "audio"):
+        out.append(MediaItem(id=next_media_id(out), path=audio, kind="audio"))
+    return out
+
+
+def _bind_clip_media(clips: list[ClipInst], media: list[MediaItem], kind: str) -> None:
+    fallback = next((m.id for m in media if m.kind == kind), "")
+    ids = {m.id for m in media if m.kind == kind}
+    for c in clips:
+        if c.media_id not in ids:
+            c.media_id = fallback
+
+
 def to_dict(proj: Project) -> dict:
     origin = proj.path
-    video = proj.video.resolve() if proj.video else None
-    audio = proj.audio.resolve() if proj.audio else None
+    media = _ensure_media(proj.media, proj.video, proj.audio)
+    video = _primary(media, "video") or (proj.video.resolve() if proj.video else None)
+    audio = _primary(media, "audio") or (proj.audio.resolve() if proj.audio else None)
+    if video is not None:
+        try:
+            video = video.resolve()
+        except OSError:
+            pass
+    if audio is not None:
+        try:
+            audio = audio.resolve()
+        except OSError:
+            pass
     saved = None
     if proj.path is not None:
         try:
@@ -172,6 +276,20 @@ def to_dict(proj: Project) -> dict:
                 saved = str(proj.path.resolve())
         except OSError:
             saved = str(proj.path)
+    media_rows = []
+    for m in media:
+        try:
+            p = m.path.resolve()
+        except OSError:
+            p = m.path
+        media_rows.append(
+            {
+                "id": m.id,
+                "kind": m.kind,
+                "path": str(p),
+                "path_rel": _rel(p, origin),
+            }
+        )
     return {
         "format": FORMAT,
         "version": VERSION,
@@ -186,6 +304,9 @@ def to_dict(proj: Project) -> dict:
         "audio_out": None if proj.audio_out is None else float(proj.audio_out),
         "audio_follows_in": bool(proj.audio_follows_in),
         "audio_fit": bool(proj.audio_fit),
+        "use_video_soundtrack": bool(proj.use_video_soundtrack),
+        "crossfade_s": max(0.0, float(proj.crossfade_s)),
+        "media": media_rows,
         "video_clips": [clip_to_dict(c) for c in proj.video_clips],
         "audio_clips": [clip_to_dict(c) for c in proj.audio_clips],
         "video": str(video) if video else None,
@@ -207,6 +328,11 @@ def from_dict(data: dict, *, origin: Path | None = None) -> Project:
         raise ProjectError(f"project version {version} is newer than this app")
     video = _resolve(data.get("video"), data.get("video_rel"), origin)
     audio = _resolve(data.get("audio"), data.get("audio_rel"), origin)
+    media = _ensure_media(_media_from_data(data, origin), video, audio)
+    if video is None:
+        video = _primary(media, "video")
+    if audio is None:
+        audio = _primary(media, "audio")
     out_raw = data.get("out_s")
     saved_raw = data.get("saved_as")
     saved_as = Path(str(saved_raw)).expanduser() if saved_raw else None
@@ -219,7 +345,7 @@ def from_dict(data: dict, *, origin: Path | None = None) -> Project:
                 path = None
         except OSError:
             pass
-    return Project(
+    proj = Project(
         video=video,
         audio=audio,
         aspect=str(data.get("aspect") or "9:16"),
@@ -245,6 +371,13 @@ def from_dict(data: dict, *, origin: Path | None = None) -> Project:
         ),
         audio_follows_in=bool(data.get("audio_follows_in") or False),
         audio_fit=bool(data.get("audio_fit") or False),
+        use_video_soundtrack=(
+            True
+            if data.get("use_video_soundtrack") is None
+            else bool(data.get("use_video_soundtrack"))
+        ),
+        crossfade_s=max(0.0, float(data.get("crossfade_s") or 0.0)),
+        media=media,
         video_clips=_clips_from_data(
             data,
             "video_clips",
@@ -275,6 +408,9 @@ def from_dict(data: dict, *, origin: Path | None = None) -> Project:
         ),
         path=path,
     )
+    _bind_clip_media(proj.video_clips, media, "video")
+    _bind_clip_media(proj.audio_clips, media, "audio")
+    return proj
 
 
 def read_project(path: Path) -> Project:

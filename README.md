@@ -3,7 +3,7 @@
 Local Ginger tool: open a video, optionally replace its audio, cover-crop to a
 social aspect, export one Buffer-safe H.264/AAC MP4.
 
-Not a kdenlive clone. No effects, titles, or codec menus.
+Not a kdenlive clone. No titles or codec menus.
 
 Lives here on purpose (`~/tech/`), not in the Dropbox vault — encode temp files
 and the Chromium profile should not sync.
@@ -19,9 +19,14 @@ update if you switch themes while the window is open.
 ```bash
 clip-editor                 # GTK window
 clip-editor gui             # same
+clip-editor gui --video clip.mp4            # add video to the current project
+clip-editor gui --new --video clip.mp4      # new project with that video
+clip-editor gui --audio bed.m4a             # add audio; keep the current project
 clip-editor export --video in.mp4 --audio bed.mp3 --aspect 9:16
 clip-editor selftest
 ```
+
+Eagle Browse: **Shift+E** sends `--video` / `--audio` (add). **Ctrl+Shift+E** sends `--new --video` (new project). A second launch is handed to the running window.
 
 The launcher is `~/tech/clip-editor/clip-editor`. Symlink it onto PATH:
 
@@ -53,6 +58,12 @@ Replacement audio starts at 0 of the audio file unless “Audio follows video
 in-point” is on (driver sync). If the music is longer than the picture, **Fit**
 cuts it to the video length (no speed change). Export always does that cut.
 
+Set **Cross-fade** to a duration such as `0.5 seconds` to dissolve between
+adjacent touching clips. `0` disables transitions. Clips separated by a gap do
+not cross-fade. Source or replacement audio clips use the same fade duration.
+This first version applies the transition during export; timeline preview still
+shows a hard cut.
+
 Export writes a `{stem}_{9x16}.mp4` (always `.mp4`) **flat into Eagle Browse
 intake**, using the same config eagle-browse does (`eagle-browse.toml`,
 `~/.config/eagle-browse/config.toml`, `EAGLE_INBOX`). Encode lands as
@@ -61,9 +72,10 @@ file.
 
 ## Project files
 
-Format: JSON, ``format: "clip-editor-project"``, ``version: 1``, suffix
+Format: JSON, ``format: "clip-editor-project"``, ``version: 3``, suffix
 ``.clip.json``. Records video/audio paths (absolute plus relative to the
-project file), aspect, pan, in/out, Fit, and “audio follows in-point”.
+project file), aspect, pan, in/out, Fit, cross-fade duration, and “audio follows
+in-point”.
 
 The hamburger menu: Open project, Save (Ctrl+S), Save As (Ctrl+Shift+S).
 The current edit auto-saves every 800ms to
