@@ -44,6 +44,30 @@ class ClipInst:
     def copy(self) -> ClipInst:
         return ClipInst(start=self.start, in_s=self.in_s, out_s=self.out_s)
 
+    def split_at(
+        self, timeline_t: float, src_dur: float = 0.0, *, min_len: float = 0.05
+    ) -> ClipInst | None:
+        """Trim this instance to the left of ``timeline_t``; return the right piece.
+
+        Same source file, same ``start``. None if the playhead is not far
+        enough inside the used range.
+        """
+        inn = max(0.0, float(self.in_s))
+        out = float(self.out_s) if self.out_s > inn else inn
+        if src_dur > 0:
+            if out <= inn:
+                out = src_dur
+            out = min(out, src_dur)
+        t0 = float(self.start) + inn
+        t1 = float(self.start) + out
+        t = float(timeline_t)
+        if t <= t0 + min_len or t >= t1 - min_len:
+            return None
+        src_cut = t - float(self.start)
+        right = ClipInst(start=self.start, in_s=src_cut, out_s=out)
+        self.out_s = src_cut
+        return right
+
 
 def clip_to_dict(c: ClipInst) -> dict:
     return {"start": float(c.start), "in_s": float(c.in_s), "out_s": float(c.out_s)}

@@ -215,6 +215,15 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
         from clip_editor.export import _flatten_clips
         from clip_editor.project import ClipInst
 
+        left = ClipInst(start=2.0, in_s=1.0, out_s=8.0)
+        right = left.split_at(6.0)
+        assert right is not None
+        assert abs(left.in_s - 1.0) < 1e-9 and abs(left.out_s - 4.0) < 1e-9
+        assert abs(right.start - 2.0) < 1e-9
+        assert abs(right.in_s - 4.0) < 1e-9 and abs(right.out_s - 8.0) < 1e-9
+        assert left.split_at(2.0) is None
+        assert ClipInst(start=0.0, in_s=0.0, out_s=1.0).split_at(0.5) is not None
+
         flat = _flatten_clips(
             [
                 ClipInst(start=0.0, in_s=0.0, out_s=0.6),

@@ -289,7 +289,8 @@ class Timeline(Gtk.DrawingArea):
         self.set_cursor_from_name("col-resize")
         self.set_tooltip_text(
             "Drag a clip to slide it. Drag either edge to trim. "
-            "Drag the ruler or playhead to seek. Del removes the selected clip."
+            "Drag the ruler or playhead to seek. T splits at the playhead. "
+            "Del removes the selected clip."
         )
         click = Gtk.GestureClick()
         click.connect("pressed", self._on_pressed)
@@ -1310,6 +1311,10 @@ class EditorWindow(Adw.ApplicationWindow):
         self.btn_play.set_tooltip_text("Play / pause (Space)")
         self.btn_play.connect("clicked", self._on_play)
         transport.append(self.btn_play)
+        self.btn_split = Gtk.Button(label="Split")
+        self.btn_split.set_tooltip_text("Split the selected clip at the playhead (T)")
+        self.btn_split.connect("clicked", lambda *_: self._split_selected_clip())
+        transport.append(self.btn_split)
         self.clock = Gtk.Label(label="0.00 / 0.00")
         self.clock.add_css_class("dim-label")
         transport.append(self.clock)
@@ -1489,6 +1494,9 @@ class EditorWindow(Adw.ApplicationWindow):
             return False
         if keyval in (Gdk.KEY_Delete, Gdk.KEY_KP_Delete):
             return self._delete_selected_clip()
+        if keyval in (Gdk.KEY_t, Gdk.KEY_T):
+            self._split_selected_clip()
+            return True
         if keyval not in (Gdk.KEY_space, Gdk.KEY_KP_Space):
             return False
         if self._space_held:
@@ -2033,6 +2041,7 @@ class EditorWindow(Adw.ApplicationWindow):
             if 0 <= self.sel_a < len(self.audio_clips):
                 self.audio_clips[self.sel_a].start = vs.start
                 self.audio_start = vs.start
+        source_aclips: list[ClipInst] = []
         if self.audio_path and self.audio_info:
             aname = self.audio_path.name
             adur = float(self.audio_info.get("duration") or 0)
@@ -2045,6 +2054,7 @@ class EditorWindow(Adw.ApplicationWindow):
             adur = vdur
             kind = "source"
             self.audio_clips = []
+            source_aclips = [c.copy() for c in self.video_clips]
         else:
             aname = ""
             adur = 0.0
@@ -2073,7 +2083,7 @@ class EditorWindow(Adw.ApplicationWindow):
             ),
             audio_kind=kind,
             vclips=self.video_clips,
-            aclips=self.audio_clips if kind == "replace" else [],
+            aclips=self.audio_clips if kind == "replace" else source_aclips,
             sel_v=self.sel_v,
             sel_a=self.sel_a,
         )
@@ -2569,6 +2579,65 @@ class EditorWindow(Adw.ApplicationWindow):
         self._schedule_autosave()
         return True
 
+    def _split_selected_clip(self) -> bool:
+        if self.exporting:
+            return False
+        kind = self._selected_clip_kind()
+        t = self._timeline_now()
+        if kind == "video":
+            idx = self.sel_v
+            if not 0 <= idx < len(self.video_clips):
+                return False
+            src_dur = float((self.video_info or {}).get("duration") or 0)
+            right = self.video_clips[idx].split_at(t, src_dur)
+            if right is None:
+                self._set_status("Playhead is not on the selected clip")
+                return False
+            self.video_clips.insert(idx + 1, right)
+            self.sel_v = idx + 1
+            self.sel_kind = "video"
+            self.video_start = right.start
+            self._loading = True
+            try:
+                self.in_spin.set_value(right.in_s)
+                self.out_spin.set_value(right.out_s)
+            finally:
+                self._loading = False
+            self._set_status(f"Split video at {t:.2f}s")
+        elif kind == "audio":
+            idx = self.sel_a
+            if not 0 <= idx < len(self.audio_clips):
+                return False
+            src_dur = float((self.audio_info or {}).get("duration") or 0)
+            right = self.audio_clips[idx].split_at(t, src_dur)
+            if right is None:
+                self._set_status("Playhead is not on the selected clip")
+                return False
+            self.audio_clips.insert(idx + 1, right)
+            self.sel_a = idx + 1
+            self.sel_kind = "audio"
+            self.audio_start = right.start
+            self.audio_in = right.in_s
+            self.audio_out = right.out_s
+            if self.follow_in.get_active():
+                self.follow_in.set_active(False)
+            self._set_status(f"Split audio at {t:.2f}s")
+        else:
+            self._set_status("Select a clip to split")
+            return False
+        self._sync_timeline_clips()
+        self.clock.set_text(f"{t:.2f} / {self._program_end():.2f}")
+        if self.playing:
+            self._video_play_clip = None
+            self._audio_play_clip = None
+            self._apply_timeline_frame(t, start_media=True)
+            self._start_preview_audio(t)
+        else:
+            self._apply_timeline_frame(t, start_media=False)
+        self._checkpoint()
+        self._schedule_autosave()
+        return True
+
     def _on_timeline_seek(self, value: float) -> None:
         if self._syncing_scrub:
             return
@@ -2817,9 +2886,16 @@ class EditorWindow(Adw.ApplicationWindow):
             self._seek_audio_src = 0
         if self._vmedia is not None:
             self._vmedia.pause()
-        self.preview.set_media(None)
         t = self.timeline.playhead
-        self.preview.set_blank(self._video_at(t) is None)
+        clip = self._video_at(t)
+        if clip is None or self._vmedia is None:
+            self.preview.set_blank(True)
+        else:
+            # Keep the paused MediaFile on screen. Clearing it falls back
+            # to the opening still (first frame).
+            self.preview.set_blank(False)
+            self.preview.set_media(self._vmedia)
+            self.preview.queue_draw()
         if self._tick is not None:
             GLib.source_remove(self._tick)
             self._tick = None
@@ -2832,18 +2908,26 @@ class EditorWindow(Adw.ApplicationWindow):
         if self.playing:
             self._stop()
             return
-        self._play_t0 = 0.0
+        end = self._program_end()
+        t = self.timeline.playhead
+        if t >= end - 0.04:
+            t = 0.0
+        self._play_t0 = t
         self._play_mono = time.monotonic()
         self._clip_playing = False
         self._audio_pending = False
         self._video_play_clip = None
         self._audio_play_clip = None
         self._syncing_scrub = True
-        self.timeline.set_playhead(0.0)
+        self.timeline.set_playhead(t)
         self._syncing_scrub = False
-        self.clock.set_text(f"0.00 / {self._program_end():.2f}")
-        self._apply_timeline_frame(0.0, start_media=True)
-        self._start_preview_audio(0.0)
+        self.clock.set_text(f"{t:.2f} / {end:.2f}")
+        self._apply_timeline_frame(t, start_media=True)
+        self._start_preview_audio(t)
+        if self.audio_clips:
+            self._audio_play_clip = self._audio_at(t)
+        elif self.video_info and self.video_info.get("has_audio"):
+            self._audio_play_clip = self._video_at(t)
         if not self.audio_path and not (
             self.video_info and self.video_info.get("has_audio")
         ):
@@ -2867,12 +2951,21 @@ class EditorWindow(Adw.ApplicationWindow):
             self._apply_timeline_frame(t, start_media=True)
         else:
             self.preview.queue_draw()
-        aclip = self._audio_at(t) if self.audio_clips else None
         if self.audio_clips:
+            aclip = self._audio_at(t)
             prev = getattr(self, "_audio_play_clip", None)
             if aclip is not prev:
                 self._audio_play_clip = aclip
                 if aclip is not None:
+                    self._start_preview_audio(t)
+                else:
+                    self._stop_preview_audio()
+                    self._audio_pending = True
+        elif self.video_info and self.video_info.get("has_audio"):
+            prev = getattr(self, "_audio_play_clip", None)
+            if vclip is not prev:
+                self._audio_play_clip = vclip
+                if vclip is not None:
                     self._start_preview_audio(t)
                 else:
                     self._stop_preview_audio()
