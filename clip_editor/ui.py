@@ -36,6 +36,7 @@ from clip_editor.project import (
 
 APP_ID = "local.clip.Editor"
 HISTORY_LIMIT = 80
+JOIN_EPS = 0.04
 
 
 def _same_path(a: Path | None, b: Path | None) -> bool:
@@ -2672,63 +2673,46 @@ class EditorWindow(Adw.ApplicationWindow):
                 starts.append(t0)
         return min(starts) if starts else None
 
-    def _preview_cmd(self, timeline_t: float) -> list[str] | None:
+    def _source_time(self, c: ClipInst, timeline_t: float, src_dur: float) -> float:
+        """Source-file time for a clip at a timeline position. Never before the in-point."""
+        inn = max(0.0, float(c.in_s))
+        out = float(c.out_s) if c.out_s > inn else src_dur
+        if src_dur > 0:
+            out = min(out, src_dur)
+        src = float(timeline_t) - float(c.start)
+        src = max(src, inn)
+        if out > inn:
+            src = min(src, out)
+        if src_dur > 0:
+            src = min(src, src_dur)
+        return max(0.0, src)
+
+    def _preview_audio_spec(self, timeline_t: float) -> tuple[Path, float, float] | None:
+        """(path, source_start, remaining) for preview audio at a timeline time."""
         if self.audio_path and self.audio_clips:
             ac = self._audio_at(timeline_t)
             if ac is None:
                 return None
-            path = self.audio_path
-            start = timeline_t - ac.start
-            _t0, t1 = self._clip_span(ac, float((self.audio_info or {}).get("duration") or 0))
-            remaining = max(0.05, t1 - timeline_t)
-        elif self.video_path and self.video_info and self.video_info.get("has_audio"):
+            adur = float((self.audio_info or {}).get("duration") or 0)
+            start = self._source_time(ac, timeline_t, adur)
+            run = self._run_end(self.audio_clips, adur, timeline_t)
+            remaining = max(0.05, (run if run is not None else timeline_t) - timeline_t)
+            return self.audio_path, start, remaining
+        if self.video_path and self.video_info and self.video_info.get("has_audio"):
             vc = self._video_at(timeline_t)
             if vc is None:
                 return None
-            path = self.video_path
-            start = timeline_t - vc.start
-            _t0, t1 = self._clip_span(vc, float(self.video_info.get("duration") or 0))
-            remaining = max(0.05, t1 - timeline_t)
-        else:
-            return None
-        start = max(0.0, start)
-        # Same players Eagle Browse uses for audio preview. ffplay first —
-        # Gtk.MediaFile/GStreamer is mute or abort here.
-        if shutil.which("ffplay"):
-            return [
-                "ffplay",
-                "-vn",
-                "-nodisp",
-                "-autoexit",
-                "-loglevel",
-                "error",
-                "-nostats",
-                "-ss",
-                f"{start:.3f}",
-                "-t",
-                f"{remaining:.3f}",
-                str(path),
-            ]
-        if shutil.which("mpv"):
-            return [
-                "mpv",
-                "--no-video",
-                "--force-window=no",
-                "--no-terminal",
-                "--audio-display=no",
-                "--no-resume-playback",
-                f"--start={start:.3f}",
-                f"--length={remaining:.3f}",
-                str(path),
-            ]
+            vdur = float(self.video_info.get("duration") or 0)
+            start = self._source_time(vc, timeline_t, vdur)
+            run = self._run_end(self.video_clips, vdur, timeline_t)
+            remaining = max(0.05, (run if run is not None else timeline_t) - timeline_t)
+            return self.video_path, start, remaining
         return None
 
     def _stop_preview_audio(self) -> None:
         proc = self._preview_proc
         self._preview_proc = None
-        if proc is None:
-            return
-        if proc.poll() is not None:
+        if proc is None or proc.poll() is not None:
             return
         try:
             proc.terminate()
@@ -2745,6 +2729,44 @@ class EditorWindow(Adw.ApplicationWindow):
         if src_dur > 0:
             out = min(out, src_dur)
         return c.start + inn, c.start + out
+
+    def _continuous_with(self, prev: ClipInst | None, nxt: ClipInst | None, src_dur: float) -> bool:
+        """True if nxt is the same source file playing on from prev (a split, not moved)."""
+        if prev is None or nxt is None:
+            return False
+        if prev is nxt:
+            return True
+        if abs(float(prev.start) - float(nxt.start)) > JOIN_EPS:
+            return False
+        _p0, p1 = self._clip_span(prev, src_dur)
+        n0, _n1 = self._clip_span(nxt, src_dur)
+        return abs(p1 - n0) <= JOIN_EPS
+
+    def _run_end(self, clips: list[ClipInst], src_dur: float, t: float) -> float | None:
+        """Timeline end of the contiguous same-source run covering t."""
+        covering = None
+        for c in clips:
+            t0, t1 = self._clip_span(c, src_dur)
+            if t0 - 0.02 <= t < t1:
+                covering = c
+        if covering is None:
+            return None
+        _t0, end = self._clip_span(covering, src_dur)
+        rest: list[tuple[float, float, ClipInst]] = []
+        for c in clips:
+            if c is covering:
+                continue
+            c0, c1 = self._clip_span(c, src_dur)
+            if c1 > c0:
+                rest.append((c0, c1, c))
+        rest.sort(key=lambda row: row[0])
+        start0 = covering.start
+        for c0, c1, c in rest:
+            if abs(float(c.start) - float(start0)) > JOIN_EPS:
+                continue
+            if abs(c0 - end) <= JOIN_EPS:
+                end = max(end, c1)
+        return end
 
     def _video_at(self, t: float) -> ClipInst | None:
         hit = None
@@ -2773,10 +2795,8 @@ class EditorWindow(Adw.ApplicationWindow):
             self._clip_playing = False
             return
         self.preview.set_blank(False)
-        source = max(0.0, timeline_t - clip.start)
         dur = float((self.video_info or {}).get("duration") or 0)
-        if dur > 0:
-            source = min(source, dur)
+        source = self._source_time(clip, timeline_t, dur)
         self.preview.set_media(self._vmedia)
         if start_media:
             self._play_media_at(source)
@@ -2791,18 +2811,53 @@ class EditorWindow(Adw.ApplicationWindow):
     def _start_preview_audio(self, timeline_t: float) -> None:
         self._stop_preview_audio()
         begins = self._audio_begins_at()
-        cmd = self._preview_cmd(timeline_t)
-        if cmd is None:
+        spec = self._preview_audio_spec(timeline_t)
+        if spec is None:
             if begins is not None and timeline_t < begins - 0.02:
                 self._audio_pending = True
                 return
             if self.audio_path and not shutil.which("ffplay") and not shutil.which("mpv"):
                 self._set_status("Need ffplay or mpv to hear preview audio")
             return
+        path, start, remaining = spec
         self._audio_pending = False
         log = Path.home() / ".cache" / "clip-editor" / "preview-audio.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         logf = log.open("w", encoding="utf-8")
+        # Play the source file directly. A decode-pipe into ffplay exited
+        # before any audio (stdin probe / broken pipe).
+        if shutil.which("ffplay"):
+            cmd = [
+                "ffplay",
+                "-vn",
+                "-nodisp",
+                "-autoexit",
+                "-loglevel",
+                "error",
+                "-nostats",
+                "-ss",
+                f"{start:.3f}",
+                "-t",
+                f"{remaining:.3f}",
+                str(path),
+            ]
+        elif shutil.which("mpv"):
+            cmd = [
+                "mpv",
+                "--no-video",
+                "--force-window=no",
+                "--no-terminal",
+                "--audio-display=no",
+                "--no-resume-playback",
+                "--hr-seek=yes",
+                f"--start={start:.3f}",
+                f"--length={remaining:.3f}",
+                str(path),
+            ]
+        else:
+            self._set_status("Need ffplay or mpv to hear preview audio")
+            logf.close()
+            return
         self._preview_proc = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
@@ -2943,33 +2998,50 @@ class EditorWindow(Adw.ApplicationWindow):
         self.timeline.set_playhead(t)
         self._syncing_scrub = False
         self.clock.set_text(f"{t:.2f} / {end:.2f}")
+        vdur = float((self.video_info or {}).get("duration") or 0)
         vclip = self._video_at(t)
+        prev_v = getattr(self, "_video_play_clip", None)
         if vclip is None:
+            self._video_play_clip = None
             self._apply_timeline_frame(t, start_media=False)
-        elif not self._clip_playing or vclip is not getattr(self, "_video_play_clip", None):
+        elif not self._clip_playing:
             self._video_play_clip = vclip
             self._apply_timeline_frame(t, start_media=True)
+        elif vclip is not prev_v:
+            if self._continuous_with(prev_v, vclip, vdur):
+                self._video_play_clip = vclip
+                self.preview.queue_draw()
+            else:
+                self._video_play_clip = vclip
+                self._apply_timeline_frame(t, start_media=True)
         else:
             self.preview.queue_draw()
         if self.audio_clips:
+            adur = float((self.audio_info or {}).get("duration") or 0)
             aclip = self._audio_at(t)
             prev = getattr(self, "_audio_play_clip", None)
             if aclip is not prev:
-                self._audio_play_clip = aclip
-                if aclip is not None:
-                    self._start_preview_audio(t)
+                if aclip is not None and self._continuous_with(prev, aclip, adur):
+                    self._audio_play_clip = aclip
                 else:
-                    self._stop_preview_audio()
-                    self._audio_pending = True
+                    self._audio_play_clip = aclip
+                    if aclip is not None:
+                        self._start_preview_audio(t)
+                    else:
+                        self._stop_preview_audio()
+                        self._audio_pending = True
         elif self.video_info and self.video_info.get("has_audio"):
             prev = getattr(self, "_audio_play_clip", None)
             if vclip is not prev:
-                self._audio_play_clip = vclip
-                if vclip is not None:
-                    self._start_preview_audio(t)
+                if vclip is not None and self._continuous_with(prev, vclip, vdur):
+                    self._audio_play_clip = vclip
                 else:
-                    self._stop_preview_audio()
-                    self._audio_pending = True
+                    self._audio_play_clip = vclip
+                    if vclip is not None:
+                        self._start_preview_audio(t)
+                    else:
+                        self._stop_preview_audio()
+                        self._audio_pending = True
         elif self._audio_pending and self._preview_proc is None:
             begins = self._audio_begins_at()
             if begins is not None and t >= begins - 0.02:
