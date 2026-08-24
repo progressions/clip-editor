@@ -519,7 +519,8 @@ def _build_cmd_many(
             d = float(part[1])
             filters.append(
                 f"color=c=black:s={dw}x{dh}:r={fps:.4f}:d={d:.6f},"
-                f"format=yuv420p,setsar=1[{lab}]"
+                f"format=yuv420p,fps={fps:.4f},settb=AVTB,"
+                f"setpts=PTS-STARTPTS,setsar=1[{lab}]"
             )
         else:
             sinn, sdur, mid = float(part[1]), float(part[2]), str(part[3])
@@ -536,7 +537,7 @@ def _build_cmd_many(
             chain = []
             if _trim_needed(sinn, sdur, dur):
                 chain.append(f"trim=start={sinn:.6f}:duration={sdur:.6f}")
-                chain.append("setpts=PTS-STARTPTS")
+            chain.append("setpts=PTS-STARTPTS")
             chain += [
                 this_crop.as_ffmpeg(),
                 f"scale={dw}:{dh}:flags=lanczos",
@@ -574,7 +575,8 @@ def _build_cmd_many(
                 )
                 filters.append(
                     f"[{bg}][{fg}]overlay=x={xexpr}:y={yexpr}:"
-                    f"shortest=1:eof_action=pass[{lab}]"
+                    f"shortest=1:eof_action=pass,fps={fps:.4f},"
+                    f"settb=AVTB,setpts=PTS-STARTPTS[{lab}]"
                 )
             else:
                 filters.append(f"{pad}{','.join(chain)}[{lab}]")

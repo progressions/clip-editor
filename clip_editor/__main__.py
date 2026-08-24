@@ -277,7 +277,13 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
             in_s=0.0,
             out_s=2.0,
             video_clips=[
-                ClipInst(start=0.0, in_s=0.0, out_s=0.8),
+                ClipInst(
+                    start=0.0,
+                    in_s=0.0,
+                    out_s=0.8,
+                    transform_x=40.0,
+                    scale=0.9,
+                ),
                 ClipInst(start=0.0, in_s=0.8, out_s=1.6),
             ],
             crossfade_s=0.25,
