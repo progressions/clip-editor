@@ -35,12 +35,12 @@ def _dur_for(c: ClipInst, src_dur: float | dict[str, float]) -> float:
 
 def _flatten_clips(
     clips: list[ClipInst], src_dur: float | dict[str, float]
-) -> list[tuple[float, float, float, float, str]]:
-    """Return (timeline_t0, timeline_t1, source_in, source_out, media_id).
+) -> list[tuple[float, float, float, float, str, float, float, float]]:
+    """Return timeline/source bounds, media id, x/y translation, and scale.
 
     Later clips overwrite earlier ones on overlap, matching playback.
     """
-    segs: list[tuple[float, float, float, float, str]] = []
+    segs: list[tuple[float, float, float, float, str, float, float, float]] = []
     for c in clips:
         dur = _dur_for(c, src_dur)
         inn = max(0.0, float(c.in_s))
@@ -59,18 +59,29 @@ def _flatten_clips(
         if out <= inn + 0.04:
             continue
         mid = c.media_id or ""
-        nxt: list[tuple[float, float, float, float, str]] = []
-        for st0, st1, sinn, sout, smid in segs:
+        nxt: list[tuple[float, float, float, float, str, float, float, float]] = []
+        for st0, st1, sinn, sout, smid, sx, sy, scale in segs:
             if st1 <= t0 + 0.001 or st0 >= t1 - 0.001:
-                nxt.append((st0, st1, sinn, sout, smid))
+                nxt.append((st0, st1, sinn, sout, smid, sx, sy, scale))
                 continue
             if st0 < t0 - 0.001:
                 keep = t0 - st0
-                nxt.append((st0, t0, sinn, sinn + keep, smid))
+                nxt.append((st0, t0, sinn, sinn + keep, smid, sx, sy, scale))
             if st1 > t1 + 0.001:
                 skip = t1 - st0
-                nxt.append((t1, st1, sinn + skip, sout, smid))
-        nxt.append((t0, t1, inn, out, mid))
+                nxt.append((t1, st1, sinn + skip, sout, smid, sx, sy, scale))
+        nxt.append(
+            (
+                t0,
+                t1,
+                inn,
+                out,
+                mid,
+                float(c.transform_x),
+                float(c.transform_y),
+                max(0.05, float(c.scale)),
+            )
+        )
         segs = nxt
     segs = [s for s in segs if s[1] > s[0] + 0.04]
     segs.sort(key=lambda row: row[0])
@@ -144,6 +155,13 @@ def build_cmd(
     many = (video_clips is not None and len(video_clips) > 1) or (
         audio_clips is not None and len(audio_clips) > 1
     )
+    if any(
+        abs(float(c.transform_x)) > 0.0001
+        or abs(float(c.transform_y)) > 0.0001
+        or abs(float(c.scale) - 1.0) > 0.0001
+        for c in (video_clips or [])
+    ):
+        many = True
     vmids = {c.media_id for c in (video_clips or []) if c.media_id}
     amids = {c.media_id for c in (audio_clips or []) if c.media_id}
     if len(vmids) > 1 or len(amids) > 1:
@@ -292,7 +310,8 @@ def _timeline_parts(flat: list[tuple], out_dur: float) -> list[tuple]:
         mid = str(row[4]) if len(row) > 4 else ""
         if t0 > t + 0.02:
             parts.append(("gap", t0 - t))
-        parts.append(("seg", sinn, t1 - t0, mid))
+        transform = tuple(row[5:8]) if len(row) >= 8 else (0.0, 0.0, 1.0)
+        parts.append(("seg", sinn, t1 - t0, mid, *transform))
         t = t1
     if out_dur > t + 0.02:
         parts.append(("gap", out_dur - t))
@@ -504,6 +523,8 @@ def _build_cmd_many(
             )
         else:
             sinn, sdur, mid = float(part[1]), float(part[2]), str(part[3])
+            tx, ty = float(part[4]), float(part[5])
+            clip_scale = max(0.05, float(part[6]))
             ii = idx_of.get(mid, 0)
             info = probes.get(mid) or src
             dur = float(info.get("duration") or src_dur or 0)
@@ -519,6 +540,17 @@ def _build_cmd_many(
             chain += [
                 this_crop.as_ffmpeg(),
                 f"scale={dw}:{dh}:flags=lanczos",
+            ]
+            transformed = (
+                abs(tx) > 0.0001
+                or abs(ty) > 0.0001
+                or abs(clip_scale - 1.0) > 0.0001
+            )
+            if transformed:
+                tw = max(2, int(round(dw * clip_scale / 2.0)) * 2)
+                th = max(2, int(round(dh * clip_scale / 2.0)) * 2)
+                chain.append(f"scale={tw}:{th}:flags=lanczos")
+            chain += [
                 f"fps={fps:.4f}",
                 "settb=AVTB",
                 "setsar=1",
@@ -530,7 +562,22 @@ def _build_cmd_many(
                 pad = f"[vin{ii}_{k}]"
             else:
                 pad = f"[{ii}:v]"
-            filters.append(f"{pad}{','.join(chain)}[{lab}]")
+            if transformed:
+                fg = f"vfg{i}"
+                bg = f"vbg{i}"
+                xexpr = f"(W-w)/2+{tx:.3f}"
+                yexpr = f"(H-h)/2+{ty:.3f}"
+                filters.append(f"{pad}{','.join(chain)}[{fg}]")
+                filters.append(
+                    f"color=c=black:s={dw}x{dh}:r={fps:.4f}:d={sdur:.6f},"
+                    f"format=yuv420p[{bg}]"
+                )
+                filters.append(
+                    f"[{bg}][{fg}]overlay=x={xexpr}:y={yexpr}:"
+                    f"shortest=1:eof_action=pass[{lab}]"
+                )
+            else:
+                filters.append(f"{pad}{','.join(chain)}[{lab}]")
         v_labs.append(f"[{lab}]")
     video_duration = out_dur
     if len(v_labs) > 1:

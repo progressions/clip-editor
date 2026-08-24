@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 FORMAT = "clip-editor-project"
-VERSION = 3
+VERSION = 4
 SUFFIX = ".clip.json"
 STATE_DIR = Path.home() / ".local" / "state" / "clip-editor"
 AUTOSAVE_PATH = STATE_DIR / "autosave.clip.json"
@@ -52,6 +52,9 @@ class ClipInst:
     in_s: float = 0.0
     out_s: float = 0.0
     media_id: str = ""
+    transform_x: float = 0.0
+    transform_y: float = 0.0
+    scale: float = 1.0
 
     def used(self) -> tuple[float, float]:
         inn = max(0.0, float(self.in_s))
@@ -64,7 +67,13 @@ class ClipInst:
 
     def copy(self) -> ClipInst:
         return ClipInst(
-            start=self.start, in_s=self.in_s, out_s=self.out_s, media_id=self.media_id
+            start=self.start,
+            in_s=self.in_s,
+            out_s=self.out_s,
+            media_id=self.media_id,
+            transform_x=self.transform_x,
+            transform_y=self.transform_y,
+            scale=self.scale,
         )
 
     def split_at(
@@ -88,7 +97,13 @@ class ClipInst:
             return None
         src_cut = t - float(self.start)
         right = ClipInst(
-            start=self.start, in_s=src_cut, out_s=out, media_id=self.media_id
+            start=self.start,
+            in_s=src_cut,
+            out_s=out,
+            media_id=self.media_id,
+            transform_x=self.transform_x,
+            transform_y=self.transform_y,
+            scale=self.scale,
         )
         self.out_s = src_cut
         return right
@@ -98,6 +113,12 @@ def clip_to_dict(c: ClipInst) -> dict:
     d = {"start": float(c.start), "in_s": float(c.in_s), "out_s": float(c.out_s)}
     if c.media_id:
         d["media_id"] = c.media_id
+    if abs(float(c.transform_x)) > 0.0001:
+        d["transform_x"] = float(c.transform_x)
+    if abs(float(c.transform_y)) > 0.0001:
+        d["transform_y"] = float(c.transform_y)
+    if abs(float(c.scale) - 1.0) > 0.0001:
+        d["scale"] = float(c.scale)
     return d
 
 
@@ -108,10 +129,21 @@ def clip_from_dict(data: object) -> ClipInst | None:
         start = float(data.get("start") or 0.0)
         inn = max(0.0, float(data.get("in_s") or 0.0))
         out = float(data.get("out_s") or 0.0)
+        transform_x = float(data.get("transform_x") or 0.0)
+        transform_y = float(data.get("transform_y") or 0.0)
+        scale = max(0.05, float(data.get("scale") or 1.0))
     except (TypeError, ValueError):
         return None
     mid = str(data.get("media_id") or "")
-    return ClipInst(start=start, in_s=inn, out_s=out, media_id=mid)
+    return ClipInst(
+        start=start,
+        in_s=inn,
+        out_s=out,
+        media_id=mid,
+        transform_x=transform_x,
+        transform_y=transform_y,
+        scale=scale,
+    )
 
 
 def _clips_from_data(

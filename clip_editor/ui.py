@@ -99,6 +99,11 @@ class CoverPreview(Gtk.Widget):
         self.pixbuf: GdkPixbuf.Pixbuf | None = None
         self.pan_x = 0.5
         self.pan_y = 0.5
+        self.transform_x = 0.0
+        self.transform_y = 0.0
+        self.transform_scale = 1.0
+        self.output_width = 1080
+        self.output_height = 1920
         self.on_pan = None
         self.on_pan_end = None
         self._drag_pan = (0.5, 0.5)
@@ -142,6 +147,16 @@ class CoverPreview(Gtk.Widget):
         self.blank = blank
         self.queue_draw()
 
+    def set_transform(
+        self, x: float, y: float, scale: float, output_width: int, output_height: int
+    ) -> None:
+        self.transform_x = float(x)
+        self.transform_y = float(y)
+        self.transform_scale = max(0.05, float(scale))
+        self.output_width = max(1, int(output_width))
+        self.output_height = max(1, int(output_height))
+        self.queue_draw()
+
     def _paintable(self) -> Gdk.Paintable | None:
         if self.blank:
             return None
@@ -179,10 +194,19 @@ class CoverPreview(Gtk.Widget):
             sw, sh = float(w), ih * scale
             x = 0.0
             y = -(sh - h) * self.pan_y
+        tx = self.transform_x * w / self.output_width
+        ty = self.transform_y * h / self.output_height
         snapshot.push_clip(Graphene.Rect().init(0, 0, w, h))
         snapshot.save()
+        # First clip the normal cover-cropped frame, then transform that whole
+        # output canvas. This matches FFmpeg's crop -> scale -> overlay order.
+        snapshot.translate(Graphene.Point().init(w / 2.0 + tx, h / 2.0 + ty))
+        snapshot.scale(self.transform_scale, self.transform_scale)
+        snapshot.translate(Graphene.Point().init(-w / 2.0, -h / 2.0))
+        snapshot.push_clip(Graphene.Rect().init(0, 0, w, h))
         snapshot.translate(Graphene.Point().init(x, y))
         p.snapshot(snapshot, sw, sh)
+        snapshot.pop()
         snapshot.restore()
         snapshot.pop()
 
@@ -1468,6 +1492,30 @@ class EditorWindow(Adw.ApplicationWindow):
         self.video_label = self._wrapping_label("none")
         right.append(self.video_label)
 
+        right.append(self._section("Transform selected clip"))
+        transform = Gtk.Grid(column_spacing=8, row_spacing=6)
+        self.transform_x_spin = Gtk.SpinButton.new_with_range(-4096, 4096, 1)
+        self.transform_y_spin = Gtk.SpinButton.new_with_range(-4096, 4096, 1)
+        self.transform_scale_spin = Gtk.SpinButton.new_with_range(0.05, 4.0, 0.05)
+        self.transform_x_spin.set_digits(0)
+        self.transform_y_spin.set_digits(0)
+        self.transform_scale_spin.set_digits(2)
+        self.transform_scale_spin.set_value(1.0)
+        for row_i, (label, spin) in enumerate(
+            (
+                ("X", self.transform_x_spin),
+                ("Y", self.transform_y_spin),
+                ("Scale", self.transform_scale_spin),
+            )
+        ):
+            transform.attach(Gtk.Label(label=label, xalign=0), 0, row_i, 1, 1)
+            transform.attach(spin, 1, row_i, 1, 1)
+            spin.connect("value-changed", self._on_transform_changed)
+        self.btn_transform_reset = Gtk.Button(label="Reset")
+        self.btn_transform_reset.connect("clicked", self._on_transform_reset)
+        transform.attach(self.btn_transform_reset, 2, 0, 1, 3)
+        right.append(transform)
+
         right.append(self._section("Audio"))
         row = Gtk.Box(spacing=8)
         b = Gtk.Button(label="Open audio")
@@ -1575,6 +1623,7 @@ class EditorWindow(Adw.ApplicationWindow):
         keys.connect("key-released", self._on_key_released)
         self.add_controller(keys)
         self._open_from_cli = False
+        self._sync_transform_controls()
         self._refresh_media()
         GLib.idle_add(self._restore_autosave)
 
@@ -1650,7 +1699,15 @@ class EditorWindow(Adw.ApplicationWindow):
             round(float(p.audio_in), 3),
             None if p.audio_out is None else round(float(p.audio_out), 3),
             tuple(
-                (round(c.start, 3), round(c.in_s, 3), round(c.out_s, 3), c.media_id)
+                (
+                    round(c.start, 3),
+                    round(c.in_s, 3),
+                    round(c.out_s, 3),
+                    c.media_id,
+                    round(c.transform_x, 3),
+                    round(c.transform_y, 3),
+                    round(c.scale, 4),
+                )
                 for c in p.video_clips
             ),
             tuple(
@@ -1863,6 +1920,7 @@ class EditorWindow(Adw.ApplicationWindow):
                     pass
 
     def _apply_project(self, proj: Project) -> None:
+        was_loading = self._loading
         self._loading = True
         self._stop()
         try:
@@ -1930,7 +1988,7 @@ class EditorWindow(Adw.ApplicationWindow):
             self._refresh_fit()
             self._update_title()
         finally:
-            self._loading = False
+            self._loading = was_loading
 
     def _load_project_file(self, path: Path) -> None:
         try:
@@ -2288,6 +2346,52 @@ class EditorWindow(Adw.ApplicationWindow):
         self._refresh_export_name()
         self._schedule_autosave()
 
+    def _selected_video_clip(self) -> ClipInst | None:
+        if self.sel_kind == "video" and 0 <= self.sel_v < len(self.video_clips):
+            return self.video_clips[self.sel_v]
+        return None
+
+    def _sync_transform_controls(self) -> None:
+        clip = self._selected_video_clip()
+        enabled = clip is not None
+        controls = (
+            self.transform_x_spin,
+            self.transform_y_spin,
+            self.transform_scale_spin,
+            self.btn_transform_reset,
+        )
+        for widget in controls:
+            widget.set_sensitive(enabled and not self.exporting)
+        was_loading = self._loading
+        self._loading = True
+        try:
+            self.transform_x_spin.set_value(clip.transform_x if clip else 0.0)
+            self.transform_y_spin.set_value(clip.transform_y if clip else 0.0)
+            self.transform_scale_spin.set_value(clip.scale if clip else 1.0)
+        finally:
+            self._loading = was_loading
+
+    def _on_transform_changed(self, *_args: object) -> None:
+        if self._loading:
+            return
+        clip = self._selected_video_clip()
+        if clip is None:
+            return
+        clip.transform_x = self.transform_x_spin.get_value()
+        clip.transform_y = self.transform_y_spin.get_value()
+        clip.scale = max(0.05, self.transform_scale_spin.get_value())
+        self._apply_timeline_frame(self.timeline.playhead, start_media=False)
+        self._schedule_checkpoint()
+        self._schedule_autosave()
+
+    def _on_transform_reset(self, *_args: object) -> None:
+        if self._selected_video_clip() is None:
+            return
+        self.transform_x_spin.set_value(0.0)
+        self.transform_y_spin.set_value(0.0)
+        self.transform_scale_spin.set_value(1.0)
+        self._checkpoint()
+
     def _refresh_export_name(self) -> None:
         if not self.video_path:
             self.export_name.set_text("name is assigned on export (.mp4)")
@@ -2355,6 +2459,7 @@ class EditorWindow(Adw.ApplicationWindow):
             c = self.video_clips[self.sel_v]
             self.timeline.set_range(c.in_s, c.out_s)
         self.btn_export.set_sensitive(bool(self.video_clips) and not self.exporting)
+        self._sync_transform_controls()
         self._refresh_media()
 
     def _refresh_media(self) -> None:
@@ -2624,6 +2729,11 @@ class EditorWindow(Adw.ApplicationWindow):
         self.aspect = name
         w, h = dest_size(name)
         self.aspect_frame.set_ratio(w / h)
+        clip = self._video_at(self.timeline.playhead)
+        if clip is not None:
+            self.preview.set_transform(
+                clip.transform_x, clip.transform_y, clip.scale, w, h
+            )
         self._refresh_crop()
         self._checkpoint()
 
@@ -2740,6 +2850,7 @@ class EditorWindow(Adw.ApplicationWindow):
                 item = self._clip_item(c, "audio")
                 if item is not None:
                     self._bind_audio(item.id)
+        self._sync_transform_controls()
 
     def _place_clip(self, kind: str, t: float, media_id: str = "") -> None:
         t = max(0.0, float(t))
@@ -3122,6 +3233,8 @@ class EditorWindow(Adw.ApplicationWindow):
     def _apply_timeline_frame(self, timeline_t: float, *, start_media: bool) -> None:
         clip = self._video_at(timeline_t)
         if clip is None or self._vmedia is None:
+            dw, dh = dest_size(self.aspect)
+            self.preview.set_transform(0.0, 0.0, 1.0, dw, dh)
             self.preview.set_blank(True)
             if self._vmedia is not None:
                 self._vmedia.pause()
@@ -3133,6 +3246,10 @@ class EditorWindow(Adw.ApplicationWindow):
             info = self.media_info.get(item.id) or self.video_info or {}
         else:
             info = self.video_info or {}
+        dw, dh = dest_size(self.aspect)
+        self.preview.set_transform(
+            clip.transform_x, clip.transform_y, clip.scale, dw, dh
+        )
         self.preview.set_blank(False)
         dur = float(info.get("duration") or 0)
         source = self._source_time(clip, timeline_t, dur)

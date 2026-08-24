@@ -222,12 +222,21 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
         from clip_editor.export import _flatten_clips
         from clip_editor.project import ClipInst
 
-        left = ClipInst(start=2.0, in_s=1.0, out_s=8.0)
+        left = ClipInst(
+            start=2.0,
+            in_s=1.0,
+            out_s=8.0,
+            transform_x=120.0,
+            transform_y=-80.0,
+            scale=1.25,
+        )
         right = left.split_at(6.0)
         assert right is not None
         assert abs(left.in_s - 1.0) < 1e-9 and abs(left.out_s - 4.0) < 1e-9
         assert abs(right.start - 2.0) < 1e-9
         assert abs(right.in_s - 4.0) < 1e-9 and abs(right.out_s - 8.0) < 1e-9
+        assert right.transform_x == 120.0 and right.transform_y == -80.0
+        assert right.scale == 1.25
         assert left.split_at(2.0) is None
         assert ClipInst(start=0.0, in_s=0.0, out_s=1.0).split_at(0.5) is not None
 
@@ -277,6 +286,30 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
         assert g3["gate_ok"], g3
         assert 1.25 <= float(g3["duration"]) <= 1.45, g3
         assert abs(float(result3["meta"]["crossfade_s"]) - 0.25) < 1e-9
+
+        out4 = td_p / "out_transform.mp4"
+        result4 = run_export(
+            video,
+            out4,
+            audio=None,
+            aspect="9:16",
+            in_s=0.0,
+            out_s=2.0,
+            video_clips=[
+                ClipInst(
+                    start=0.0,
+                    in_s=0.0,
+                    out_s=0.8,
+                    transform_x=120.0,
+                    transform_y=-90.0,
+                    scale=0.75,
+                )
+            ],
+        )
+        g4 = result4["gate"]
+        assert g4["gate_ok"], g4
+        assert g4["width"] == 1080 and g4["height"] == 1920, g4
+        assert 0.7 <= float(g4["duration"]) <= 0.9, g4
         print("selftest ok")
         print(f"  crop {result['meta']['crop']}")
         print(f"  {g['width']}x{g['height']} {g['vcodec']}+{g['acodec']} {g['duration']:.3f}s")
