@@ -17,13 +17,18 @@ depends=(
   'python'
   'python-gobject'
 )
-makedepends=('git' 'python-build' 'python-installer' 'python-wheel')
+makedepends=('git' 'python-build' 'python-installer' 'python-setuptools' 'python-wheel')
 optdepends=('chromium: legacy clip-editor serve --open interface')
 source=("$pkgname::git+$url.git#tag=v$pkgver")
 sha256sums=('SKIP')
 
 build() {
   cd "$pkgname"
+  # setuptools stages into build/lib and does not prune files that went away, so
+  # a rebuild over an existing extract (makepkg -e, --noextract) can carry a
+  # removed module into the wheel. This PR also gitignores build/, so the
+  # directory now sticks around in working trees.
+  rm -rf build dist
   python -m build --wheel --no-isolation
 }
 
