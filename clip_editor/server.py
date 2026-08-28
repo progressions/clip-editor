@@ -160,7 +160,6 @@ def _pick_native(kind: str) -> Path | None:
             text=True,
             timeout=300,
             env=env,
-            cwd=str(Path(__file__).resolve().parents[1]),
         )
     except subprocess.TimeoutExpired:
         raise ProbeError("file picker timed out")

@@ -5,10 +5,61 @@ social aspect, export one Buffer-safe H.264/AAC MP4.
 
 Not a kdenlive clone. No titles or codec menus.
 
-Lives here on purpose (`~/tech/`), not in the Dropbox vault — encode temp files
-and the Chromium profile should not sync.
+The installed application and its cache stay on local disk rather than in the
+Dropbox vault, so encode temporary files and the optional Chromium profile do
+not sync.
 
 Vault note: `GENNIE/Ops/clip-editor.md`.
+
+## Install
+
+Clip Editor is distributed as an Arch package. A release is built from a Git
+tag whose version matches `pkgver` in `PKGBUILD`.
+
+```bash
+git clone https://github.com/progressions/clip-editor.git
+cd clip-editor
+makepkg -si
+```
+
+The package installs the Python application, `/usr/bin/clip-editor`, and the
+desktop entry. It declares GTK, libadwaita, GStreamer, and FFmpeg runtime
+dependencies. Chromium is optional and is only used by the legacy `serve`
+command.
+
+### Migrating from the source launcher
+
+Remove the old user-owned symlink and desktop-file copy after installing the
+package. This does not touch projects or application state.
+
+```bash
+unlink ~/.local/bin/clip-editor
+rm ~/.local/share/applications/clip-editor.desktop
+```
+
+If either path is not present, skip that command. The package-owned desktop
+entry under `/usr/share/applications` is then used by the app launcher.
+
+### Upgrade, downgrade, and uninstall
+
+Build a newer checked-out tag with `makepkg -si` to upgrade. To downgrade,
+install a previously built package from the Pacman cache:
+
+```bash
+sudo pacman -U /var/cache/pacman/pkg/clip-editor-<version>-any.pkg.tar.zst
+```
+
+Uninstall with `sudo pacman -Rns clip-editor`. Pacman removes program files
+only. It preserves projects, exported media, Eagle intake files, and
+`~/.local/state/clip-editor`.
+
+Maintainer release procedure:
+
+1. Update the version in `clip_editor/__init__.py` and `PKGBUILD`; reset
+   `pkgrel` to 1.
+2. Run `clip-editor selftest` and build/test the package.
+3. Commit, tag the commit as `v<version>`, and push the commit and tag.
+4. Run `makepkg -si` from the tagged checkout.
 
 ## Run
 
@@ -28,11 +79,8 @@ clip-editor selftest
 
 Eagle Browse: **Shift+E** sends `--video` / `--audio` (add). **Ctrl+Shift+E** sends `--new --video` (new project). A second launch is handed to the running window.
 
-The launcher is `~/tech/clip-editor/clip-editor`. Symlink it onto PATH:
-
-```bash
-ln -sfn "$HOME/tech/clip-editor/clip-editor" "$HOME/.local/bin/clip-editor"
-```
+The installed console entry point is `/usr/bin/clip-editor`; it does not use
+the source checkout, `PYTHONPATH`, or a particular working directory.
 
 Window is `http://127.0.0.1:8765/` (localhost only).
 
