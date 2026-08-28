@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 FORMAT = "clip-editor-project"
-VERSION = 4
+VERSION = 5
 SUFFIX = ".clip.json"
 STATE_DIR = Path.home() / ".local" / "state" / "clip-editor"
 AUTOSAVE_PATH = STATE_DIR / "autosave.clip.json"
@@ -55,6 +55,7 @@ class ClipInst:
     transform_x: float = 0.0
     transform_y: float = 0.0
     scale: float = 1.0
+    track: int = 1
 
     def used(self) -> tuple[float, float]:
         inn = max(0.0, float(self.in_s))
@@ -74,6 +75,7 @@ class ClipInst:
             transform_x=self.transform_x,
             transform_y=self.transform_y,
             scale=self.scale,
+            track=self.track,
         )
 
     def split_at(
@@ -104,6 +106,7 @@ class ClipInst:
             transform_x=self.transform_x,
             transform_y=self.transform_y,
             scale=self.scale,
+            track=self.track,
         )
         self.out_s = src_cut
         return right
@@ -119,6 +122,8 @@ def clip_to_dict(c: ClipInst) -> dict:
         d["transform_y"] = float(c.transform_y)
     if abs(float(c.scale) - 1.0) > 0.0001:
         d["scale"] = float(c.scale)
+    if int(c.track) != 1:
+        d["track"] = max(1, min(2, int(c.track)))
     return d
 
 
@@ -132,6 +137,7 @@ def clip_from_dict(data: object) -> ClipInst | None:
         transform_x = float(data.get("transform_x") or 0.0)
         transform_y = float(data.get("transform_y") or 0.0)
         scale = max(0.05, float(data.get("scale") or 1.0))
+        track = max(1, min(2, int(data.get("track") or 1)))
     except (TypeError, ValueError):
         return None
     mid = str(data.get("media_id") or "")
@@ -143,6 +149,7 @@ def clip_from_dict(data: object) -> ClipInst | None:
         transform_x=transform_x,
         transform_y=transform_y,
         scale=scale,
+        track=track,
     )
 
 

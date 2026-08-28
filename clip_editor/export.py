@@ -379,7 +379,12 @@ def _join_parts(
                 max(0.0, part_dur - 0.05),
             )
 
-        out_label = f"{kind[0]}join{i}"
+        # Full `kind`, not kind[0]: the audio callers pass "audio1"/"audio2", so
+        # every track emitted the same [ajoinN] names. ffmpeg accepts that only
+        # because each label is consumed before the next track reuses it -- an
+        # emission-order dependency nothing enforces. Distinct names per track
+        # remove it.
+        out_label = f"{kind}join{i}"
         if transition > 0.001:
             if kind == "video":
                 offset = max(0.0, duration - transition)
@@ -447,7 +452,8 @@ def _build_cmd_many(
         probes[m.id] = info
         durs[m.id] = float(info.get("duration") or 0.0)
     vwork = []
-    for c in video_clips:
+    # Higher video tracks take priority wherever their clips are present.
+    for c in sorted(video_clips, key=lambda clip: int(clip.track)):
         cc = c.copy()
         if not cc.media_id:
             cc.media_id = prim_v
@@ -455,24 +461,32 @@ def _build_cmd_many(
     vflat = _flatten_clips(vwork, durs if durs else src_dur)
     if not vflat:
         raise ExportError("no video on the timeline")
+    aflats: dict[int, list[tuple]] = {}
     if use_replacement and audio_clips:
-        awork = []
-        for c in audio_clips:
-            cc = c.copy()
-            if not cc.media_id:
-                cc.media_id = prim_a or prim_v
-            awork.append(cc)
-        aflat = _flatten_clips(awork, durs if durs else src_dur)
+        for track in (1, 2):
+            awork = []
+            for c in audio_clips:
+                if int(c.track) != track:
+                    continue
+                cc = c.copy()
+                if not cc.media_id:
+                    cc.media_id = prim_a or prim_v
+                awork.append(cc)
+            flat = _flatten_clips(awork, durs if durs else src_dur)
+            if flat:
+                aflats[track] = flat
     elif use_source_audio:
-        aflat = [row for row in vflat if probes.get(row[4], {}).get("has_audio")]
-    else:
-        aflat = []
+        flat = [row for row in vflat if probes.get(row[4], {}).get("has_audio")]
+        if flat:
+            aflats[1] = flat
     out_dur = vflat[-1][1]
-    if aflat:
+    for aflat in aflats.values():
         out_dur = max(out_dur, aflat[-1][1])
     out_dur = max(out_dur, 0.05)
     v_parts = _timeline_parts(vflat, out_dur)
-    a_parts = _timeline_parts(aflat, out_dur) if aflat else []
+    a_parts_by_track = {
+        track: _timeline_parts(aflat, out_dur) for track, aflat in aflats.items()
+    }
 
     inputs: list[Path] = []
     idx_of: dict[str, int] = {}
@@ -492,8 +506,9 @@ def _build_cmd_many(
 
     for row in vflat:
         add_input(str(row[4]))
-    for row in aflat:
-        add_input(str(row[4]))
+    for aflat in aflats.values():
+        for row in aflat:
+            add_input(str(row[4]))
     if not inputs:
         inputs = [video]
         idx_of[prim_v] = 0
@@ -589,9 +604,10 @@ def _build_cmd_many(
         if v_label != "[v]":
             filters.append(f"{v_label}null[v]")
 
-    have_audio = bool(a_parts) and (use_replacement or use_source_audio)
+    have_audio = bool(a_parts_by_track) and (use_replacement or use_source_audio)
     if have_audio:
-        a_mids = [str(p[3]) for p in a_parts if p[0] == "seg"]
+        all_a_parts = [p for parts in a_parts_by_track.values() for p in parts]
+        a_mids = [str(p[3]) for p in all_a_parts if p[0] == "seg"]
         a_idx_count = Counter(idx_of.get(mid, 0) for mid in a_mids)
         a_split_at = {i: 0 for i in a_idx_count}
         for i, n in a_idx_count.items():
@@ -599,37 +615,50 @@ def _build_cmd_many(
                 filters.append(
                     f"[{i}:a]asplit={n}" + "".join(f"[ain{i}_{k}]" for k in range(n))
                 )
-        a_labs: list[str] = []
-        for i, part in enumerate(a_parts):
-            lab = "a" if len(a_parts) == 1 else f"as{i}"
-            if part[0] == "gap":
-                d = float(part[1])
-                filters.append(
-                    f"anullsrc=r=48000:cl=stereo:d={d:.6f},"
-                    f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[{lab}]"
+        track_outputs: list[str] = []
+        for track, a_parts in sorted(a_parts_by_track.items()):
+            a_labs: list[str] = []
+            for i, part in enumerate(a_parts):
+                lab = f"a{track}s{i}"
+                if part[0] == "gap":
+                    d = float(part[1])
+                    filters.append(
+                        f"anullsrc=r=48000:cl=stereo:d={d:.6f},"
+                        f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[{lab}]"
+                    )
+                else:
+                    sinn, sdur, mid = float(part[1]), float(part[2]), str(part[3])
+                    ii = idx_of.get(mid, 0)
+                    off = max(0.0, float(audio_offset or 0.0))
+                    if a_idx_count[ii] > 1:
+                        k = a_split_at[ii]
+                        a_split_at[ii] = k + 1
+                        pad = f"[ain{ii}_{k}]"
+                    else:
+                        pad = f"[{ii}:a]"
+                    filters.append(
+                        f"{pad}atrim=start={sinn + off:.6f}:duration={sdur:.6f},"
+                        f"asetpts=PTS-STARTPTS,"
+                        f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[{lab}]"
+                    )
+                a_labs.append(f"[{lab}]")
+            if len(a_labs) > 1:
+                a_label, _ = _join_parts(
+                    filters, a_parts, a_labs, kind=f"audio{track}", crossfade_s=crossfade_s
                 )
             else:
-                sinn, sdur, mid = float(part[1]), float(part[2]), str(part[3])
-                ii = idx_of.get(mid, 0)
-                off = max(0.0, float(audio_offset or 0.0))
-                if a_idx_count[ii] > 1:
-                    k = a_split_at[ii]
-                    a_split_at[ii] = k + 1
-                    pad = f"[ain{ii}_{k}]"
-                else:
-                    pad = f"[{ii}:a]"
-                filters.append(
-                    f"{pad}atrim=start={sinn + off:.6f}:duration={sdur:.6f},"
-                    f"asetpts=PTS-STARTPTS,"
-                    f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[{lab}]"
-                )
-            a_labs.append(f"[{lab}]")
-        if len(a_labs) > 1:
-            a_label, _ = _join_parts(
-                filters, a_parts, a_labs, kind="audio", crossfade_s=crossfade_s
+                a_label = a_labs[0]
+            track_out = f"atrack{track}"
+            filters.append(f"{a_label}anull[{track_out}]")
+            track_outputs.append(f"[{track_out}]")
+        if len(track_outputs) == 1:
+            filters.append(f"{track_outputs[0]}anull[a]")
+        else:
+            filters.append(
+                "".join(track_outputs)
+                + f"amix=inputs={len(track_outputs)}:duration=longest:normalize=0,"
+                + f"volume={1.0 / len(track_outputs):.6f}[a]"
             )
-            if a_label != "[a]":
-                filters.append(f"{a_label}anull[a]")
 
     out_dur = max(0.05, video_duration)
 

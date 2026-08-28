@@ -316,6 +316,49 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
         assert g4["gate_ok"], g4
         assert g4["width"] == 1080 and g4["height"] == 1920, g4
         assert 0.7 <= float(g4["duration"]) <= 0.9, g4
+
+        out5 = td_p / "out_two_audio_tracks.mp4"
+        result5 = run_export(
+            video,
+            out5,
+            audio=audio,
+            aspect="9:16",
+            in_s=0.0,
+            out_s=2.0,
+            video_clips=[ClipInst(start=0.0, in_s=0.0, out_s=1.0)],
+            audio_clips=[
+                ClipInst(start=0.0, in_s=0.0, out_s=1.0, track=1),
+                ClipInst(start=0.0, in_s=0.0, out_s=1.0, track=2),
+            ],
+        )
+        g5 = result5["gate"]
+        assert g5["gate_ok"] and g5["acodec"] == "aac", g5
+        assert 0.9 <= float(g5["duration"]) <= 1.1, g5
+
+        # Both audio tracks multi-part, so each reaches _join_parts: A1 has two
+        # segments, A2 a leading gap plus a segment. Covers the per-track join
+        # and mix path, which the single-part case above never exercises.
+        out6 = td_p / "out_two_audio_tracks_multipart.mp4"
+        result6 = run_export(
+            video,
+            out6,
+            audio=audio,
+            aspect="9:16",
+            in_s=0.0,
+            out_s=2.0,
+            video_clips=[ClipInst(start=0.0, in_s=0.0, out_s=1.6)],
+            audio_clips=[
+                # _clip_span adds start to in_s/out_s, so these two butt
+                # together on the timeline at 0.0-0.8 and 0.8-1.6.
+                ClipInst(start=0.0, in_s=0.0, out_s=0.8, track=1),
+                ClipInst(start=0.0, in_s=0.8, out_s=1.6, track=1),
+                # Leading gap, so A2 is also two parts.
+                ClipInst(start=0.5, in_s=0.0, out_s=0.6, track=2),
+            ],
+        )
+        g6 = result6["gate"]
+        assert g6["gate_ok"] and g6["acodec"] == "aac", g6
+        assert 1.5 <= float(g6["duration"]) <= 1.7, g6
         print("selftest ok")
         print(f"  crop {result['meta']['crop']}")
         print(f"  {g['width']}x{g['height']} {g['vcodec']}+{g['acodec']} {g['duration']:.3f}s")

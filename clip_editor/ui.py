@@ -275,6 +275,7 @@ class Timeline(Gtk.DrawingArea):
     _TRAIL_PX = 160.0
     _TRAIL_MIN_S = 8.0
     _MIN_PPS = 8.0
+    _HEIGHT = 162
 
     def __init__(self) -> None:
         super().__init__()
@@ -302,20 +303,22 @@ class Timeline(Gtk.DrawingArea):
         self.on_audio_move = None
         self.on_video_trim = None
         self.on_audio_trim = None
+        self.on_track_change = None
         self.on_place = None
         self.on_select = None
         self._drag_mode = ""
         self._drag_index = -1
         self._drag_v0 = 0.0
+        self._drag_y0 = 0.0
         self._drag_span = 0.0
         self._drag_inner = 1.0
         self._snap_line: float | None = None
-        self._drop_hover: tuple[str, float] | None = None
+        self._drop_hover: tuple[str, float, int] | None = None
         self.set_hexpand(False)
         self.set_vexpand(False)
         self.set_content_width(200)
-        self.set_content_height(94)
-        self.set_size_request(200, 94)
+        self.set_content_height(self._HEIGHT)
+        self.set_size_request(200, self._HEIGHT)
         self.set_draw_func(self._draw)
         self.connect("resize", self._on_resize)
         self.set_sensitive(False)
@@ -487,7 +490,7 @@ class Timeline(Gtk.DrawingArea):
         w = self._desired_width()
         cur = int(self.get_size_request()[0] or 0)
         if cur != w:
-            self.set_size_request(w, 94)
+            self.set_size_request(w, self._HEIGHT)
             self.set_content_width(w)
 
     def _on_resize(self, _area: Gtk.DrawingArea, _width: int, _height: int) -> None:
@@ -565,6 +568,34 @@ class Timeline(Gtk.DrawingArea):
     def _in_lane(self, y: float, lane_y: float) -> bool:
         return lane_y <= y <= lane_y + self._LANE_H
 
+    def _lane_y(self, kind: str, track: int) -> float:
+        # Overlay video sits above the base picture; audio tracks sit below it.
+        slot = {("video", 2): 0, ("video", 1): 1, ("audio", 1): 2, ("audio", 2): 3}[
+            (kind, max(1, min(2, int(track))))
+        ]
+        return self._RULER_H + slot * (self._LANE_H + self._LANE_GAP)
+
+    def _track_at(self, kind: str, y: float) -> int | None:
+        for track in (1, 2):
+            if self._in_lane(y, self._lane_y(kind, track)):
+                return track
+        return None
+
+    def _hit_kind(self, x: float, y: float, kind: str) -> tuple[int, str]:
+        clips = self.vclips if kind == "video" else self.aclips
+        lane = "v" if kind == "video" else "a"
+        for track in (1, 2):
+            lane_y = self._lane_y(kind, track)
+            candidates = [i for i, c in enumerate(clips) if int(c.track) == track]
+            for i in reversed(candidates):
+                t0, t1 = self._clip_times(clips[i], self._clip_src_dur(clips[i], lane))
+                edge = self._hit_edge(x, y, t0, t1, lane_y)
+                if edge:
+                    return i, edge
+                if self._hit_clip(x, y, t0, t1, lane_y):
+                    return i, "body"
+        return -1, ""
+
     def _hit_edge(self, x: float, y: float, t0: float, t1: float, lane_y: float) -> str:
         if not self._in_lane(y, lane_y) or t1 <= t0:
             return ""
@@ -617,25 +648,23 @@ class Timeline(Gtk.DrawingArea):
         return -1, ""
 
     def _hit_video(self, x: float, y: float) -> bool:
-        i, part = self._hit_lane_clip(x, y, self.vclips, "v", self._RULER_H)
+        i, part = self._hit_kind(x, y, "video")
         return i >= 0 and part == "body"
 
     def _hit_audio(self, x: float, y: float) -> bool:
         if self.audio_kind == "source":
             return False
-        a_y = self._RULER_H + self._LANE_H + self._LANE_GAP
-        i, part = self._hit_lane_clip(x, y, self.aclips, "a", a_y)
+        i, part = self._hit_kind(x, y, "audio")
         return i >= 0 and part == "body"
 
     def _hit_video_edge(self, x: float, y: float) -> str:
-        i, part = self._hit_lane_clip(x, y, self.vclips, "v", self._RULER_H)
+        i, part = self._hit_kind(x, y, "video")
         return part if part in ("in", "out") else ""
 
     def _hit_audio_edge(self, x: float, y: float) -> str:
         if self.audio_kind == "source":
             return ""
-        a_y = self._RULER_H + self._LANE_H + self._LANE_GAP
-        i, part = self._hit_lane_clip(x, y, self.aclips, "a", a_y)
+        i, part = self._hit_kind(x, y, "audio")
         return part if part in ("in", "out") else ""
 
     def _seek_x(self, x: float) -> None:
@@ -646,32 +675,14 @@ class Timeline(Gtk.DrawingArea):
             self.on_seek(t)
 
     def _select_hit(self, x: float, y: float) -> bool:
-        a_y = self._RULER_H + self._LANE_H + self._LANE_GAP
-        v_y = self._RULER_H
-        if self._in_lane(y, a_y):
-            ai, _ap = self._hit_lane_clip(x, y, self.aclips, "a", a_y)
-            if ai >= 0:
-                self.sel_a = ai
-                self._mirror_sel()
-                if callable(self.on_select):
-                    self.on_select("audio", ai)
-                return True
-        if self._in_lane(y, v_y):
-            vi, _vp = self._hit_lane_clip(x, y, self.vclips, "v", v_y)
-            if vi >= 0:
-                self.sel_v = vi
-                self._mirror_sel()
-                if callable(self.on_select):
-                    self.on_select("video", vi)
-                return True
-        vi, _vp = self._hit_lane_clip(x, y, self.vclips, "v", v_y)
+        vi, _vp = self._hit_kind(x, y, "video")
         if vi >= 0:
             self.sel_v = vi
             self._mirror_sel()
             if callable(self.on_select):
                 self.on_select("video", vi)
             return True
-        ai, _ap = self._hit_lane_clip(x, y, self.aclips, "a", a_y)
+        ai, _ap = self._hit_kind(x, y, "audio")
         if ai >= 0:
             self.sel_a = ai
             self._mirror_sel()
@@ -704,11 +715,11 @@ class Timeline(Gtk.DrawingArea):
         _left, inner = self._inner(max(1.0, float(self.get_width())))
         self._drag_inner = inner
         self._drag_span = max(self._map_span(), 0.01)
-        vi, vp = self._hit_lane_clip(ox, oy, self.vclips, "v", self._RULER_H)
-        a_y = self._RULER_H + self._LANE_H + self._LANE_GAP
+        self._drag_y0 = oy
+        vi, vp = self._hit_kind(ox, oy, "video")
         ai, ap = (-1, "")
         if self.audio_kind != "source":
-            ai, ap = self._hit_lane_clip(ox, oy, self.aclips, "a", a_y)
+            ai, ap = self._hit_kind(ox, oy, "audio")
         if vp in ("in", "out", "body"):
             self.sel_v = vi
             self._drag_index = vi
@@ -816,7 +827,7 @@ class Timeline(Gtk.DrawingArea):
         self._snap_line = line
         return max(-used_in, best)
 
-    def _on_drag_update(self, gesture: Gtk.GestureDrag, dx: float, _dy: float) -> None:
+    def _on_drag_update(self, gesture: Gtk.GestureDrag, dx: float, dy: float) -> None:
         dt = self._dt(dx)
         if self._drag_mode == "video-in":
             c = self._vclip()
@@ -890,6 +901,11 @@ class Timeline(Gtk.DrawingArea):
                 start = self._snap_move(start, inn, out, self._other_edges("video"))
                 start = max(-inn, start)
                 c.start = start
+                track = self._track_at("video", self._drag_y0 + dy)
+                if track is not None and track != c.track:
+                    c.track = track
+                    if callable(self.on_track_change):
+                        self.on_track_change("video", self._drag_index, track)
                 self.video_start = start
                 if callable(self.on_video_move):
                     self.on_video_move(self._drag_index, start, False)
@@ -902,6 +918,11 @@ class Timeline(Gtk.DrawingArea):
                 start = self._snap_move(start, inn, out, self._other_edges("audio"))
                 start = max(-inn, start)
                 c.start = start
+                track = self._track_at("audio", self._drag_y0 + dy)
+                if track is not None and track != c.track:
+                    c.track = track
+                    if callable(self.on_track_change):
+                        self.on_track_change("audio", self._drag_index, track)
                 self.audio_start = start
                 if callable(self.on_audio_move):
                     self.on_audio_move(self._drag_index, start, False)
@@ -965,16 +986,13 @@ class Timeline(Gtk.DrawingArea):
     def _bin_action(self, target: Gtk.DropTarget, x: float, y: float) -> Gdk.DragAction:
         kind = self._drop_kind(target)
         t = self._x_to_t(x)
-        v_y = self._RULER_H
-        a_y = self._RULER_H + self._LANE_H + self._LANE_GAP
-        hover: tuple[str, float] | None = None
+        hover: tuple[str, float, int] | None = None
         action = Gdk.DragAction(0)
-        if kind == "video" and self._in_lane(y, v_y):
-            hover = ("video", t)
-            action = Gdk.DragAction.COPY
-        elif kind == "audio" and self._in_lane(y, a_y):
-            hover = ("audio", t)
-            action = Gdk.DragAction.COPY
+        for track in (1, 2):
+            if kind in ("video", "audio") and self._in_lane(y, self._lane_y(kind, track)):
+                hover = (kind, t, track)
+                action = Gdk.DragAction.COPY
+                break
         if hover != self._drop_hover:
             self._drop_hover = hover
             self.queue_draw()
@@ -1000,18 +1018,13 @@ class Timeline(Gtk.DrawingArea):
     def _on_bin_drop(self, _t: Gtk.DropTarget, value: object, x: float, y: float) -> bool:
         kind, mid = self._parse_bin_payload(value)
         t = self._x_to_t(x)
-        v_y = self._RULER_H
-        a_y = self._RULER_H + self._LANE_H + self._LANE_GAP
         self._drop_hover = None
         self.queue_draw()
-        if kind == "video" and self._in_lane(y, v_y):
-            if callable(self.on_place):
-                self.on_place("video", t, mid)
-            return True
-        if kind == "audio" and self._in_lane(y, a_y):
-            if callable(self.on_place):
-                self.on_place("audio", t, mid)
-            return True
+        for track in (1, 2):
+            if kind in ("video", "audio") and self._in_lane(y, self._lane_y(kind, track)):
+                if callable(self.on_place):
+                    self.on_place(kind, t, mid, track)
+                return True
         return False
 
     def _draw_clip(
@@ -1068,83 +1081,86 @@ class Timeline(Gtk.DrawingArea):
         cr.paint()
 
         left, inner = self._inner(width)
-        v_y = self._RULER_H
-        a_y = self._RULER_H + self._LANE_H + self._LANE_GAP
-        lanes_bottom = a_y + self._LANE_H
+        v_y = self._lane_y("video", 1)
+        lanes_bottom = self._lane_y("audio", 2) + self._LANE_H
 
-        _round_rect(cr, left, v_y, inner, self._LANE_H, 4)
-        cr.set_source_rgb(*track)
-        cr.fill()
-        _round_rect(cr, left, a_y, inner, self._LANE_H, 4)
-        cr.set_source_rgb(*track)
-        cr.fill()
+        for kind, track_no in (("video", 2), ("video", 1), ("audio", 1), ("audio", 2)):
+            lane_y = self._lane_y(kind, track_no)
+            _round_rect(cr, left, lane_y, inner, self._LANE_H, 4)
+            cr.set_source_rgb(*track)
+            cr.fill()
 
         cr.set_source_rgb(*muted)
         cr.set_font_size(11)
-        cr.move_to(6, v_y + 19)
-        cr.show_text("V")
-        cr.move_to(6, a_y + 19)
-        cr.show_text("A")
+        for label, kind, track_no in (
+            ("V2", "video", 2), ("V1", "video", 1),
+            ("A1", "audio", 1), ("A2", "audio", 2),
+        ):
+            cr.move_to(3, self._lane_y(kind, track_no) + 19)
+            cr.show_text(label)
 
         clip_y = 3.0
         clip_h = self._LANE_H - 6
         for i, c in enumerate(self.vclips):
+            clip_lane_y = self._lane_y("video", c.track)
             d = self._clip_src_dur(c, "v")
             inn, out = self._clip_used(c, d)
             gx0 = self._t_to_x(c.start, width)
             gx1 = self._t_to_x(c.start + d, width)
-            self._draw_clip(cr, gx0, v_y + clip_y, max(3.0, gx1 - gx0), clip_h, sel, "", 0.28)
+            self._draw_clip(cr, gx0, clip_lane_y + clip_y, max(3.0, gx1 - gx0), clip_h, sel, "", 0.28)
             x0 = self._t_to_x(c.start + inn, width)
             x1 = self._t_to_x(c.start + out, width)
             name = self.clip_names.get(c.media_id) or (
                 self.video_name if i == self.sel_v or len(self.vclips) == 1 else ""
             )
             self._draw_clip(
-                cr, x0, v_y + clip_y, max(3.0, x1 - x0), clip_h, sel, name
+                cr, x0, clip_lane_y + clip_y, max(3.0, x1 - x0), clip_h, sel, name
             )
-            self._draw_handles(cr, x0, x1, v_y + clip_y, clip_h, fg)
+            self._draw_handles(cr, x0, x1, clip_lane_y + clip_y, clip_h, fg)
             if i == self.sel_v:
                 cr.set_source_rgb(*fg)
                 cr.set_line_width(1)
-                cr.rectangle(x0, v_y + clip_y, max(3.0, x1 - x0), clip_h)
+                cr.rectangle(x0, clip_lane_y + clip_y, max(3.0, x1 - x0), clip_h)
                 cr.stroke()
 
         color = green if self.audio_kind != "source" else muted
         for i, c in enumerate(self.aclips):
+            clip_lane_y = self._lane_y("audio", c.track)
             d = self._clip_src_dur(c, "a")
             inn, out = self._clip_used(c, d)
             gx0 = self._t_to_x(c.start, width)
             gx1 = self._t_to_x(c.start + d, width)
-            self._draw_clip(cr, gx0, a_y + clip_y, max(3.0, gx1 - gx0), clip_h, color, "", 0.28)
+            self._draw_clip(cr, gx0, clip_lane_y + clip_y, max(3.0, gx1 - gx0), clip_h, color, "", 0.28)
             x0 = self._t_to_x(c.start + inn, width)
             x1 = self._t_to_x(c.start + out, width)
             name = self.clip_names.get(c.media_id) or (
                 self.audio_name if i == self.sel_a or len(self.aclips) == 1 else ""
             )
             self._draw_clip(
-                cr, x0, a_y + clip_y, max(3.0, x1 - x0), clip_h, color, name
+                cr, x0, clip_lane_y + clip_y, max(3.0, x1 - x0), clip_h, color, name
             )
             if self.audio_kind != "source":
-                self._draw_handles(cr, x0, x1, a_y + clip_y, clip_h, fg)
+                self._draw_handles(cr, x0, x1, clip_lane_y + clip_y, clip_h, fg)
             if i == self.sel_a:
                 cr.set_source_rgb(*fg)
                 cr.set_line_width(1)
-                cr.rectangle(x0, a_y + clip_y, max(3.0, x1 - x0), clip_h)
+                cr.rectangle(x0, clip_lane_y + clip_y, max(3.0, x1 - x0), clip_h)
                 cr.stroke()
 
         if self._drop_hover is not None:
-            kind, t = self._drop_hover
+            kind, t, track_no = self._drop_hover
+            hover_y = self._lane_y(kind, track_no)
             if kind == "video" and self.video_dur > 0:
                 gx0 = self._t_to_x(t, width)
                 gx1 = self._t_to_x(t + self.video_dur, width)
                 self._draw_clip(
-                    cr, gx0, v_y + clip_y, max(3.0, gx1 - gx0), clip_h, sel, "", 0.5
+                    cr, gx0, hover_y + clip_y, max(3.0, gx1 - gx0), clip_h, sel, "", 0.5
                 )
             elif kind == "audio" and self.audio_dur > 0:
                 gx0 = self._t_to_x(t, width)
                 gx1 = self._t_to_x(t + self.audio_dur, width)
                 self._draw_clip(
-                    cr, gx0, a_y + clip_y, max(3.0, gx1 - gx0), clip_h, green, "", 0.5
+                    cr, gx0, hover_y + clip_y, max(3.0, gx1 - gx0), clip_h, green, "", 0.5
                 )
 
         if 0 <= self.sel_v < len(self.vclips):
@@ -1380,6 +1396,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.playing = False
         self._vmedia: Gtk.MediaFile | None = None
         self._preview_proc: subprocess.Popen[bytes] | None = None
+        self._preview_mix_proc: subprocess.Popen[bytes] | None = None
         self._play_t0 = 0.0
         self._play_mono = 0.0
         self._syncing_scrub = False
@@ -1455,13 +1472,14 @@ class EditorWindow(Adw.ApplicationWindow):
         self.timeline.on_audio_move = self._on_audio_move
         self.timeline.on_video_trim = self._on_video_trim
         self.timeline.on_audio_trim = self._on_audio_trim
+        self.timeline.on_track_change = self._on_track_change
         self.timeline.on_place = self._place_clip
         self.timeline.on_select = self._on_clip_select
         self.timeline_scroll = Gtk.ScrolledWindow()
         self.timeline_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
         self.timeline_scroll.set_hexpand(True)
         self.timeline_scroll.set_vexpand(False)
-        self.timeline_scroll.set_min_content_height(94)
+        self.timeline_scroll.set_min_content_height(Timeline._HEIGHT)
         self.timeline_scroll.set_child(self.timeline)
         self.timeline_scroll.connect("notify::width", lambda *_: self.timeline._sync_canvas())
         left.append(self.timeline_scroll)
@@ -1707,11 +1725,15 @@ class EditorWindow(Adw.ApplicationWindow):
                     round(c.transform_x, 3),
                     round(c.transform_y, 3),
                     round(c.scale, 4),
+                    int(c.track),
                 )
                 for c in p.video_clips
             ),
             tuple(
-                (round(c.start, 3), round(c.in_s, 3), round(c.out_s, 3), c.media_id)
+                (
+                    round(c.start, 3), round(c.in_s, 3), round(c.out_s, 3),
+                    c.media_id, int(c.track),
+                )
                 for c in p.audio_clips
             ),
             tuple((m.id, m.kind, str(m.path)) for m in p.media),
@@ -2783,6 +2805,13 @@ class EditorWindow(Adw.ApplicationWindow):
         self._schedule_autosave()
         self._set_status(f"Audio at {self.audio_clips[index].start + inn:.2f}s")
 
+    def _on_track_change(self, kind: str, index: int, track: int) -> None:
+        clips = self.video_clips if kind == "video" else self.audio_clips
+        if not 0 <= index < len(clips):
+            return
+        clips[index].track = max(1, min(2, int(track)))
+        self._set_status(f"Moved clip to {kind[0].upper()}{clips[index].track}")
+
     def _on_video_trim(self, index: int, in_s: float, out_s: float, done: bool) -> None:
         if not 0 <= index < len(self.video_clips):
             return
@@ -2852,8 +2881,9 @@ class EditorWindow(Adw.ApplicationWindow):
                     self._bind_audio(item.id)
         self._sync_transform_controls()
 
-    def _place_clip(self, kind: str, t: float, media_id: str = "") -> None:
+    def _place_clip(self, kind: str, t: float, media_id: str = "", track: int = 1) -> None:
         t = max(0.0, float(t))
+        track = max(1, min(2, int(track)))
         if kind == "video":
             item = self._media_by_id(media_id) or next(
                 (m for m in self.media if m.kind == "video"), None
@@ -2864,7 +2894,7 @@ class EditorWindow(Adw.ApplicationWindow):
             if dur <= 0.04:
                 return
             self.video_clips.append(
-                ClipInst(start=t, in_s=0.0, out_s=dur, media_id=item.id)
+                ClipInst(start=t, in_s=0.0, out_s=dur, media_id=item.id, track=track)
             )
             self.sel_v = len(self.video_clips) - 1
             self.sel_kind = "video"
@@ -2876,7 +2906,7 @@ class EditorWindow(Adw.ApplicationWindow):
             finally:
                 self._loading = False
             self.video_start = t
-            self._set_status(f"Placed {item.path.name} at {t:.2f}s")
+            self._set_status(f"Placed {item.path.name} on V{track} at {t:.2f}s")
         elif kind == "audio":
             item = self._media_by_id(media_id) or next(
                 (m for m in self.media if m.kind == "audio"), None
@@ -2887,7 +2917,7 @@ class EditorWindow(Adw.ApplicationWindow):
             if dur <= 0.04:
                 return
             self.audio_clips.append(
-                ClipInst(start=t, in_s=0.0, out_s=dur, media_id=item.id)
+                ClipInst(start=t, in_s=0.0, out_s=dur, media_id=item.id, track=track)
             )
             self.use_video_soundtrack = False
             self.sel_a = len(self.audio_clips) - 1
@@ -2898,7 +2928,7 @@ class EditorWindow(Adw.ApplicationWindow):
             self.audio_out = dur
             if self.follow_in.get_active():
                 self.follow_in.set_active(False)
-            self._set_status(f"Placed {item.path.name} at {t:.2f}s")
+            self._set_status(f"Placed {item.path.name} on A{track} at {t:.2f}s")
         else:
             return
         self._sync_timeline_clips()
@@ -3113,51 +3143,64 @@ class EditorWindow(Adw.ApplicationWindow):
             src = min(src, src_dur)
         return max(0.0, src)
 
-    def _preview_audio_spec(self, timeline_t: float) -> tuple[Path, float, float] | None:
-        """(path, source_start, remaining) for preview audio at a timeline time."""
+    def _audio_tracks_at(self, timeline_t: float) -> tuple[ClipInst | None, ClipInst | None]:
+        hits: list[ClipInst | None] = [None, None]
+        dur = float((self.audio_info or {}).get("duration") or 0)
+        for c in self.audio_clips:
+            t0, t1 = self._clip_span(c, dur)
+            if t0 - 0.02 <= timeline_t < t1:
+                hits[max(1, min(2, int(c.track))) - 1] = c
+        return hits[0], hits[1]
+
+    def _preview_audio_specs(self, timeline_t: float) -> list[tuple[Path, float, float]]:
+        """Active (path, source start, remaining) entries for preview audio."""
         if self.audio_clips:
-            ac = self._audio_at(timeline_t)
-            if ac is None:
-                return None
-            item = self._clip_item(ac, "audio")
-            if item is None:
-                return None
-            adur = self._media_dur(item.id)
-            start = self._source_time(ac, timeline_t, adur)
-            run = self._run_end(self.audio_clips, self._src_durs(), timeline_t)
-            remaining = max(0.05, (run if run is not None else timeline_t) - timeline_t)
-            return item.path, start, remaining
+            specs: list[tuple[Path, float, float]] = []
+            for ac in self._audio_tracks_at(timeline_t):
+                if ac is None:
+                    continue
+                item = self._clip_item(ac, "audio")
+                if item is None:
+                    continue
+                adur = self._media_dur(item.id)
+                start = self._source_time(ac, timeline_t, adur)
+                _t0, end = self._clip_span(ac, adur)
+                specs.append((item.path, start, max(0.05, end - timeline_t)))
+            return specs
         if not self.use_video_soundtrack:
-            return None
+            return []
         vc = self._video_at(timeline_t)
         if vc is None:
-            return None
+            return []
         item = self._clip_item(vc, "video")
         info = self.media_info.get(item.id) if item is not None else self.video_info
         if not info or not info.get("has_audio"):
-            return None
+            return []
         path = item.path if item is not None else self.video_path
         if path is None:
-            return None
+            return []
         vdur = float(info.get("duration") or 0)
         start = self._source_time(vc, timeline_t, vdur)
         run = self._run_end(self.video_clips, self._src_durs(), timeline_t)
         remaining = max(0.05, (run if run is not None else timeline_t) - timeline_t)
-        return path, start, remaining
+        return [(path, start, remaining)]
 
     def _stop_preview_audio(self) -> None:
         proc = self._preview_proc
         self._preview_proc = None
-        if proc is None or proc.poll() is not None:
-            return
-        try:
-            proc.terminate()
-            proc.wait(timeout=0.4)
-        except (ProcessLookupError, PermissionError, OSError, subprocess.TimeoutExpired):
+        mixer = self._preview_mix_proc
+        self._preview_mix_proc = None
+        for child in (proc, mixer):
+            if child is None or child.poll() is not None:
+                continue
             try:
-                proc.kill()
-            except OSError:
-                pass
+                child.terminate()
+                child.wait(timeout=0.4)
+            except (ProcessLookupError, PermissionError, OSError, subprocess.TimeoutExpired):
+                try:
+                    child.kill()
+                except OSError:
+                    pass
 
     def _clip_span(self, c: ClipInst, src_dur: float | dict[str, float] = 0.0) -> tuple[float, float]:
         dur = self._media_dur(c.media_id) if c.media_id else 0.0
@@ -3185,6 +3228,24 @@ class EditorWindow(Adw.ApplicationWindow):
         _p0, p1 = self._clip_span(prev, src_dur)
         n0, _n1 = self._clip_span(nxt, src_dur)
         return abs(p1 - n0) <= JOIN_EPS
+
+    def _audio_state_continuous(
+        self,
+        prev: tuple[ClipInst | None, ...] | None,
+        nxt: tuple[ClipInst | None, ...],
+        src_dur: float,
+    ) -> bool:
+        """True if every track carried on into a split of the same source."""
+        if prev is None or len(prev) != len(nxt):
+            return False
+        if not any(c is not None for c in nxt):
+            return False
+        for was, now in zip(prev, nxt):
+            if was is now:
+                continue
+            if not self._continuous_with(was, now, src_dur):
+                return False
+        return True
 
     def _run_end(self, clips: list[ClipInst], src_dur: float, t: float) -> float | None:
         """Timeline end of the contiguous same-source run covering t."""
@@ -3215,16 +3276,7 @@ class EditorWindow(Adw.ApplicationWindow):
     def _video_at(self, t: float) -> ClipInst | None:
         hit = None
         dur = float((self.video_info or {}).get("duration") or 0)
-        for c in self.video_clips:
-            t0, t1 = self._clip_span(c, dur)
-            if t0 - 0.02 <= t < t1:
-                hit = c
-        return hit
-
-    def _audio_at(self, t: float) -> ClipInst | None:
-        hit = None
-        dur = float((self.audio_info or {}).get("duration") or 0)
-        for c in self.audio_clips:
+        for c in sorted(self.video_clips, key=lambda clip: int(clip.track)):
             t0, t1 = self._clip_span(c, dur)
             if t0 - 0.02 <= t < t1:
                 hit = c
@@ -3267,60 +3319,100 @@ class EditorWindow(Adw.ApplicationWindow):
     def _start_preview_audio(self, timeline_t: float) -> None:
         self._stop_preview_audio()
         begins = self._audio_begins_at()
-        spec = self._preview_audio_spec(timeline_t)
-        if spec is None:
+        specs = self._preview_audio_specs(timeline_t)
+        # Gain and routing follow the specs playing at timeline_t, not every clip
+        # in the project: a clip on A1 at 0-5s and one on A2 at 10-15s never
+        # overlap, so halving both would preview quieter than the export, which
+        # mixes only genuinely overlapping segments.
+        overlapping = len(specs) > 1
+        preview_gain = 1.0 / len(specs) if overlapping else 1.0
+        if not specs:
             if begins is not None and timeline_t < begins - 0.02:
                 self._audio_pending = True
                 return
             if self.audio_path and not shutil.which("ffplay") and not shutil.which("mpv"):
                 self._set_status("Need ffplay or mpv to hear preview audio")
             return
-        path, start, remaining = spec
         self._audio_pending = False
         log = Path.home() / ".cache" / "clip-editor" / "preview-audio.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         logf = log.open("w", encoding="utf-8")
-        # mpv first: --hr-seek hits the playhead. ffplay -ss is keyframe-only
-        # and often restarts at the clip origin.
-        if shutil.which("mpv"):
-            cmd = [
-                "mpv",
-                "--no-video",
-                "--force-window=no",
-                "--no-terminal",
-                "--audio-display=no",
-                "--no-resume-playback",
-                "--hr-seek=always",
-                f"--start={start:.3f}",
-                f"--length={remaining:.3f}",
-                str(path),
+        mix_proc: subprocess.Popen[bytes] | None = None
+        # FFmpeg mixes overlapping A1/A2 clips, then pipes PCM to ffplay.
+        if overlapping and shutil.which("ffplay"):
+            mix_cmd = [which_ffmpeg(), "-hide_banner", "-loglevel", "error"]
+            for path, start, remaining in specs:
+                mix_cmd += ["-ss", f"{start:.3f}", "-t", f"{remaining:.3f}", "-i", str(path)]
+            pads = "".join(f"[{i}:a]" for i in range(len(specs)))
+            if len(specs) > 1:
+                audio_filter = (
+                    pads
+                    + f"amix=inputs={len(specs)}:duration=shortest:normalize=0,"
+                    + f"volume={preview_gain:.6f}[a]"
+                )
+            else:
+                audio_filter = f"[0:a]volume={preview_gain:.6f}[a]"
+            mix_cmd += [
+                "-filter_complex",
+                audio_filter,
+                "-map",
+                "[a]",
+                "-f", "wav", "-ar", "48000", "-ac", "2", "pipe:1",
             ]
-        elif shutil.which("ffplay"):
+            mix_proc = subprocess.Popen(
+                mix_cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=logf,
+            )
             cmd = [
-                "ffplay",
-                "-vn",
-                "-nodisp",
-                "-autoexit",
-                "-loglevel",
-                "error",
-                "-nostats",
-                "-ss",
-                f"{start:.3f}",
-                "-t",
-                f"{remaining:.3f}",
-                str(path),
+                "ffplay", "-vn", "-nodisp", "-autoexit", "-loglevel", "error",
+                "-nostats", "-i", "pipe:0",
             ]
-        else:
-            self._set_status("Need ffplay or mpv to hear preview audio")
+        elif overlapping:
+            self._set_status("Need ffplay to preview overlapping audio tracks")
             logf.close()
             return
-        self._preview_proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=logf,
+        else:
+            path, start, remaining = specs[0]
+            # mpv first: --hr-seek hits the playhead. ffplay -ss is keyframe-only.
+            if shutil.which("mpv"):
+                cmd = [
+                    "mpv", "--no-video", "--force-window=no", "--no-terminal",
+                    "--audio-display=no", "--no-resume-playback", "--hr-seek=always",
+                    f"--volume={preview_gain * 100.0:.1f}",
+                    f"--start={start:.3f}", f"--length={remaining:.3f}", str(path),
+                ]
+            elif shutil.which("ffplay"):
+                cmd = [
+                    "ffplay", "-vn", "-nodisp", "-autoexit", "-loglevel", "error",
+                    "-nostats", "-ss", f"{start:.3f}", "-t", f"{remaining:.3f}",
+                    "-af", f"volume={preview_gain:.6f}", str(path),
+                ]
+            else:
+                self._set_status("Need ffplay or mpv to hear preview audio")
+                logf.close()
+                return
+        # Adopt the mixer before the player can raise, or a failed spawn leaves
+        # ffmpeg running on a pipe nobody reads and _stop_preview_audio blind.
+        self._preview_mix_proc = mix_proc
+        try:
+            self._preview_proc = subprocess.Popen(
+                cmd,
+                stdin=mix_proc.stdout if mix_proc is not None else subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=logf,
+            )
+        except OSError:
+            self._stop_preview_audio()
+            logf.close()
+            self._set_status("Could not start preview audio")
+            return
+        if mix_proc is not None and mix_proc.stdout is not None:
+            mix_proc.stdout.close()
+        src = "A1 + A2" if len(specs) > 1 else (
+            self.audio_path.name if self.audio_path else "video soundtrack"
         )
-        src = self.audio_path.name if self.audio_path else "video soundtrack"
         self._set_status(f"Playing {src}")
         GLib.timeout_add(400, self._check_preview_audio, log)
 
@@ -3440,7 +3532,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self._apply_timeline_frame(t, start_media=True)
         self._start_preview_audio(t)
         if self.audio_clips:
-            self._audio_play_clip = self._audio_at(t)
+            self._audio_play_clip = self._audio_tracks_at(t)
         elif self.use_video_soundtrack and self.video_info and self.video_info.get("has_audio"):
             self._audio_play_clip = self._video_at(t)
         if not self.audio_clips and not (
@@ -3480,18 +3572,20 @@ class EditorWindow(Adw.ApplicationWindow):
             self.preview.queue_draw()
         if self.audio_clips:
             adur = float((self.audio_info or {}).get("duration") or 0)
-            aclip = self._audio_at(t)
+            astate = self._audio_tracks_at(t)
             prev = getattr(self, "_audio_play_clip", None)
-            if aclip is not prev:
-                if aclip is not None and self._continuous_with(prev, aclip, adur):
-                    self._audio_play_clip = aclip
+            if astate != prev:
+                self._audio_play_clip = astate
+                if self._audio_state_continuous(prev, astate, adur):
+                    # Crossing a split in the same source on every track: the
+                    # player is already playing that audio, so let it run rather
+                    # than respawn and drop out at the cut.
+                    pass
+                elif any(c is not None for c in astate):
+                    self._start_preview_audio(t)
                 else:
-                    self._audio_play_clip = aclip
-                    if aclip is not None:
-                        self._start_preview_audio(t)
-                    else:
-                        self._stop_preview_audio()
-                        self._audio_pending = True
+                    self._stop_preview_audio()
+                    self._audio_pending = True
         elif self.use_video_soundtrack and self.video_info and self.video_info.get("has_audio"):
             prev = getattr(self, "_audio_play_clip", None)
             if vclip is not prev:
