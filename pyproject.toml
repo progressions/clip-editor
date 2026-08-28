@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clip-editor"
+dynamic = ["version"]
+description = "Native GTK clip editor for social video exports"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "LicenseRef-Proprietary"
+authors = [{name = "Isaac Priestley"}]
+
+[project.scripts]
+clip-editor = "clip_editor.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["clip_editor*"]
+
+[tool.setuptools.package-data]
+clip_editor = ["static/*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "clip_editor.__version__"}

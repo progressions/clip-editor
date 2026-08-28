@@ -1,10 +1,10 @@
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=Editor
+Name=Clip Editor
 GenericName=Clip editor
 Comment=Cover-crop, mux audio, export Buffer-safe H.264
-Exec=/home/isaac/.local/bin/clip-editor
+Exec=/usr/bin/clip-editor
 Icon=video-x-generic
 Terminal=false
 Categories=AudioVideo;Video;AudioVideoEditing;
