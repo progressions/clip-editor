@@ -68,7 +68,7 @@ the current Omarchy theme (`colors.toml`), same mapping as Eagle Browse, and
 update if you switch themes while the window is open.
 
 ```bash
-clip-editor                 # GTK window
+clip-editor                 # GTK window (installed package)
 clip-editor gui             # same
 clip-editor gui --video clip.mp4            # add video to the current project
 clip-editor gui --new --video clip.mp4      # new project with that video
@@ -76,6 +76,17 @@ clip-editor gui --audio bed.m4a             # add audio; keep the current projec
 clip-editor export --video in.mp4 --audio bed.mp3 --aspect 9:16
 clip-editor selftest
 ```
+
+### Develop while the package is installed
+
+```bash
+~/tech/clip-editor/clip-editor              # source; PYTHONPATH = checkout
+~/tech/clip-editor/clip-editor selftest
+```
+
+Keep using `/usr/bin/clip-editor` for normal launches. Do not restore a
+`~/.local/bin/clip-editor` symlink over the package. See
+`GENNIE/Ops/isaac-archrepo.md`.
 
 Eagle Browse: **Shift+E** sends `--video` / `--audio` (add). **Ctrl+Shift+E** sends `--new --video` (new project). A second launch is handed to the running window.
 
