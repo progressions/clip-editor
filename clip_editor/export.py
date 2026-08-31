@@ -11,6 +11,11 @@ from typing import Any, Callable
 
 from clip_editor.aspects import cover_crop, dest_size
 from clip_editor.eagle import inbox_dir
+from clip_editor.preview import (
+    FINAL_PROFILE,
+    EncodeProfile,
+    profile_dest_size,
+)
 from clip_editor.probe import ProbeError, gate_h264, probe, which_ffmpeg
 from clip_editor.project import (
     TRANSITION_DISSOLVE,
@@ -138,10 +143,12 @@ def build_cmd(
     use_video_soundtrack: bool = True,
     crossfade_s: float = 0.0,
     src: dict[str, Any] | None = None,
+    profile: EncodeProfile = FINAL_PROFILE,
 ) -> tuple[list[str], dict[str, Any]]:
     """Return (ffmpeg argv, meta dict with crop/duration/dest)."""
     video = Path(video)
     out = Path(out)
+    profile = profile or FINAL_PROFILE
     src = src or probe(video)
     if not src.get("has_video"):
         raise ExportError(f"no video stream: {video}")
@@ -162,7 +169,7 @@ def build_cmd(
         raise ExportError("out-point must be after in-point")
     duration = end - in_s
 
-    dw, dh = dest_size(aspect)
+    dw, dh = profile_dest_size(aspect, profile)
     crop = cover_crop(src_w, src_h, dw, dh, pan_x, pan_y)
 
     audio_path: Path | None = Path(audio) if audio else None
@@ -209,6 +216,7 @@ def build_cmd(
             use_replacement=use_replacement,
             use_source_audio=use_source_audio,
             crossfade_s=crossfade_s,
+            profile=profile,
         )
 
     vchain = []
@@ -281,32 +289,21 @@ def build_cmd(
         a_in = "[1:a]" if use_replacement else "[0:a]"
         filt = f"[0:v]{','.join(vchain)}[v];{a_in}{','.join(achain)}[a]"
         cmd += ["-filter_complex", filt, "-map", "[v]", "-map", "[a]"]
-        cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2"]
+        cmd += [
+            "-c:a",
+            "aac",
+            "-b:a",
+            profile.audio_bitrate,
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+        ]
         cmd += ["-disposition:a", "default"]
     else:
         cmd += ["-filter:v", ",".join(vchain), "-map", "0:v:0", "-an"]
 
-    cmd += [
-        "-c:v",
-        "libx264",
-        "-preset",
-        "slow",
-        "-crf",
-        "20",
-        "-pix_fmt",
-        "yuv420p",
-        "-map_metadata",
-        "-1",
-        "-map_chapters",
-        "-1",
-        "-movflags",
-        "+faststart",
-        "-t",
-        f"{out_dur:.6f}",
-        "-f",
-        "mp4",
-        str(out),
-    ]
+    cmd += _encode_tail(out, out_dur, profile=profile)
     meta = {
         "crop": {"x": crop.x, "y": crop.y, "w": crop.w, "h": crop.h},
         "dest": {"width": dw, "height": dh, "aspect": aspect},
@@ -318,6 +315,7 @@ def build_cmd(
         "audio_offset": a_start if (use_replacement or use_source_audio) else None,
         "video_start": v_place,
         "audio_start": a_place,
+        "profile": profile.name,
     }
     return cmd, meta
 
@@ -429,14 +427,16 @@ def _lookup_transition_at(
     }
 
 
-def _encode_tail(out: Path, out_dur: float) -> list[str]:
+def _encode_tail(
+    out: Path, out_dur: float, *, profile: EncodeProfile = FINAL_PROFILE
+) -> list[str]:
     return [
         "-c:v",
         "libx264",
         "-preset",
-        "slow",
+        profile.preset,
         "-crf",
-        "20",
+        str(int(profile.crf)),
         "-pix_fmt",
         "yuv420p",
         "-map_metadata",
@@ -607,7 +607,9 @@ def _build_cmd_many(
     use_source_audio: bool,
     crossfade_s: float = 0.0,
     media: list[MediaItem] | None = None,
+    profile: EncodeProfile = FINAL_PROFILE,
 ) -> tuple[list[str], dict[str, Any]]:
+    profile = profile or FINAL_PROFILE
     media = list(media or [])
     if not any(m.kind == "video" for m in media):
         media = [MediaItem(id="m1", path=video, kind="video")] + media
@@ -883,11 +885,20 @@ def _build_cmd_many(
     cmd += ["-filter_complex", ";".join(filters)]
     if have_audio:
         cmd += ["-map", "[v]", "-map", "[a]"]
-        cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2"]
+        cmd += [
+            "-c:a",
+            "aac",
+            "-b:a",
+            profile.audio_bitrate,
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+        ]
         cmd += ["-disposition:a", "default"]
     else:
         cmd += ["-map", "[v]", "-an"]
-    cmd += _encode_tail(out, out_dur)
+    cmd += _encode_tail(out, out_dur, profile=profile)
     effective = [row for row in v_applied if row.get("applied")]
     meta = {
         "crop": {"x": crop.x, "y": crop.y, "w": crop.w, "h": crop.h},
@@ -907,6 +918,7 @@ def _build_cmd_many(
             default=max(0.0, float(crossfade_s or 0.0)),
         ),
         "transitions": v_applied,
+        "profile": profile.name,
     }
     return cmd, meta
 
@@ -932,6 +944,10 @@ def _parse_progress_line(line: str) -> tuple[float | None, bool]:
     return None, False
 
 
+class ExportCancelled(ExportError):
+    """Raised when ``cancel_event`` is set during ``run_export``."""
+
+
 def run_export(
     video: Path,
     out: Path,
@@ -953,7 +969,9 @@ def run_export(
     media: list[MediaItem] | None = None,
     use_video_soundtrack: bool = True,
     crossfade_s: float = 0.0,
+    profile: EncodeProfile = FINAL_PROFILE,
     progress: ProgressCb | None = None,
+    cancel_event: threading.Event | None = None,
     timeout: float = 1800.0,
 ) -> dict[str, Any]:
     video = Path(video).expanduser().resolve()
@@ -989,6 +1007,7 @@ def run_export(
         use_video_soundtrack=use_video_soundtrack,
         crossfade_s=crossfade_s,
         src=src,
+        profile=profile or FINAL_PROFILE,
     )
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp.unlink(missing_ok=True)
@@ -1012,20 +1031,29 @@ def run_export(
     t = threading.Thread(target=_read_err, daemon=True)
     t.start()
     dest_dur = float(meta["duration"])
+    cancelled = False
     try:
         assert proc.stdout is not None
         for line in proc.stdout:
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                proc.kill()
+                break
             now, ended = _parse_progress_line(line)
             if now is not None and dest_dur > 0 and progress:
                 progress(min(1.0, now / dest_dur), "encoding")
             if ended:
                 break
-        proc.wait(timeout=timeout)
+        if not cancelled:
+            proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
         tmp.unlink(missing_ok=True)
         raise ExportError(f"ffmpeg timed out after {timeout:.0f}s") from None
     t.join(timeout=5)
+    if cancelled or (cancel_event is not None and cancel_event.is_set()):
+        tmp.unlink(missing_ok=True)
+        raise ExportCancelled("preview render cancelled")
     stderr = err_box[0] if err_box else ""
     if proc.returncode != 0 or not tmp.is_file() or tmp.stat().st_size == 0:
         tmp.unlink(missing_ok=True)
