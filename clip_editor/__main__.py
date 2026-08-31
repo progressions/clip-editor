@@ -49,7 +49,7 @@ def _add_export_args(p: argparse.ArgumentParser) -> None:
         "--crossfade",
         type=float,
         default=0.0,
-        help="cross-fade seconds between adjacent clips (default off)",
+        help="legacy: stamp dissolve of this many seconds onto every clip",
     )
     p.add_argument(
         "--video-start",
@@ -283,15 +283,45 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
                     out_s=0.8,
                     transform_x=40.0,
                     scale=0.9,
+                    transition="dissolve",
+                    transition_s=0.25,
                 ),
                 ClipInst(start=0.0, in_s=0.8, out_s=1.6),
             ],
-            crossfade_s=0.25,
         )
         g3 = result3["gate"]
         assert g3["gate_ok"], g3
         assert 1.25 <= float(g3["duration"]) <= 1.45, g3
         assert abs(float(result3["meta"]["crossfade_s"]) - 0.25) < 1e-9
+        transitions = result3["meta"].get("transitions") or []
+        assert transitions and transitions[0].get("type") == "dissolve"
+        assert abs(float(transitions[0]["duration"]) - 0.25) < 1e-9
+
+        out3b = td_p / "out_white_flash.mp4"
+        result3b = run_export(
+            video,
+            out3b,
+            audio=None,
+            aspect="9:16",
+            in_s=0.0,
+            out_s=2.0,
+            video_clips=[
+                ClipInst(
+                    start=0.0,
+                    in_s=0.0,
+                    out_s=0.8,
+                    transition="white_flash",
+                    transition_s=0.25,
+                ),
+                ClipInst(start=0.8, in_s=0.0, out_s=0.8),
+                ClipInst(start=1.6, in_s=0.0, out_s=0.4),
+            ],
+        )
+        g3b = result3b["gate"]
+        assert g3b["gate_ok"], g3b
+        tmeta = result3b["meta"].get("transitions") or []
+        assert tmeta and tmeta[0].get("type") == "white_flash"
+
 
         out4 = td_p / "out_transform.mp4"
         result4 = run_export(
