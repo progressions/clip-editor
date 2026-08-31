@@ -12,7 +12,15 @@ from typing import Any, Callable
 from clip_editor.aspects import cover_crop, dest_size
 from clip_editor.eagle import inbox_dir
 from clip_editor.probe import ProbeError, gate_h264, probe, which_ffmpeg
-from clip_editor.project import ClipInst, MediaItem
+from clip_editor.project import (
+    TRANSITION_DISSOLVE,
+    TRANSITION_NONE,
+    TRANSITION_WHITE_FLASH,
+    ClipInst,
+    MediaItem,
+    apply_legacy_crossfade,
+    normalize_transition,
+)
 
 ProgressCb = Callable[[float, str], None]
 
@@ -35,12 +43,13 @@ def _dur_for(c: ClipInst, src_dur: float | dict[str, float]) -> float:
 
 def _flatten_clips(
     clips: list[ClipInst], src_dur: float | dict[str, float]
-) -> list[tuple[float, float, float, float, str, float, float, float]]:
-    """Return timeline/source bounds, media id, x/y translation, and scale.
+) -> list[tuple]:
+    """Return timeline/source bounds, media id, transform, and outgoing transition.
 
+    Row: ``(t0, t1, sinn, sout, mid, tx, ty, scale, transition, transition_s)``.
     Later clips overwrite earlier ones on overlap, matching playback.
     """
-    segs: list[tuple[float, float, float, float, str, float, float, float]] = []
+    segs: list[tuple] = []
     for c in clips:
         dur = _dur_for(c, src_dur)
         inn = max(0.0, float(c.in_s))
@@ -59,17 +68,26 @@ def _flatten_clips(
         if out <= inn + 0.04:
             continue
         mid = c.media_id or ""
-        nxt: list[tuple[float, float, float, float, str, float, float, float]] = []
-        for st0, st1, sinn, sout, smid, sx, sy, scale in segs:
+        ttype, tdur = normalize_transition(c.transition, c.transition_s)
+        nxt: list[tuple] = []
+        for row in segs:
+            st0, st1, sinn, sout, smid, sx, sy, scale = row[:8]
+            st_type = row[8] if len(row) > 8 else TRANSITION_NONE
+            st_dur = row[9] if len(row) > 9 else 0.0
             if st1 <= t0 + 0.001 or st0 >= t1 - 0.001:
-                nxt.append((st0, st1, sinn, sout, smid, sx, sy, scale))
+                nxt.append((st0, st1, sinn, sout, smid, sx, sy, scale, st_type, st_dur))
                 continue
             if st0 < t0 - 0.001:
                 keep = t0 - st0
-                nxt.append((st0, t0, sinn, sinn + keep, smid, sx, sy, scale))
+                # Remnant keeps its outgoing transition into the overlapping clip.
+                nxt.append(
+                    (st0, t0, sinn, sinn + keep, smid, sx, sy, scale, st_type, st_dur)
+                )
             if st1 > t1 + 0.001:
                 skip = t1 - st0
-                nxt.append((t1, st1, sinn + skip, sout, smid, sx, sy, scale))
+                nxt.append(
+                    (t1, st1, sinn + skip, sout, smid, sx, sy, scale, st_type, st_dur)
+                )
         nxt.append(
             (
                 t0,
@@ -80,6 +98,8 @@ def _flatten_clips(
                 float(c.transform_x),
                 float(c.transform_y),
                 max(0.05, float(c.scale)),
+                ttype,
+                tdur,
             )
         )
         segs = nxt
@@ -311,13 +331,102 @@ def _timeline_parts(flat: list[tuple], out_dur: float) -> list[tuple]:
         if t0 > t + 0.02:
             parts.append(("gap", t0 - t))
         transform = tuple(row[5:8]) if len(row) >= 8 else (0.0, 0.0, 1.0)
-        parts.append(("seg", sinn, t1 - t0, mid, *transform))
+        ttype = row[8] if len(row) > 8 else TRANSITION_NONE
+        tdur = float(row[9]) if len(row) > 9 else 0.0
+        parts.append(("seg", sinn, t1 - t0, mid, *transform, ttype, tdur))
         t = t1
     if out_dur > t + 0.02:
         parts.append(("gap", out_dur - t))
     if not parts:
         parts.append(("gap", max(out_dur, 0.05)))
     return parts
+
+
+def _xfade_name(transition: str) -> str | None:
+    if transition == TRANSITION_DISSOLVE:
+        return "fade"
+    if transition == TRANSITION_WHITE_FLASH:
+        return "fadewhite"
+    return None
+
+
+def _clamp_transition_duration(
+    requested: float, prev_dur: float, next_dur: float
+) -> float:
+    return min(
+        max(0.0, float(requested or 0.0)),
+        max(0.0, float(prev_dur) - 0.05),
+        max(0.0, float(next_dur) - 0.05),
+    )
+
+
+def _part_outgoing(part: tuple) -> tuple[str, float]:
+    if part[0] != "seg":
+        return TRANSITION_NONE, 0.0
+    if len(part) >= 9:
+        return normalize_transition(part[7], part[8])
+    return TRANSITION_NONE, 0.0
+
+
+def _join_transitions_for_parts(parts: list[tuple]) -> list[dict[str, Any]]:
+    """Effective transition from parts[i] into parts[i+1] (gaps force hard cuts)."""
+    out: list[dict[str, Any]] = []
+    for i in range(len(parts) - 1):
+        prev, nxt = parts[i], parts[i + 1]
+        if prev[0] != "seg" or nxt[0] != "seg":
+            out.append(
+                {
+                    "type": TRANSITION_NONE,
+                    "requested_s": 0.0,
+                    "duration": 0.0,
+                    "applied": False,
+                }
+            )
+            continue
+        ttype, requested = _part_outgoing(prev)
+        effective = _clamp_transition_duration(
+            requested if ttype != TRANSITION_NONE else 0.0,
+            _part_duration(prev),
+            _part_duration(nxt),
+        )
+        applied = ttype != TRANSITION_NONE and effective > 0.001
+        out.append(
+            {
+                "type": ttype if applied else TRANSITION_NONE,
+                "requested_s": requested if ttype != TRANSITION_NONE else 0.0,
+                "duration": effective if applied else 0.0,
+                "applied": applied,
+            }
+        )
+    return out
+
+
+def _transitions_by_boundary_time(
+    parts: list[tuple], joins: list[dict[str, Any]]
+) -> dict[float, dict[str, Any]]:
+    by_t: dict[float, dict[str, Any]] = {}
+    t = 0.0
+    for i, part in enumerate(parts[:-1]):
+        t += _part_duration(part)
+        by_t[round(t, 3)] = joins[i]
+    return by_t
+
+
+def _lookup_transition_at(
+    by_t: dict[float, dict[str, Any]], boundary: float
+) -> dict[str, Any]:
+    key = round(boundary, 3)
+    if key in by_t:
+        return by_t[key]
+    for k, val in by_t.items():
+        if abs(k - boundary) <= 0.02:
+            return val
+    return {
+        "type": TRANSITION_NONE,
+        "requested_s": 0.0,
+        "duration": 0.0,
+        "applied": False,
+    }
 
 
 def _encode_tail(out: Path, out_dur: float) -> list[str]:
@@ -356,28 +465,74 @@ def _join_parts(
     labels: list[str],
     *,
     kind: str,
-    crossfade_s: float,
-) -> tuple[str, float]:
-    """Join prepared timeline parts, dissolving only touching media segments."""
+    crossfade_s: float = 0.0,
+    join_transitions: list[dict[str, Any]] | None = None,
+) -> tuple[str, float, list[dict[str, Any]]]:
+    """Join prepared timeline parts with optional per-cut transitions.
+
+    ``join_transitions[i]`` describes the cut from ``parts[i]`` into
+    ``parts[i + 1]``. Gaps force hard cuts. When omitted, a legacy
+    ``crossfade_s`` applies dissolve to every touching media pair.
+    """
     if not labels:
         raise ExportError(f"no {kind} parts to join")
     if len(labels) == 1:
-        return labels[0], _part_duration(parts[0])
+        return labels[0], _part_duration(parts[0]), []
+
+    if join_transitions is None:
+        legacy = max(0.0, float(crossfade_s or 0.0))
+        join_transitions = []
+        for i in range(len(parts) - 1):
+            prev, nxt = parts[i], parts[i + 1]
+            if legacy > 0.001 and prev[0] == "seg" and nxt[0] == "seg":
+                dur = _clamp_transition_duration(
+                    legacy, _part_duration(prev), _part_duration(nxt)
+                )
+                join_transitions.append(
+                    {
+                        "type": TRANSITION_DISSOLVE if dur > 0.001 else TRANSITION_NONE,
+                        "requested_s": legacy,
+                        "duration": dur if dur > 0.001 else 0.0,
+                        "applied": dur > 0.001,
+                    }
+                )
+            else:
+                join_transitions.append(
+                    {
+                        "type": TRANSITION_NONE,
+                        "requested_s": 0.0,
+                        "duration": 0.0,
+                        "applied": False,
+                    }
+                )
+    elif len(join_transitions) != len(parts) - 1:
+        raise ExportError(
+            f"{kind} join_transitions length {len(join_transitions)} "
+            f"!= {len(parts) - 1}"
+        )
 
     current = labels[0]
     duration = _part_duration(parts[0])
     previous = parts[0]
-    requested = max(0.0, float(crossfade_s or 0.0))
+    applied: list[dict[str, Any]] = []
 
     for i, (part, label) in enumerate(zip(parts[1:], labels[1:]), start=1):
         part_dur = _part_duration(part)
-        transition = 0.0
-        if requested > 0 and previous[0] == "seg" and part[0] == "seg":
-            transition = min(
-                requested,
-                max(0.0, _part_duration(previous) - 0.05),
-                max(0.0, part_dur - 0.05),
+        info = join_transitions[i - 1]
+        ttype = str(info.get("type") or TRANSITION_NONE)
+        transition = float(info.get("duration") or 0.0)
+        if previous[0] != "seg" or part[0] != "seg":
+            ttype = TRANSITION_NONE
+            transition = 0.0
+        else:
+            transition = _clamp_transition_duration(
+                transition if ttype != TRANSITION_NONE else 0.0,
+                _part_duration(previous),
+                part_dur,
             )
+            if transition <= 0.001:
+                ttype = TRANSITION_NONE
+                transition = 0.0
 
         # Full `kind`, not kind[0]: the audio callers pass "audio1"/"audio2", so
         # every track emitted the same [ajoinN] names. ffmpeg accepts that only
@@ -385,29 +540,48 @@ def _join_parts(
         # emission-order dependency nothing enforces. Distinct names per track
         # remove it.
         out_label = f"{kind}join{i}"
-        if transition > 0.001:
+        xfade = _xfade_name(ttype) if transition > 0.001 else None
+        if xfade is not None:
             if kind == "video":
                 offset = max(0.0, duration - transition)
                 filters.append(
-                    f"{current}{label}xfade=transition=fade:"
+                    f"{current}{label}xfade=transition={xfade}:"
                     f"duration={transition:.6f}:offset={offset:.6f}[{out_label}]"
                 )
             else:
+                # Visual dissolve / white flash both use an audio acrossfade when
+                # audio is continuous across the same cut.
                 filters.append(
                     f"{current}{label}acrossfade=d={transition:.6f}:c1=tri:c2=tri"
                     f"[{out_label}]"
                 )
             duration += part_dur - transition
+            applied.append(
+                {
+                    "type": ttype,
+                    "requested_s": float(info.get("requested_s") or transition),
+                    "duration": transition,
+                    "applied": True,
+                }
+            )
         else:
             if kind == "video":
                 filters.append(f"{current}{label}concat=n=2:v=1:a=0[{out_label}]")
             else:
                 filters.append(f"{current}{label}concat=n=2:v=0:a=1[{out_label}]")
             duration += part_dur
+            applied.append(
+                {
+                    "type": TRANSITION_NONE,
+                    "requested_s": float(info.get("requested_s") or 0.0),
+                    "duration": 0.0,
+                    "applied": False,
+                }
+            )
         current = f"[{out_label}]"
         previous = part
 
-    return current, duration
+    return current, duration, applied
 
 
 def _build_cmd_many(
@@ -458,6 +632,8 @@ def _build_cmd_many(
         if not cc.media_id:
             cc.media_id = prim_v
         vwork.append(cc)
+    if crossfade_s and float(crossfade_s) > 0.001:
+        apply_legacy_crossfade(vwork, float(crossfade_s))
     vflat = _flatten_clips(vwork, durs if durs else src_dur)
     if not vflat:
         raise ExportError("no video on the timeline")
@@ -597,12 +773,19 @@ def _build_cmd_many(
                 filters.append(f"{pad}{','.join(chain)}[{lab}]")
         v_labs.append(f"[{lab}]")
     video_duration = out_dur
+    v_joins = _join_transitions_for_parts(v_parts)
+    v_applied: list[dict[str, Any]] = []
     if len(v_labs) > 1:
-        v_label, video_duration = _join_parts(
-            filters, v_parts, v_labs, kind="video", crossfade_s=crossfade_s
+        v_label, video_duration, v_applied = _join_parts(
+            filters,
+            v_parts,
+            v_labs,
+            kind="video",
+            join_transitions=v_joins,
         )
         if v_label != "[v]":
             filters.append(f"{v_label}null[v]")
+    v_cut_by_t = _transitions_by_boundary_time(v_parts, v_joins)
 
     have_audio = bool(a_parts_by_track) and (use_replacement or use_source_audio)
     if have_audio:
@@ -643,8 +826,30 @@ def _build_cmd_many(
                     )
                 a_labs.append(f"[{lab}]")
             if len(a_labs) > 1:
-                a_label, _ = _join_parts(
-                    filters, a_parts, a_labs, kind=f"audio{track}", crossfade_s=crossfade_s
+                a_joins: list[dict[str, Any]] = []
+                t_cursor = 0.0
+                for i in range(len(a_parts) - 1):
+                    t_cursor += _part_duration(a_parts[i])
+                    prev, nxt = a_parts[i], a_parts[i + 1]
+                    if prev[0] == "seg" and nxt[0] == "seg":
+                        # Match the video cut at this timeline boundary when audio
+                        # is continuous across the same cut.
+                        a_joins.append(_lookup_transition_at(v_cut_by_t, t_cursor))
+                    else:
+                        a_joins.append(
+                            {
+                                "type": TRANSITION_NONE,
+                                "requested_s": 0.0,
+                                "duration": 0.0,
+                                "applied": False,
+                            }
+                        )
+                a_label, _, _ = _join_parts(
+                    filters,
+                    a_parts,
+                    a_labs,
+                    kind=f"audio{track}",
+                    join_transitions=a_joins,
                 )
             else:
                 a_label = a_labs[0]
@@ -683,6 +888,7 @@ def _build_cmd_many(
     else:
         cmd += ["-map", "[v]", "-an"]
     cmd += _encode_tail(out, out_dur)
+    effective = [row for row in v_applied if row.get("applied")]
     meta = {
         "crop": {"x": crop.x, "y": crop.y, "w": crop.w, "h": crop.h},
         "dest": {"width": dw, "height": dh, "aspect": aspect},
@@ -696,7 +902,11 @@ def _build_cmd_many(
         "audio_start": float(audio_clips[0].start) if audio_clips else 0.0,
         "clips": len(vflat),
         "inputs": len(inputs),
-        "crossfade_s": max(0.0, float(crossfade_s or 0.0)),
+        "crossfade_s": max(
+            (float(row["duration"]) for row in effective),
+            default=max(0.0, float(crossfade_s or 0.0)),
+        ),
+        "transitions": v_applied,
     }
     return cmd, meta
 

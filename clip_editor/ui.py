@@ -24,12 +24,17 @@ from clip_editor.eagle import apply_omarchy_theme, theme_rgb
 from clip_editor.export import ExportError, default_out_path, run_export
 from clip_editor.probe import ProbeError, probe, which_ffmpeg
 from clip_editor.project import (
+    DEFAULT_TRANSITION_S,
+    TRANSITION_DISSOLVE,
+    TRANSITION_NONE,
+    TRANSITION_WHITE_FLASH,
     ClipInst,
     MediaItem,
     Project,
     ProjectError,
     clear_autosave,
     next_media_id,
+    normalize_transition,
     read_autosave,
     read_project,
     write_autosave,
@@ -1122,6 +1127,16 @@ class Timeline(Gtk.DrawingArea):
                 cr.set_line_width(1)
                 cr.rectangle(x0, clip_lane_y + clip_y, max(3.0, x1 - x0), clip_h)
                 cr.stroke()
+            if getattr(c, "transition", TRANSITION_NONE) not in ("", TRANSITION_NONE):
+                # Compact marker at the outgoing cut of a configured transition.
+                mx = x1
+                mid_y = clip_lane_y + clip_y + clip_h / 2.0
+                cr.set_source_rgb(*fg)
+                cr.move_to(mx - 4, mid_y - 5)
+                cr.line_to(mx + 2, mid_y)
+                cr.line_to(mx - 4, mid_y + 5)
+                cr.close_path()
+                cr.fill()
 
         color = green if self.audio_kind != "source" else muted
         for i, c in enumerate(self.aclips):
@@ -1377,7 +1392,6 @@ class EditorWindow(Adw.ApplicationWindow):
         self.aspect = "9:16"
         self.audio_fit = False
         self.use_video_soundtrack = True
-        self.crossfade_s = 0.0
         self.video_start = 0.0
         self.audio_start = 0.0
         self.audio_in = 0.0
@@ -1494,19 +1508,27 @@ class EditorWindow(Adw.ApplicationWindow):
         row.append(b)
         right.append(row)
 
-        right.append(self._section("Transition"))
-        transition = Gtk.Box(spacing=8)
-        transition.append(Gtk.Label(label="Cross-fade"))
-        self.crossfade_spin = Gtk.SpinButton.new_with_range(0.0, 3.0, 0.1)
-        self.crossfade_spin.set_digits(1)
-        self.crossfade_spin.set_value(0.0)
-        self.crossfade_spin.set_tooltip_text(
-            "Dissolve between adjacent touching clips; 0 disables it"
+        right.append(self._section("Transition after this clip"))
+        self.transition_type = Gtk.DropDown.new_from_strings(
+            ["None", "Dissolve", "White flash"]
         )
-        self.crossfade_spin.connect("value-changed", self._on_crossfade_changed)
-        transition.append(self.crossfade_spin)
-        transition.append(Gtk.Label(label="seconds"))
-        right.append(transition)
+        self.transition_type.set_tooltip_text(
+            "Applies into the next touching video segment; gaps stay hard cuts"
+        )
+        self.transition_type.connect("notify::selected", self._on_transition_changed)
+        right.append(self.transition_type)
+        transition_dur = Gtk.Box(spacing=8)
+        transition_dur.append(Gtk.Label(label="Duration"))
+        self.transition_spin = Gtk.SpinButton.new_with_range(0.1, 3.0, 0.05)
+        self.transition_spin.set_digits(2)
+        self.transition_spin.set_value(0.5)
+        self.transition_spin.set_tooltip_text("0.1–3.0 seconds")
+        self.transition_spin.connect("value-changed", self._on_transition_changed)
+        transition_dur.append(self.transition_spin)
+        transition_dur.append(Gtk.Label(label="seconds"))
+        right.append(transition_dur)
+        self.transition_hint = self._wrapping_label("")
+        right.append(self.transition_hint)
         self.video_label = self._wrapping_label("none")
         right.append(self.video_label)
 
@@ -1726,6 +1748,8 @@ class EditorWindow(Adw.ApplicationWindow):
                     round(c.transform_y, 3),
                     round(c.scale, 4),
                     int(c.track),
+                    c.transition,
+                    round(float(c.transition_s), 3),
                 )
                 for c in p.video_clips
             ),
@@ -1740,7 +1764,6 @@ class EditorWindow(Adw.ApplicationWindow):
             bool(p.audio_follows_in),
             bool(p.audio_fit),
             bool(p.use_video_soundtrack),
-            round(float(p.crossfade_s), 3),
             str(p.path) if p.path else "",
         )
 
@@ -1846,7 +1869,7 @@ class EditorWindow(Adw.ApplicationWindow):
             audio_follows_in=self.follow_in.get_active(),
             audio_fit=self.audio_fit,
             use_video_soundtrack=self.use_video_soundtrack,
-            crossfade_s=self.crossfade_s,
+            crossfade_s=0.0,
             path=self.project_path,
         )
 
@@ -1967,8 +1990,6 @@ class EditorWindow(Adw.ApplicationWindow):
             self.follow_in.set_active(proj.audio_follows_in)
             self.audio_fit = proj.audio_fit
             self.use_video_soundtrack = proj.use_video_soundtrack
-            self.crossfade_s = max(0.0, float(proj.crossfade_s or 0.0))
-            self.crossfade_spin.set_value(self.crossfade_s)
             self.video_start = float(proj.video_start or 0.0)
             self.audio_start = float(proj.audio_start or 0.0)
             self.audio_in = max(0.0, float(proj.audio_in or 0.0))
@@ -2072,8 +2093,6 @@ class EditorWindow(Adw.ApplicationWindow):
         self.out_spin.set_value(0)
         self.follow_in.set_active(False)
         self.use_video_soundtrack = True
-        self.crossfade_s = 0.0
-        self.crossfade_spin.set_value(0.0)
         self.video_start = 0.0
         self.audio_start = 0.0
         self.audio_in = 0.0
@@ -2090,6 +2109,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.timeline.set_range(0.0, 0.0)
         self.timeline.set_duration(0.0)
         self.preview.set_blank(False)
+        self._sync_transition_controls()
         self._refresh_media()
 
     def _on_new_project(self, *_args: object) -> None:
@@ -2482,6 +2502,7 @@ class EditorWindow(Adw.ApplicationWindow):
             self.timeline.set_range(c.in_s, c.out_s)
         self.btn_export.set_sensitive(bool(self.video_clips) and not self.exporting)
         self._sync_transform_controls()
+        self._sync_transition_controls()
         self._refresh_media()
 
     def _refresh_media(self) -> None:
@@ -2556,11 +2577,128 @@ class EditorWindow(Adw.ApplicationWindow):
         self._schedule_autosave()
         self._schedule_checkpoint()
 
-    def _on_crossfade_changed(self, *_args: object) -> None:
-        self.crossfade_s = max(0.0, float(self.crossfade_spin.get_value()))
-        if not self._loading:
-            self._schedule_autosave()
-            self._schedule_checkpoint()
+    def _clip_used_end(self, clip: ClipInst, *, kind: str = "video") -> float:
+        if kind == "video":
+            fallback = float((self.video_info or {}).get("duration") or 0)
+        else:
+            fallback = float((self.audio_info or {}).get("duration") or 0)
+        dur = self._media_dur(clip.media_id) or fallback
+        inn = max(0.0, float(clip.in_s))
+        out = float(clip.out_s) if clip.out_s > inn else (dur if dur > inn else inn)
+        if dur > 0:
+            out = min(out, dur)
+        return float(clip.start) + out
+
+    def _clip_used_start(self, clip: ClipInst, *, kind: str = "video") -> float:
+        if kind == "video":
+            fallback = float((self.video_info or {}).get("duration") or 0)
+        else:
+            fallback = float((self.audio_info or {}).get("duration") or 0)
+        dur = self._media_dur(clip.media_id) or fallback
+        inn = max(0.0, float(clip.in_s))
+        out = float(clip.out_s) if clip.out_s > inn else (dur if dur > inn else inn)
+        if dur > 0:
+            out = min(out, dur)
+        if out <= inn:
+            return float(clip.start)
+        return float(clip.start) + inn
+
+    def _has_touching_video_follower(self, index: int) -> bool:
+        if not 0 <= index < len(self.video_clips):
+            return False
+        end = self._clip_used_end(self.video_clips[index])
+        for j, other in enumerate(self.video_clips):
+            if j == index:
+                continue
+            if abs(self._clip_used_start(other) - end) <= JOIN_EPS:
+                return True
+        return False
+
+    def _transition_type_index(self, transition: str) -> int:
+        mapping = {
+            TRANSITION_NONE: 0,
+            TRANSITION_DISSOLVE: 1,
+            TRANSITION_WHITE_FLASH: 2,
+        }
+        return mapping.get(transition, 0)
+
+    def _transition_from_index(self, index: int) -> str:
+        return (
+            TRANSITION_NONE,
+            TRANSITION_DISSOLVE,
+            TRANSITION_WHITE_FLASH,
+        )[max(0, min(2, int(index)))]
+
+    def _sync_transition_controls(self) -> None:
+        clip = self._selected_video_clip()
+        has_follower = (
+            self.sel_kind == "video"
+            and 0 <= self.sel_v < len(self.video_clips)
+            and self._has_touching_video_follower(self.sel_v)
+        )
+        enabled = clip is not None and has_follower and not self.exporting
+        was_loading = self._loading
+        self._loading = True
+        try:
+            if clip is None:
+                self.transition_type.set_selected(0)
+                self.transition_spin.set_value(0.5)
+            else:
+                ttype, tdur = normalize_transition(clip.transition, clip.transition_s)
+                self.transition_type.set_selected(self._transition_type_index(ttype))
+                if ttype == TRANSITION_NONE:
+                    self.transition_spin.set_value(
+                        DEFAULT_TRANSITION_S.get(TRANSITION_DISSOLVE, 0.5)
+                    )
+                else:
+                    self.transition_spin.set_value(tdur)
+            self.transition_type.set_sensitive(enabled)
+            self.transition_spin.set_sensitive(
+                enabled and self.transition_type.get_selected() > 0
+            )
+            if clip is None:
+                self.transition_hint.set_text("Select a video clip")
+            elif not has_follower:
+                self.transition_hint.set_text(
+                    "No touching video segment follows this clip"
+                )
+            else:
+                self.transition_hint.set_text("")
+        finally:
+            self._loading = was_loading
+
+    def _on_transition_changed(self, *_args: object) -> None:
+        if self._loading:
+            return
+        clip = self._selected_video_clip()
+        if clip is None:
+            return
+        if not self._has_touching_video_follower(self.sel_v):
+            self._sync_transition_controls()
+            return
+        ttype = self._transition_from_index(self.transition_type.get_selected())
+        if ttype == TRANSITION_NONE:
+            clip.transition = TRANSITION_NONE
+            clip.transition_s = 0.0
+        else:
+            raw_dur = float(self.transition_spin.get_value())
+            if raw_dur <= 0.0:
+                raw_dur = DEFAULT_TRANSITION_S.get(ttype, 0.5)
+                was_loading = self._loading
+                self._loading = True
+                try:
+                    self.transition_spin.set_value(raw_dur)
+                finally:
+                    self._loading = was_loading
+            ttype, tdur = normalize_transition(ttype, raw_dur)
+            clip.transition = ttype
+            clip.transition_s = tdur
+        self.transition_spin.set_sensitive(
+            not self.exporting and self.transition_type.get_selected() > 0
+        )
+        self._sync_timeline_clips()
+        self._schedule_autosave()
+        self._schedule_checkpoint()
 
     def _pick(self, kind: str) -> None:
         dialog = Gtk.FileDialog(title="Open video" if kind == "video" else "Open audio")
@@ -3626,7 +3764,6 @@ class EditorWindow(Adw.ApplicationWindow):
         out_s = self.out_spin.get_value()
         follows = self.follow_in.get_active()
         use_soundtrack = self.use_video_soundtrack
-        crossfade_s = self.crossfade_s
         v_start = self.video_start
         a_start = self.audio_start
         a_in = self.audio_in
@@ -3664,7 +3801,6 @@ class EditorWindow(Adw.ApplicationWindow):
                     audio_clips=a_clips or None,
                     media=media or None,
                     use_video_soundtrack=use_soundtrack,
-                    crossfade_s=crossfade_s,
                     progress=progress,
                 )
                 GLib.idle_add(self._export_done, result, None)

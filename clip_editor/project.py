@@ -14,10 +14,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 FORMAT = "clip-editor-project"
-VERSION = 5
+VERSION = 6
 SUFFIX = ".clip.json"
 STATE_DIR = Path.home() / ".local" / "state" / "clip-editor"
 AUTOSAVE_PATH = STATE_DIR / "autosave.clip.json"
+
+TRANSITION_NONE = "none"
+TRANSITION_DISSOLVE = "dissolve"
+TRANSITION_WHITE_FLASH = "white_flash"
+TRANSITION_TYPES = (TRANSITION_NONE, TRANSITION_DISSOLVE, TRANSITION_WHITE_FLASH)
+DEFAULT_TRANSITION_S = {
+    TRANSITION_DISSOLVE: 0.5,
+    TRANSITION_WHITE_FLASH: 0.25,
+}
 
 
 class ProjectError(RuntimeError):
@@ -44,6 +53,26 @@ def next_media_id(items: list[MediaItem]) -> str:
     return f"m{n}"
 
 
+def normalize_transition(type_s: object, duration_s: object = 0.0) -> tuple[str, float]:
+    """Return a valid ``(transition, transition_s)`` pair."""
+    raw = str(type_s or TRANSITION_NONE).strip().lower().replace("-", "_")
+    if raw in ("fade", "crossfade", "cross_fade"):
+        raw = TRANSITION_DISSOLVE
+    if raw in ("fadewhite", "whiteflash", "flash_white"):
+        raw = TRANSITION_WHITE_FLASH
+    if raw not in TRANSITION_TYPES:
+        raw = TRANSITION_NONE
+    try:
+        dur = float(duration_s or 0.0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    if raw == TRANSITION_NONE:
+        return TRANSITION_NONE, 0.0
+    if dur <= 0.0:
+        dur = DEFAULT_TRANSITION_S.get(raw, 0.5)
+    return raw, max(0.1, min(3.0, dur))
+
+
 @dataclass
 class ClipInst:
     """One instance of a bin item on the timeline."""
@@ -56,6 +85,9 @@ class ClipInst:
     transform_y: float = 0.0
     scale: float = 1.0
     track: int = 1
+    # Outgoing cut into the next touching flattened video segment.
+    transition: str = TRANSITION_NONE
+    transition_s: float = 0.0
 
     def used(self) -> tuple[float, float]:
         inn = max(0.0, float(self.in_s))
@@ -76,6 +108,8 @@ class ClipInst:
             transform_y=self.transform_y,
             scale=self.scale,
             track=self.track,
+            transition=self.transition,
+            transition_s=self.transition_s,
         )
 
     def split_at(
@@ -84,7 +118,8 @@ class ClipInst:
         """Trim this instance to the left of ``timeline_t``; return the right piece.
 
         Same source file, same ``start``. None if the playhead is not far
-        enough inside the used range.
+        enough inside the used range. The outgoing transition moves to the
+        right piece; the new internal cut is hard.
         """
         inn = max(0.0, float(self.in_s))
         out = float(self.out_s) if self.out_s > inn else inn
@@ -107,8 +142,12 @@ class ClipInst:
             transform_y=self.transform_y,
             scale=self.scale,
             track=self.track,
+            transition=self.transition,
+            transition_s=self.transition_s,
         )
         self.out_s = src_cut
+        self.transition = TRANSITION_NONE
+        self.transition_s = 0.0
         return right
 
 
@@ -124,6 +163,10 @@ def clip_to_dict(c: ClipInst) -> dict:
         d["scale"] = float(c.scale)
     if int(c.track) != 1:
         d["track"] = max(1, min(2, int(c.track)))
+    ttype, tdur = normalize_transition(c.transition, c.transition_s)
+    if ttype != TRANSITION_NONE:
+        d["transition"] = ttype
+        d["transition_s"] = tdur
     return d
 
 
@@ -141,6 +184,7 @@ def clip_from_dict(data: object) -> ClipInst | None:
     except (TypeError, ValueError):
         return None
     mid = str(data.get("media_id") or "")
+    ttype, tdur = normalize_transition(data.get("transition"), data.get("transition_s"))
     return ClipInst(
         start=start,
         in_s=inn,
@@ -150,7 +194,21 @@ def clip_from_dict(data: object) -> ClipInst | None:
         transform_y=transform_y,
         scale=scale,
         track=track,
+        transition=ttype,
+        transition_s=tdur,
     )
+
+
+def apply_legacy_crossfade(clips: list[ClipInst], crossfade_s: float) -> None:
+    """Stamp a project-wide crossfade onto every clip as an outgoing dissolve."""
+    requested = max(0.0, float(crossfade_s or 0.0))
+    if requested <= 0.001:
+        return
+    ttype, tdur = normalize_transition(TRANSITION_DISSOLVE, requested)
+    for c in clips:
+        if c.transition == TRANSITION_NONE:
+            c.transition = ttype
+            c.transition_s = tdur
 
 
 def _clips_from_data(
@@ -344,7 +402,8 @@ def to_dict(proj: Project) -> dict:
         "audio_follows_in": bool(proj.audio_follows_in),
         "audio_fit": bool(proj.audio_fit),
         "use_video_soundtrack": bool(proj.use_video_soundtrack),
-        "crossfade_s": max(0.0, float(proj.crossfade_s)),
+        # Deprecated project-wide crossfade; per-clip transition fields are source of truth.
+        "crossfade_s": 0.0,
         "media": media_rows,
         "video_clips": [clip_to_dict(c) for c in proj.video_clips],
         "audio_clips": [clip_to_dict(c) for c in proj.audio_clips],
@@ -415,7 +474,7 @@ def from_dict(data: dict, *, origin: Path | None = None) -> Project:
             if data.get("use_video_soundtrack") is None
             else bool(data.get("use_video_soundtrack"))
         ),
-        crossfade_s=max(0.0, float(data.get("crossfade_s") or 0.0)),
+        crossfade_s=0.0,
         media=media,
         video_clips=_clips_from_data(
             data,
@@ -449,6 +508,11 @@ def from_dict(data: dict, *, origin: Path | None = None) -> Project:
     )
     _bind_clip_media(proj.video_clips, media, "video")
     _bind_clip_media(proj.audio_clips, media, "audio")
+    legacy_xf = max(0.0, float(data.get("crossfade_s") or 0.0))
+    # Pre-v6 projects used one project-wide crossfade. Stamp dissolves onto clips
+    # when none already carry a transition field.
+    if version < 6 and legacy_xf > 0.001:
+        apply_legacy_crossfade(proj.video_clips, legacy_xf)
     return proj
 
 
