@@ -323,8 +323,7 @@ class ProjectLoadingTest(unittest.TestCase):
         with self.assertRaises(ProjectError):
             read_project(bad)
 
-    def test_open_failure_leaves_caller_state_untouched(self) -> None:
-        """Mimic UI fail-closed: validate before replacing session state."""
+    def test_strict_validation_reports_missing_media(self) -> None:
         good = self._rich_project()
         session = {
             "media": [m.copy() for m in good.media],
@@ -424,8 +423,9 @@ def on_activate(application):
         ),
     )
     win._load_project_file(missing)
-    result["failed_status"] = win.status.get_text()
-    result["unchanged_clips"] = [c.media_id for c in win.video_clips]
+    result["warning_status"] = win.status.get_text()
+    result["offline_clips"] = [c.media_id for c in win.video_clips]
+    result["offline_media"] = [(m.id, str(m.path)) for m in win.media]
     win._load_project_file(path)
     result.update({
         "status": win.status.get_text(),
@@ -438,6 +438,9 @@ def on_activate(application):
         "hist_len": len(win._history),
         "hist_i": win._hist_i,
         "undo_reaches_prior": win._hist_i > 0,
+        "unknown_id_falls_back": win._clip_item(
+            ClipInst(media_id="gone"), "video"
+        ) is not None,
     })
     application.quit()
 
@@ -457,8 +460,9 @@ print(json.dumps(result))
         lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("{")]
         self.assertTrue(lines, proc.stdout)
         result = json.loads(lines[-1])
-        self.assertIn("missing media", result["failed_status"])
-        self.assertEqual(result["unchanged_clips"], ["old"])
+        self.assertIn("Opened missing.clip.json with media warnings", result["warning_status"])
+        self.assertEqual(result["offline_clips"], ["m1"])
+        self.assertEqual(result["offline_media"][0][0], "m1")
         self.assertEqual(result["status"], "Opened ui.clip.json")
         self.assertEqual(result["n_media"], 3)
         self.assertEqual(result["n_vc"], 2)
@@ -469,6 +473,7 @@ print(json.dumps(result))
         self.assertEqual(result["hist_len"], 1)
         self.assertEqual(result["hist_i"], 0)
         self.assertFalse(result["undo_reaches_prior"])
+        self.assertFalse(result["unknown_id_falls_back"])
 
 
 if __name__ == "__main__":

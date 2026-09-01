@@ -534,7 +534,7 @@ def from_dict(data: dict, *, origin: Path | None = None) -> Project:
 
 
 def media_load_errors(proj: Project) -> list[str]:
-    """Return human-readable problems that should block opening ``proj``."""
+    """Return unresolved-media warnings for ``proj``."""
     errors: list[str] = []
     by_id = {m.id: m for m in proj.media}
     for m in proj.media:
@@ -547,8 +547,7 @@ def media_load_errors(proj: Project) -> list[str]:
         for i, c in enumerate(clips):
             mid = c.media_id
             if not mid:
-                if kind == "video" and any(m.kind == "video" for m in proj.media):
-                    errors.append(f"{label} clip {i + 1} has no media_id")
+                errors.append(f"{label} clip {i + 1} has no media_id")
                 continue
             item = by_id.get(mid)
             if item is None:
