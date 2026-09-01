@@ -18,7 +18,13 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from clip_editor import __version__
-from clip_editor.aspects import ASPECTS, cover_crop, dest_size
+from clip_editor.aspects import (
+    ASPECTS,
+    DEFAULT_RESOLUTION,
+    RESOLUTIONS,
+    cover_crop,
+    dest_size,
+)
 from clip_editor.export import ExportError, default_out_path, run_export
 from clip_editor.probe import ProbeError, probe, which_ffmpeg
 
@@ -143,6 +149,16 @@ def _project_payload() -> dict[str, Any]:
         "video_path": vpath,
         "audio_path": apath,
         "aspects": {k: {"width": w, "height": h} for k, (w, h) in ASPECTS.items()},
+        "resolutions": list(RESOLUTIONS),
+        "default_resolution": DEFAULT_RESOLUTION,
+        "aspect_sizes": {
+            k: {
+                res: {"width": rw, "height": rh}
+                for res in RESOLUTIONS
+                for rw, rh in [dest_size(k, res)]
+            }
+            for k in ASPECTS
+        },
         "suggested_out": suggested.get("9:16"),
         "suggested_names": suggested,
         "export": export,
@@ -210,6 +226,7 @@ def _start_export(body: dict[str, Any]) -> None:
         }
 
     aspect = str(body.get("aspect") or "9:16")
+    resolution = str(body.get("resolution") or DEFAULT_RESOLUTION)
     pan_x = float(body.get("pan_x", 0.5))
     pan_y = float(body.get("pan_y", 0.5))
     in_s = float(body.get("in_s") or 0.0)
@@ -232,6 +249,7 @@ def _start_export(body: dict[str, Any]) -> None:
                 out,
                 audio=audio,
                 aspect=aspect,
+                resolution=resolution,
                 pan_x=pan_x,
                 pan_y=pan_y,
                 in_s=in_s,
@@ -398,7 +416,8 @@ class Handler(BaseHTTPRequestHandler):
         if not info:
             raise ProbeError("open a video first")
         aspect = str(body.get("aspect") or "9:16")
-        dw, dh = dest_size(aspect)
+        resolution = str(body.get("resolution") or DEFAULT_RESOLUTION)
+        dw, dh = dest_size(aspect, resolution)
         crop = cover_crop(
             int(info["width"]),
             int(info["height"]),
@@ -409,7 +428,12 @@ class Handler(BaseHTTPRequestHandler):
         )
         return {
             "crop": {"x": crop.x, "y": crop.y, "w": crop.w, "h": crop.h},
-            "dest": {"width": dw, "height": dh, "aspect": aspect},
+            "dest": {
+                "width": dw,
+                "height": dh,
+                "aspect": aspect,
+                "resolution": resolution,
+            },
         }
 
     def _send_static(self, name: str) -> None:

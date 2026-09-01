@@ -4,12 +4,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Export pixel sizes. Always even (yuv420p).
+# Medium (default) export pixel sizes. Always even (yuv420p).
 ASPECTS: dict[str, tuple[int, int]] = {
     "9:16": (1080, 1920),
     "4:5": (1080, 1350),
     "1:1": (1080, 1080),
     "16:9": (1920, 1080),
+}
+
+# Short-edge targets for Low / Medium / High. Medium matches ASPECTS.
+RESOLUTIONS: tuple[str, ...] = ("low", "medium", "high")
+DEFAULT_RESOLUTION = "medium"
+RESOLUTION_SHORT_AXIS: dict[str, int] = {
+    "low": 720,
+    "medium": 1080,
+    "high": 1440,
 }
 
 
@@ -82,9 +91,33 @@ def cover_crop(
     return CropRect(x, y, crop_w, crop_h)
 
 
-def dest_size(aspect: str) -> tuple[int, int]:
+def normalize_resolution(resolution: str | None) -> str:
+    key = str(resolution or DEFAULT_RESOLUTION).strip().lower()
+    if key not in RESOLUTION_SHORT_AXIS:
+        known = ", ".join(RESOLUTIONS)
+        raise ValueError(f"unknown resolution {resolution!r}; use {known}")
+    return key
+
+
+def dest_size(aspect: str, resolution: str | None = None) -> tuple[int, int]:
+    """Return even WxH for ``aspect`` at ``resolution`` (low/medium/high).
+
+    Medium is the historical ASPECTS table (1080 short edge). Low/high scale
+    that table so the short edge is 720 / 1440.
+    """
     key = str(aspect).strip()
     if key not in ASPECTS:
         known = ", ".join(ASPECTS)
         raise ValueError(f"unknown aspect {aspect!r}; use {known}")
-    return ASPECTS[key]
+    fw, fh = ASPECTS[key]
+    res = normalize_resolution(resolution)
+    short = RESOLUTION_SHORT_AXIS[res]
+    base_short = min(fw, fh)
+    if base_short <= 0:
+        raise ValueError(f"bad aspect size {fw}x{fh}")
+    if short == base_short:
+        return fw, fh
+    scale = short / base_short
+    dw = even(int(round(fw * scale)))
+    dh = even(int(round(fh * scale)))
+    return max(2, dw), max(2, dh)

@@ -9,7 +9,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
-from clip_editor.aspects import cover_crop, dest_size
+from clip_editor.aspects import cover_crop, normalize_resolution
 from clip_editor.eagle import inbox_dir
 from clip_editor.preview import (
     FINAL_PROFILE,
@@ -142,6 +142,7 @@ def build_cmd(
     media: list[MediaItem] | None = None,
     use_video_soundtrack: bool = True,
     crossfade_s: float = 0.0,
+    resolution: str | None = None,
     src: dict[str, Any] | None = None,
     profile: EncodeProfile = FINAL_PROFILE,
 ) -> tuple[list[str], dict[str, Any]]:
@@ -149,6 +150,7 @@ def build_cmd(
     video = Path(video)
     out = Path(out)
     profile = profile or FINAL_PROFILE
+    resolution = normalize_resolution(resolution)
     src = src or probe(video)
     if not src.get("has_video"):
         raise ExportError(f"no video stream: {video}")
@@ -169,7 +171,7 @@ def build_cmd(
         raise ExportError("out-point must be after in-point")
     duration = end - in_s
 
-    dw, dh = profile_dest_size(aspect, profile)
+    dw, dh = profile_dest_size(aspect, profile, resolution)
     crop = cover_crop(src_w, src_h, dw, dh, pan_x, pan_y)
 
     audio_path: Path | None = Path(audio) if audio else None
@@ -199,6 +201,7 @@ def build_cmd(
             out,
             audio_path=audio_path,
             aspect=aspect,
+            resolution=resolution,
             pan_x=pan_x,
             pan_y=pan_y,
             audio_follows_in=audio_follows_in,
@@ -306,7 +309,12 @@ def build_cmd(
     cmd += _encode_tail(out, out_dur, profile=profile)
     meta = {
         "crop": {"x": crop.x, "y": crop.y, "w": crop.w, "h": crop.h},
-        "dest": {"width": dw, "height": dh, "aspect": aspect},
+        "dest": {
+            "width": dw,
+            "height": dh,
+            "aspect": aspect,
+            "resolution": resolution,
+        },
         "in_s": in_s,
         "out_s": in_s + duration,
         "duration": out_dur,
@@ -590,6 +598,7 @@ def _build_cmd_many(
     *,
     audio_path: Path | None,
     aspect: str,
+    resolution: str,
     pan_x: float,
     pan_y: float,
     audio_follows_in: bool,
@@ -902,7 +911,12 @@ def _build_cmd_many(
     effective = [row for row in v_applied if row.get("applied")]
     meta = {
         "crop": {"x": crop.x, "y": crop.y, "w": crop.w, "h": crop.h},
-        "dest": {"width": dw, "height": dh, "aspect": aspect},
+        "dest": {
+            "width": dw,
+            "height": dh,
+            "aspect": aspect,
+            "resolution": resolution,
+        },
         "in_s": vflat[0][2],
         "out_s": vflat[-1][3],
         "duration": out_dur,
@@ -969,6 +983,7 @@ def run_export(
     media: list[MediaItem] | None = None,
     use_video_soundtrack: bool = True,
     crossfade_s: float = 0.0,
+    resolution: str | None = None,
     profile: EncodeProfile = FINAL_PROFILE,
     progress: ProgressCb | None = None,
     cancel_event: threading.Event | None = None,
@@ -1006,6 +1021,7 @@ def run_export(
         media=media,
         use_video_soundtrack=use_video_soundtrack,
         crossfade_s=crossfade_s,
+        resolution=resolution,
         src=src,
         profile=profile or FINAL_PROFILE,
     )
