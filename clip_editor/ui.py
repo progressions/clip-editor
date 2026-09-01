@@ -19,7 +19,13 @@ gi.require_version("GdkPixbuf", "2.0")
 
 from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, GObject, Graphene, Gtk, Pango  # noqa: E402
 
-from clip_editor.aspects import ASPECTS, cover_crop, dest_size
+from clip_editor.aspects import (
+    ASPECTS,
+    DEFAULT_RESOLUTION,
+    RESOLUTIONS,
+    cover_crop,
+    dest_size,
+)
 from clip_editor.eagle import apply_omarchy_theme, theme_rgb
 from clip_editor.export import ExportCancelled, ExportError, default_out_path, run_export
 from clip_editor.preview import (
@@ -1452,6 +1458,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self._media_bin_ids: list[str] = []
         self._vmedia_path: Path | None = None
         self.aspect = "9:16"
+        self.resolution = DEFAULT_RESOLUTION
         self.audio_fit = False
         self.use_video_soundtrack = True
         self.video_start = 0.0
@@ -1697,6 +1704,27 @@ class EditorWindow(Adw.ApplicationWindow):
             self.aspect_buttons[name] = tb
             aspects.append(tb)
         right.append(aspects)
+
+        right.append(self._section("Resolution"))
+        resolutions = Gtk.Box(spacing=6)
+        self.resolution_buttons: dict[str, Gtk.ToggleButton] = {}
+        res_group = None
+        for name in RESOLUTIONS:
+            label = name.capitalize()
+            tb = Gtk.ToggleButton(label=label)
+            if res_group is None:
+                res_group = tb
+            else:
+                tb.set_group(res_group)
+            if name == DEFAULT_RESOLUTION:
+                tb.set_active(True)
+            tb.connect("toggled", self._on_resolution, name)
+            self.resolution_buttons[name] = tb
+            resolutions.append(tb)
+        right.append(resolutions)
+        self.resolution_size_label = self._wrapping_label("")
+        right.append(self.resolution_size_label)
+        self._refresh_resolution_label()
 
         right.append(self._section("Trim"))
         trim = Gtk.Box(spacing=8)
@@ -1978,6 +2006,7 @@ class EditorWindow(Adw.ApplicationWindow):
             video=self.video_path,
             audio=self.audio_path,
             aspect=self.aspect,
+            resolution=self.resolution,
             pan_x=self.preview.pan_x,
             pan_y=self.preview.pan_y,
             in_s=self.in_spin.get_value(),
@@ -2102,8 +2131,12 @@ class EditorWindow(Adw.ApplicationWindow):
             if proj.aspect in self.aspect_buttons:
                 self.aspect_buttons[proj.aspect].set_active(True)
                 self.aspect = proj.aspect
-                dw, dh = dest_size(proj.aspect)
+                dw, dh = dest_size(proj.aspect, proj.resolution)
                 self.aspect_frame.set_ratio(dw / dh)
+            if getattr(proj, "resolution", DEFAULT_RESOLUTION) in self.resolution_buttons:
+                self.resolution = proj.resolution
+                self.resolution_buttons[proj.resolution].set_active(True)
+                self._refresh_resolution_label()
             self.preview.pan_x = min(1.0, max(0.0, proj.pan_x))
             self.preview.pan_y = min(1.0, max(0.0, proj.pan_y))
             self.preview.queue_draw()
@@ -2251,9 +2284,14 @@ class EditorWindow(Adw.ApplicationWindow):
         self._unload_audio()
         self.project_path = None
         self.aspect = "9:16"
-        dw, dh = dest_size("9:16")
+        self.resolution = DEFAULT_RESOLUTION
+        dw, dh = dest_size("9:16", self.resolution)
         self.aspect_frame.set_ratio(dw / dh)
         nine = self.aspect_buttons.get("9:16")
+        med = self.resolution_buttons.get(DEFAULT_RESOLUTION)
+        if med is not None:
+            med.set_active(True)
+        self._refresh_resolution_label()
         if nine is not None and not nine.get_active():
             nine.set_active(True)
         self.preview.pan_x = 0.5
@@ -2555,7 +2593,7 @@ class EditorWindow(Adw.ApplicationWindow):
         if not self.video_info:
             self.crop_label.set_text("")
             return
-        dw, dh = dest_size(self.aspect)
+        dw, dh = dest_size(self.aspect, self.resolution)
         crop = cover_crop(
             int(self.video_info["width"]),
             int(self.video_info["height"]),
@@ -3123,8 +3161,9 @@ class EditorWindow(Adw.ApplicationWindow):
         if not self._guard_edit("aspect"):
             return
         self.aspect = name
-        w, h = dest_size(name)
+        w, h = dest_size(name, self.resolution)
         self.aspect_frame.set_ratio(w / h)
+        self._refresh_resolution_label()
         clip = self._video_at(self.timeline.playhead)
         if clip is not None:
             self.preview.set_transform(
@@ -3132,6 +3171,31 @@ class EditorWindow(Adw.ApplicationWindow):
             )
         self._refresh_crop()
         self._checkpoint()
+
+    def _on_resolution(self, btn: Gtk.ToggleButton, name: str) -> None:
+        if not btn.get_active():
+            return
+        if not self._guard_edit("resolution"):
+            return
+        self.resolution = name
+        w, h = dest_size(self.aspect, self.resolution)
+        self._refresh_resolution_label()
+        clip = self._video_at(self.timeline.playhead)
+        if clip is not None:
+            self.preview.set_transform(
+                clip.transform_x, clip.transform_y, clip.scale, w, h
+            )
+        self._refresh_crop()
+        self._checkpoint()
+
+    def _refresh_resolution_label(self) -> None:
+        if not hasattr(self, "resolution_size_label"):
+            return
+        try:
+            w, h = dest_size(self.aspect, self.resolution)
+            self.resolution_size_label.set_text(f"{w}×{h}")
+        except ValueError:
+            self.resolution_size_label.set_text("")
 
     def _set_in(self, *_args: object) -> None:
         if not self._guard_edit("set_in_out"):
@@ -3703,7 +3767,7 @@ class EditorWindow(Adw.ApplicationWindow):
     def _apply_timeline_frame(self, timeline_t: float, *, start_media: bool) -> None:
         clip = self._video_at(timeline_t)
         if clip is None or self._vmedia is None:
-            dw, dh = dest_size(self.aspect)
+            dw, dh = dest_size(self.aspect, self.resolution)
             self.preview.set_transform(0.0, 0.0, 1.0, dw, dh)
             self.preview.set_blank(True)
             if self._vmedia is not None:
@@ -3716,7 +3780,7 @@ class EditorWindow(Adw.ApplicationWindow):
             info = self.media_info.get(item.id) or self.video_info or {}
         else:
             info = self.video_info or {}
-        dw, dh = dest_size(self.aspect)
+        dw, dh = dest_size(self.aspect, self.resolution)
         self.preview.set_transform(
             clip.transform_x, clip.transform_y, clip.scale, dw, dh
         )
@@ -4159,6 +4223,9 @@ class EditorWindow(Adw.ApplicationWindow):
         if hasattr(self, "aspect_buttons"):
             for btn in self.aspect_buttons.values():
                 btn.set_sensitive(not locked)
+        if hasattr(self, "resolution_buttons"):
+            for btn in self.resolution_buttons.values():
+                btn.set_sensitive(not locked)
         self._update_history_actions()
         self._update_compiled_preview_label()
 
@@ -4281,7 +4348,9 @@ class EditorWindow(Adw.ApplicationWindow):
             self._vmedia.pause()
         self.preview.set_blank(False)
         self.preview.set_media(self._vmedia)
-        self.preview.set_transform(0.0, 0.0, 1.0, *dest_size(self.aspect))
+        self.preview.set_transform(
+            0.0, 0.0, 1.0, *dest_size(self.aspect, self.resolution)
+        )
         self.timeline.set_duration(self._compiled_duration)
         self.timeline.set_playhead(0.0)
         self.timeline.set_range(0.0, self._compiled_duration)
@@ -4458,6 +4527,7 @@ class EditorWindow(Adw.ApplicationWindow):
         video = self.video_path
         audio = self.audio_path
         aspect = self.aspect
+        resolution = self.resolution
         pan_x, pan_y = self.preview.pan_x, self.preview.pan_y
         in_s = self.in_spin.get_value()
         out_s = self.out_spin.get_value()
@@ -4487,6 +4557,7 @@ class EditorWindow(Adw.ApplicationWindow):
                     out,
                     audio=audio,
                     aspect=aspect,
+                    resolution=resolution,
                     pan_x=pan_x,
                     pan_y=pan_y,
                     in_s=in_s,

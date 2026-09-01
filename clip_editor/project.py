@@ -235,6 +235,7 @@ class Project:
     video: Path | None = None
     audio: Path | None = None
     aspect: str = "9:16"
+    resolution: str = "medium"
     pan_x: float = 0.5
     pan_y: float = 0.5
     in_s: float = 0.0
@@ -408,6 +409,7 @@ def to_dict(proj: Project) -> dict:
         "format": FORMAT,
         "version": VERSION,
         "aspect": proj.aspect,
+        "resolution": proj.resolution,
         "pan_x": float(proj.pan_x),
         "pan_y": float(proj.pan_y),
         "in_s": float(proj.in_s),
@@ -460,10 +462,14 @@ def from_dict(data: dict, *, origin: Path | None = None) -> Project:
                 path = None
         except OSError:
             pass
+    raw_res = str(data.get("resolution") or "medium").strip().lower()
+    if raw_res not in ("low", "medium", "high"):
+        raw_res = "medium"
     proj = Project(
         video=video,
         audio=audio,
         aspect=str(data.get("aspect") or "9:16"),
+        resolution=raw_res,
         pan_x=float(data.get("pan_x") if data.get("pan_x") is not None else 0.5),
         pan_y=float(data.get("pan_y") if data.get("pan_y") is not None else 0.5),
         in_s=float(data.get("in_s") or 0.0),

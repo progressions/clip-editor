@@ -46,7 +46,9 @@ PREVIEW_PROFILE = EncodeProfile(
 
 def proxy_dest_size(aspect: str, short_axis: int = PREVIEW_SHORT_AXIS) -> tuple[int, int]:
     """Even pixel size preserving aspect with ``short_axis`` on the short side."""
-    fw, fh = dest_size(aspect)
+    # Medium aspect geometry only — preview proxies stay fixed-size regardless
+    # of the project's Low/Medium/High export resolution.
+    fw, fh = dest_size(aspect, "medium")
     short_axis = max(64, int(short_axis))
     if fw <= fh:
         dw = even(short_axis)
@@ -57,10 +59,14 @@ def proxy_dest_size(aspect: str, short_axis: int = PREVIEW_SHORT_AXIS) -> tuple[
     return max(2, dw), max(2, dh)
 
 
-def profile_dest_size(aspect: str, profile: EncodeProfile) -> tuple[int, int]:
+def profile_dest_size(
+    aspect: str,
+    profile: EncodeProfile,
+    resolution: str | None = None,
+) -> tuple[int, int]:
     if profile.proxy:
         return proxy_dest_size(aspect)
-    return dest_size(aspect)
+    return dest_size(aspect, resolution)
 
 
 def _clip_used_range(

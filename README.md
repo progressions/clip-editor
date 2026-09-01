@@ -105,12 +105,14 @@ Matches `buffer-publish`:
 - Cover-crop, never stretch, never letterbox
 - Then the H.264 ffprobe gate
 
-| Aspect | Size |
-|--------|------|
-| 9:16 | 1080×1920 |
-| 4:5 | 1080×1350 |
-| 1:1 | 1080×1080 |
-| 16:9 | 1920×1080 |
+| Aspect | Low (720) | Medium (1080) | High (1440) |
+|--------|-----------|---------------|-------------|
+| 9:16 | 720×1280 | 1080×1920 | 1440×2560 |
+| 4:5 | 720×900 | 1080×1350 | 1440×1800 |
+| 1:1 | 720×720 | 1080×1080 | 1440×1440 |
+| 16:9 | 1280×720 | 1920×1080 | 2560×1440 |
+
+Resolution is a Low / Medium / High preset (short-edge). Medium is the default and matches the previous fixed sizes. CLI: `--resolution low|medium|high`.
 
 Drag the preview to reframe. In/out points trim the output (H3 head-blip).
 Replacement audio starts at 0 of the audio file unless “Audio follows video

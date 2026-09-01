@@ -10,7 +10,13 @@ import tempfile
 from pathlib import Path
 
 from clip_editor import __version__
-from clip_editor.aspects import ASPECTS, cover_crop, dest_size
+from clip_editor.aspects import (
+    ASPECTS,
+    DEFAULT_RESOLUTION,
+    RESOLUTIONS,
+    cover_crop,
+    dest_size,
+)
 from clip_editor.export import ExportError, default_out_path, run_export
 from clip_editor.probe import ProbeError, which_ffmpeg, which_ffprobe
 
@@ -23,6 +29,12 @@ def _add_export_args(p: argparse.ArgumentParser) -> None:
         default="9:16",
         choices=list(ASPECTS),
         help="export aspect (default 9:16)",
+    )
+    p.add_argument(
+        "--resolution",
+        default=DEFAULT_RESOLUTION,
+        choices=list(RESOLUTIONS),
+        help="export resolution preset: low=720 / medium=1080 / high=1440 short edge",
     )
     p.add_argument("--pan-x", type=float, default=0.5, help="0=left 1=right (default 0.5)")
     p.add_argument("--pan-y", type=float, default=0.5, help="0=top 1=bottom (default 0.5)")
@@ -89,6 +101,7 @@ def cmd_export(args: argparse.Namespace) -> int:
             out,
             audio=Path(args.audio) if args.audio else None,
             aspect=args.aspect,
+            resolution=args.resolution,
             pan_x=args.pan_x,
             pan_y=args.pan_y,
             in_s=args.in_s,
