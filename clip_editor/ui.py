@@ -45,6 +45,7 @@ from clip_editor.project import (
     Project,
     ProjectError,
     clear_autosave,
+    media_load_errors,
     next_media_id,
     normalize_transition,
     read_autosave,
@@ -1471,6 +1472,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self._preview_rendering = False
         self._preview_cancel = threading.Event()
         self._preview_generation = 0
+        self._project_warnings: list[str] = []
         self._compiled_mode = False
         self._compiled_stale = False
         self._compiled_path: Path | None = None
@@ -2069,15 +2071,15 @@ class EditorWindow(Adw.ApplicationWindow):
         self.media_thumbs = {}
         self._media_bin_ids = []
         for src in items:
+            # Keep offline rows in the project/bin so their ids and paths can
+            # be repaired later instead of being lost on the next autosave.
+            self.media.append(src.copy())
             if not src.path.is_file():
-                self._set_status(f"Missing {src.path}")
                 continue
             try:
                 info = probe(src.path)
             except ProbeError:
-                self._set_status(f"Could not read {src.path.name}")
                 continue
-            self.media.append(src.copy())
             self.media_info[src.id] = info
             if src.kind == "video":
                 try:
@@ -2157,20 +2159,62 @@ class EditorWindow(Adw.ApplicationWindow):
         finally:
             self._loading = was_loading
 
+    def _probe_project_media(self, proj: Project) -> None:
+        """Collect recoverable media warnings without rejecting the project."""
+        warnings = media_load_errors(proj)
+        for m in proj.media:
+            if not m.path.is_file():
+                continue
+            try:
+                info = probe(m.path)
+            except ProbeError:
+                warnings.append(f"could not read media {m.id}: {m.path.name}")
+                continue
+            if m.kind == "video" and not info.get("has_video"):
+                warnings.append(f"video media {m.id} has no video stream: {m.path.name}")
+            if m.kind == "audio" and not info.get("has_audio"):
+                warnings.append(f"audio media {m.id} has no audio stream: {m.path.name}")
+        self._project_warnings = warnings
+
+    def _reset_history_to_current(self) -> None:
+        self._history = [self._current_project()]
+        self._hist_i = 0
+        if self._ckpt_src:
+            GLib.source_remove(self._ckpt_src)
+            self._ckpt_src = 0
+        self._update_history_actions()
+
     def _load_project_file(self, path: Path) -> None:
         try:
             proj = read_project(path)
+            self._probe_project_media(proj)
         except ProjectError as exc:
             self._set_status(str(exc))
             return
-        self._checkpoint()
-        self.project_path = path
-        self._apply_project(proj)
-        self.project_path = path
-        self._update_title()
-        self._checkpoint()
+        # Cancel a pending autosave so a half-applied project cannot flush.
+        if self._autosave_src:
+            GLib.source_remove(self._autosave_src)
+            self._autosave_src = 0
+        if self._ckpt_src:
+            GLib.source_remove(self._ckpt_src)
+            self._ckpt_src = 0
+        self._loading = True
+        try:
+            self._apply_project(proj)
+            self.project_path = path
+            self._update_title()
+        finally:
+            self._loading = False
+        # Undo must not reach back into the previously open project.
+        self._reset_history_to_current()
         self._schedule_autosave()
-        self._set_status(f"Opened {path.name}")
+        if self._project_warnings:
+            first = self._project_warnings[0]
+            more = len(self._project_warnings) - 1
+            suffix = f" (+{more} more)" if more else ""
+            self._set_status(f"Opened {path.name} with media warnings: {first}{suffix}")
+        else:
+            self._set_status(f"Opened {path.name}")
 
     def _restore_autosave(self) -> bool:
         if getattr(self, "_open_from_cli", False):
@@ -2376,7 +2420,9 @@ class EditorWindow(Adw.ApplicationWindow):
         item = self._media_by_id(c.media_id)
         if item is not None:
             return item
-        if kind:
+        # Only legacy empty ids may use a compatible fallback. Preserve an
+        # explicit unknown id as offline instead of displaying another file.
+        if kind and not c.media_id:
             return next((m for m in self.media if m.kind == kind), None)
         return None
 

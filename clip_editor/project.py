@@ -263,22 +263,31 @@ def _rel(media: Path | None, origin: Path | None) -> str | None:
 
 
 def _resolve(abs_s: str | None, rel_s: str | None, origin: Path | None) -> Path | None:
+    """Resolve a media path.
+
+    Prefer a relative path that exists beside the project file. Otherwise keep
+    the absolute path (even when missing) so callers can report it. If only a
+    relative path is stored and the file is gone, still return that candidate
+    so load validation can name it instead of silently dropping the media row.
+    """
+    rel_cand: Path | None = None
     if rel_s and origin is not None:
         cand = (origin.parent / rel_s).expanduser()
         try:
             cand = cand.resolve()
         except OSError:
-            cand = cand
+            pass
         if cand.is_file():
             return cand
+        rel_cand = cand
     if abs_s:
-        p = Path(abs_s).expanduser()
+        p = Path(str(abs_s)).expanduser()
         try:
             p = p.resolve()
         except OSError:
             pass
         return p
-    return None
+    return rel_cand
 
 
 def ensure_suffix(path: Path) -> Path:
@@ -344,10 +353,18 @@ def _ensure_media(
 
 
 def _bind_clip_media(clips: list[ClipInst], media: list[MediaItem], kind: str) -> None:
+    """Attach clips to media ids.
+
+    Empty ``media_id`` (legacy single-file projects) binds to the first media
+    item of ``kind``. A non-empty id that is not in the bin is left alone so
+    load validation can reject it instead of silently swapping to another file.
+    """
     fallback = next((m.id for m in media if m.kind == kind), "")
     ids = {m.id for m in media if m.kind == kind}
     for c in clips:
-        if c.media_id not in ids:
+        if c.media_id in ids:
+            continue
+        if not c.media_id and fallback:
             c.media_id = fallback
 
 
@@ -514,6 +531,41 @@ def from_dict(data: dict, *, origin: Path | None = None) -> Project:
     if version < 6 and legacy_xf > 0.001:
         apply_legacy_crossfade(proj.video_clips, legacy_xf)
     return proj
+
+
+def media_load_errors(proj: Project) -> list[str]:
+    """Return unresolved-media warnings for ``proj``."""
+    errors: list[str] = []
+    by_id = {m.id: m for m in proj.media}
+    for m in proj.media:
+        if not m.path.is_file():
+            errors.append(f"missing media {m.id}: {m.path}")
+    for label, clips, kind in (
+        ("video", proj.video_clips, "video"),
+        ("audio", proj.audio_clips, "audio"),
+    ):
+        for i, c in enumerate(clips):
+            mid = c.media_id
+            if not mid:
+                errors.append(f"{label} clip {i + 1} has no media_id")
+                continue
+            item = by_id.get(mid)
+            if item is None:
+                errors.append(
+                    f"{label} clip {i + 1} references unknown media {mid!r}"
+                )
+            elif item.kind != kind:
+                errors.append(
+                    f"{label} clip {i + 1} references {item.kind} media {mid!r}"
+                )
+    return errors
+
+
+def ensure_project_loadable(proj: Project) -> None:
+    """Raise ``ProjectError`` when media/clip bindings are not safe to open."""
+    errors = media_load_errors(proj)
+    if errors:
+        raise ProjectError("; ".join(errors))
 
 
 def read_project(path: Path) -> Project:
