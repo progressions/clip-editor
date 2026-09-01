@@ -359,5 +359,136 @@ class CancelCleanupTest(unittest.TestCase):
             self.assertFalse(out.exists())
 
 
+class CompiledModePolicyTest(unittest.TestCase):
+    def test_blocks_mutations_while_compiled(self) -> None:
+        from clip_editor.preview import compiled_allows_action
+
+        for action in (
+            "trim",
+            "move",
+            "split",
+            "delete",
+            "track",
+            "transform",
+            "transition",
+            "undo",
+            "redo",
+            "pan",
+            "media_place",
+            "drop_media",
+            "select_rebind",
+        ):
+            self.assertFalse(
+                compiled_allows_action(action, compiled_mode=True), action
+            )
+
+    def test_allows_transport_and_save_while_compiled(self) -> None:
+        from clip_editor.preview import compiled_allows_action
+
+        for action in ("seek", "play_pause", "back_to_edit", "save", "export"):
+            self.assertTrue(
+                compiled_allows_action(action, compiled_mode=True), action
+            )
+
+    def test_allows_everything_outside_compiled(self) -> None:
+        from clip_editor.preview import compiled_allows_action
+
+        self.assertTrue(compiled_allows_action("delete", compiled_mode=False))
+        self.assertTrue(compiled_allows_action("trim", compiled_mode=False))
+
+    def test_playhead_prefers_media_clock(self) -> None:
+        from clip_editor.preview import compiled_playhead_seconds
+
+        t = compiled_playhead_seconds(
+            playing=True,
+            duration=10.0,
+            media_timestamp_us=2_500_000,
+            play_t0=0.0,
+            play_mono=100.0,
+            now_mono=103.0,
+            paused_playhead=0.0,
+        )
+        self.assertAlmostEqual(t, 2.5)
+
+    def test_playhead_falls_back_to_monotonic(self) -> None:
+        from clip_editor.preview import compiled_playhead_seconds
+
+        t = compiled_playhead_seconds(
+            playing=True,
+            duration=10.0,
+            media_timestamp_us=None,
+            play_t0=1.0,
+            play_mono=100.0,
+            now_mono=103.25,
+            paused_playhead=0.0,
+        )
+        self.assertAlmostEqual(t, 4.25)
+
+    def test_playhead_clamps_and_paused(self) -> None:
+        from clip_editor.preview import compiled_playhead_seconds
+
+        t = compiled_playhead_seconds(
+            playing=False,
+            duration=5.0,
+            media_timestamp_us=9_000_000,
+            play_t0=0.0,
+            play_mono=0.0,
+            now_mono=0.0,
+            paused_playhead=4.2,
+        )
+        self.assertAlmostEqual(t, 4.2)
+        over = compiled_playhead_seconds(
+            playing=True,
+            duration=5.0,
+            media_timestamp_us=9_000_000,
+            play_t0=0.0,
+            play_mono=0.0,
+            now_mono=0.0,
+            paused_playhead=0.0,
+        )
+        self.assertAlmostEqual(over, 5.0)
+
+
+class TimelineReadOnlyTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        import gi
+
+        gi.require_version("Gtk", "4.0")
+        from gi.repository import Gtk
+
+        if not Gtk.init_check():
+            raise unittest.SkipTest("GTK display unavailable")
+
+    def test_read_only_rejects_bin_drop_and_forces_seek_drag(self) -> None:
+        from clip_editor.ui import Timeline
+        from clip_editor.project import ClipInst
+
+        placed: list[tuple] = []
+        sought: list[float] = []
+        tl = Timeline()
+        tl.on_place = lambda *a: placed.append(a)
+        tl.on_seek = lambda t: sought.append(t)
+        tl.set_clips(
+            video_name="a.mp4",
+            video_dur=4.0,
+            vclips=[ClipInst(start=0.0, in_s=0.0, out_s=4.0)],
+            src_durs={"m1": 4.0},
+        )
+        tl.set_size_request(400, 162)
+        tl.set_read_only(True)
+        self.assertTrue(tl.read_only)
+        self.assertFalse(tl._on_bin_drop(None, "video:m1", 40.0, 40.0))
+        self.assertEqual(placed, [])
+        # Drag begin in read-only is seek-only.
+        class _G:
+            def get_start_point(self):
+                return True, 80.0, 10.0
+
+        tl._on_drag_begin(_G(), 0.0, 0.0)
+        self.assertEqual(tl._drag_mode, "seek")
+        self.assertTrue(sought)
+
+
 if __name__ == "__main__":
     unittest.main()
