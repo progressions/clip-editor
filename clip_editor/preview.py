@@ -349,3 +349,72 @@ def extract_acrossfade_signature(filter_complex: str) -> list[str]:
     import re
 
     return re.findall(r"acrossfade=d=([0-9.]+)", filter_complex or "")
+
+
+# Actions that mutate the project or timeline while compiled preview is active.
+COMPILED_BLOCKED_ACTIONS = frozenset(
+    {
+        "trim",
+        "move",
+        "split",
+        "delete",
+        "duplicate",
+        "track",
+        "transform",
+        "transition",
+        "audio_route",
+        "media_place",
+        "undo",
+        "redo",
+        "pan",
+        "aspect",
+        "fit",
+        "follow_in",
+        "clear_audio",
+        "set_in_out",
+        "drop_media",
+        "select_rebind",
+    }
+)
+
+# Transport / non-mutating actions that stay available in compiled preview.
+COMPILED_ALLOWED_ACTIONS = frozenset(
+    {
+        "seek",
+        "play_pause",
+        "back_to_edit",
+        "save",
+        "export",
+        "cancel_preview",
+        "open_project",
+        "new_project",
+    }
+)
+
+
+def compiled_allows_action(action: str, *, compiled_mode: bool) -> bool:
+    """Return whether ``action`` may run given compiled-preview mode."""
+    if not compiled_mode:
+        return True
+    if action in COMPILED_ALLOWED_ACTIONS:
+        return True
+    return action not in COMPILED_BLOCKED_ACTIONS
+
+
+def compiled_playhead_seconds(
+    *,
+    playing: bool,
+    duration: float,
+    media_timestamp_us: int | None,
+    play_t0: float,
+    play_mono: float,
+    now_mono: float,
+    paused_playhead: float,
+) -> float:
+    """Timeline time for compiled preview; prefer MediaFile clock when playing."""
+    duration = max(0.05, float(duration))
+    if playing and media_timestamp_us is not None and media_timestamp_us >= 0:
+        return min(max(0.0, media_timestamp_us / 1_000_000.0), duration)
+    if playing:
+        return min(max(0.0, float(play_t0) + (now_mono - play_mono)), duration)
+    return min(max(0.0, float(paused_playhead)), duration)

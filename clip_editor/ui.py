@@ -26,6 +26,8 @@ from clip_editor.preview import (
     PREVIEW_PROFILE,
     assert_preview_path_safe,
     cleanup_preview_cache,
+    compiled_allows_action,
+    compiled_playhead_seconds,
     has_touching_follower,
     preview_out_path,
     rebase_clips_for_window,
@@ -126,6 +128,7 @@ class CoverPreview(Gtk.Widget):
         self._media: Gtk.MediaFile | None = None
         self._inv_id = 0
         self.blank = False
+        self.read_only = False
         self.set_layout_manager(Gtk.BinLayout())
         self.set_hexpand(True)
         self.set_vexpand(True)
@@ -241,10 +244,14 @@ class CoverPreview(Gtk.Widget):
         return 0.0, ph * (w / pw) - h
 
     def _drag_begin(self, *_args: object) -> None:
+        if self.read_only:
+            return
         self._drag_pan = (self.pan_x, self.pan_y)
         self.set_cursor_from_name("grabbing")
 
     def _drag_update(self, _g: Gtk.GestureDrag, dx: float, dy: float) -> None:
+        if self.read_only:
+            return
         ox, oy = self._overflow()
         px, py = self._drag_pan
         if ox > 1:
@@ -256,6 +263,9 @@ class CoverPreview(Gtk.Widget):
             self.on_pan()
 
     def _drag_end(self, *_args: object) -> None:
+        if self.read_only:
+            self.set_cursor_from_name("default")
+            return
         self.set_cursor_from_name("grab")
         if callable(self.on_pan_end):
             self.on_pan_end()
@@ -313,6 +323,7 @@ class Timeline(Gtk.DrawingArea):
         self.sel_v = -1
         self.sel_a = -1
         self.playhead = 0.0
+        self.read_only = False
         self.on_seek = None
         self.on_video_move = None
         self.on_audio_move = None
@@ -706,12 +717,36 @@ class Timeline(Gtk.DrawingArea):
             return True
         return False
 
+    def set_read_only(self, locked: bool) -> None:
+        self.read_only = bool(locked)
+        if locked:
+            self._drag_mode = ""
+            self._drag_index = -1
+            self._drop_hover = None
+            self.set_cursor_from_name("col-resize")
+            self.set_tooltip_text(
+                "Rendered preview — seek only. Editing is locked. Use Back to edit."
+            )
+        else:
+            self.set_tooltip_text(
+                "Drag a clip to slide it. Drag either edge to trim. "
+                "Drag the ruler or playhead to seek. T splits at the playhead. "
+                "Del removes the selected clip (A-track too)."
+            )
+        self.queue_draw()
+
     def _on_pressed(self, _g: Gtk.GestureClick, _n: int, x: float, y: float) -> None:
+        if self.read_only:
+            self._seek_x(x)
+            return
         if self._select_hit(x, y):
             return
         self._seek_x(x)
 
     def _on_motion(self, _c: Gtk.EventControllerMotion, x: float, y: float) -> None:
+        if self.read_only:
+            self.set_cursor_from_name("col-resize")
+            return
         if self._drag_mode in ("video-in", "video-out", "audio-in", "audio-out"):
             self.set_cursor_from_name("ew-resize")
         elif self._drag_mode in ("video", "audio"):
@@ -731,6 +766,11 @@ class Timeline(Gtk.DrawingArea):
         self._drag_inner = inner
         self._drag_span = max(self._map_span(), 0.01)
         self._drag_y0 = oy
+        if self.read_only:
+            self._drag_mode = "seek"
+            self._drag_index = -1
+            self._seek_x(ox)
+            return
         vi, vp = self._hit_kind(ox, oy, "video")
         ai, ap = (-1, "")
         if self.audio_kind != "source":
@@ -999,6 +1039,11 @@ class Timeline(Gtk.DrawingArea):
         return kind
 
     def _bin_action(self, target: Gtk.DropTarget, x: float, y: float) -> Gdk.DragAction:
+        if self.read_only:
+            if self._drop_hover is not None:
+                self._drop_hover = None
+                self.queue_draw()
+            return Gdk.DragAction(0)
         kind = self._drop_kind(target)
         t = self._x_to_t(x)
         hover: tuple[str, float, int] | None = None
@@ -1014,6 +1059,8 @@ class Timeline(Gtk.DrawingArea):
         return action
 
     def _on_bin_enter(self, target: Gtk.DropTarget, x: float, y: float) -> Gdk.DragAction:
+        if self.read_only:
+            return Gdk.DragAction(0)
         kind = self._drop_kind(target)
         if kind not in ("video", "audio"):
             return Gdk.DragAction(0)
@@ -1031,6 +1078,10 @@ class Timeline(Gtk.DrawingArea):
             self.queue_draw()
 
     def _on_bin_drop(self, _t: Gtk.DropTarget, value: object, x: float, y: float) -> bool:
+        if self.read_only:
+            self._drop_hover = None
+            self.queue_draw()
+            return False
         kind, mid = self._parse_bin_payload(value)
         t = self._x_to_t(x)
         self._drop_hover = None
@@ -1419,6 +1470,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.exporting = False
         self._preview_rendering = False
         self._preview_cancel = threading.Event()
+        self._preview_generation = 0
         self._compiled_mode = False
         self._compiled_stale = False
         self._compiled_path: Path | None = None
@@ -1523,9 +1575,9 @@ class EditorWindow(Adw.ApplicationWindow):
 
         right.append(self._section("Video"))
         row = Gtk.Box(spacing=8)
-        b = Gtk.Button(label="Open video")
-        b.connect("clicked", lambda *_: self._pick("video"))
-        row.append(b)
+        self.btn_open_video = Gtk.Button(label="Open video")
+        self.btn_open_video.connect("clicked", lambda *_: self._pick("video"))
+        row.append(self.btn_open_video)
         right.append(row)
 
         right.append(self._section("Transition after this clip"))
@@ -1569,8 +1621,9 @@ class EditorWindow(Adw.ApplicationWindow):
         self.btn_preview_cancel.set_sensitive(False)
         self.btn_preview_cancel.connect("clicked", self._on_cancel_preview_render)
         right.append(self.btn_preview_cancel)
-        self.btn_back_edit_preview = Gtk.Button(label="Back to edit preview")
+        self.btn_back_edit_preview = Gtk.Button(label="Back to edit")
         self.btn_back_edit_preview.set_sensitive(False)
+        self.btn_back_edit_preview.add_css_class("suggested-action")
         self.btn_back_edit_preview.connect("clicked", self._on_back_edit_preview)
         right.append(self.btn_back_edit_preview)
         self.compiled_preview_label = self._wrapping_label("")
@@ -1605,9 +1658,9 @@ class EditorWindow(Adw.ApplicationWindow):
 
         right.append(self._section("Audio"))
         row = Gtk.Box(spacing=8)
-        b = Gtk.Button(label="Open audio")
-        b.connect("clicked", lambda *_: self._pick("audio"))
-        row.append(b)
+        self.btn_open_audio = Gtk.Button(label="Open audio")
+        self.btn_open_audio.connect("clicked", lambda *_: self._pick("audio"))
+        row.append(self.btn_open_audio)
         self.btn_fit = Gtk.Button(label="Fit")
         self.btn_fit.set_sensitive(False)
         self.btn_fit.set_tooltip_text("Cut the music to the video length")
@@ -1734,6 +1787,16 @@ class EditorWindow(Adw.ApplicationWindow):
         self._redo_action.set_enabled(False)
         self.add_action(self._redo_action)
 
+    def _editing_locked(self) -> bool:
+        return bool(self._compiled_mode)
+
+    def _guard_edit(self, action: str = "edit") -> bool:
+        """Return True if the edit action may proceed."""
+        if compiled_allows_action(action, compiled_mode=self._editing_locked()):
+            return True
+        self._set_status("Rendered preview — editing locked")
+        return False
+
     def _on_key_pressed(self, _c: Gtk.EventControllerKey, keyval: int, _code: int, state: int) -> bool:
         mods = state & Gtk.accelerator_get_default_mod_mask()
         ctrl = bool(mods & Gdk.ModifierType.CONTROL_MASK)
@@ -1753,8 +1816,12 @@ class EditorWindow(Adw.ApplicationWindow):
         if mods:
             return False
         if keyval in (Gdk.KEY_Delete, Gdk.KEY_KP_Delete):
+            if not self._guard_edit("delete"):
+                return True
             return self._delete_selected_clip()
         if keyval in (Gdk.KEY_t, Gdk.KEY_T):
+            if not self._guard_edit("split"):
+                return True
             self._split_selected_clip()
             return True
         if keyval not in (Gdk.KEY_space, Gdk.KEY_KP_Space):
@@ -1815,20 +1882,22 @@ class EditorWindow(Adw.ApplicationWindow):
         )
 
     def _update_history_actions(self) -> None:
+        locked = self._editing_locked()
         if self._undo_action is not None:
-            self._undo_action.set_enabled(self._hist_i > 0)
+            self._undo_action.set_enabled(not locked and self._hist_i > 0)
         if self._redo_action is not None:
             self._redo_action.set_enabled(
-                self._hist_i >= 0 and self._hist_i < len(self._history) - 1
+                not locked
+                and self._hist_i >= 0
+                and self._hist_i < len(self._history) - 1
             )
 
     def _checkpoint(self, *_args: object) -> None:
-        if self._loading or self._applying_history:
+        if self._loading or self._applying_history or self._editing_locked():
             return
         if self._ckpt_src:
             GLib.source_remove(self._ckpt_src)
             self._ckpt_src = 0
-        self._mark_compiled_stale_if_needed()
         snap = self._current_project()
         key = self._snapshot_key(snap)
         if (
@@ -1847,7 +1916,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self._update_history_actions()
 
     def _schedule_checkpoint(self) -> None:
-        if self._loading or self._applying_history:
+        if self._loading or self._applying_history or self._editing_locked():
             return
         if self._ckpt_src:
             GLib.source_remove(self._ckpt_src)
@@ -1867,6 +1936,8 @@ class EditorWindow(Adw.ApplicationWindow):
     def _on_undo(self, *_args: object) -> None:
         if self.exporting or self._applying_history:
             return
+        if not self._guard_edit("undo"):
+            return
         self._flush_checkpoint()
         if self._hist_i <= 0:
             self._set_status("Nothing to undo")
@@ -1883,6 +1954,8 @@ class EditorWindow(Adw.ApplicationWindow):
 
     def _on_redo(self, *_args: object) -> None:
         if self.exporting or self._applying_history:
+            return
+        if not self._guard_edit("redo"):
             return
         self._flush_checkpoint()
         if self._hist_i < 0 or self._hist_i >= len(self._history) - 1:
@@ -2015,6 +2088,9 @@ class EditorWindow(Adw.ApplicationWindow):
     def _apply_project(self, proj: Project) -> None:
         was_loading = self._loading
         self._loading = True
+        self._abandon_preview_render()
+        if self._compiled_mode:
+            self._reset_compiled_preview_flags()
         self._stop()
         try:
             self._install_media_list(proj.media)
@@ -2120,7 +2196,9 @@ class EditorWindow(Adw.ApplicationWindow):
         return store
 
     def _clear_session(self) -> None:
+        self._abandon_preview_render()
         self._stop()
+        self._reset_compiled_preview_flags()
         self.media = []
         self.media_info = {}
         self.media_thumbs = {}
@@ -2136,6 +2214,8 @@ class EditorWindow(Adw.ApplicationWindow):
             nine.set_active(True)
         self.preview.pan_x = 0.5
         self.preview.pan_y = 0.5
+        self.preview.read_only = False
+        self.preview.set_cursor_from_name("grab")
         self.preview.queue_draw()
         self.in_spin.set_value(0)
         self.out_spin.set_value(0)
@@ -2156,8 +2236,10 @@ class EditorWindow(Adw.ApplicationWindow):
         self.timeline.set_playhead(0)
         self.timeline.set_range(0.0, 0.0)
         self.timeline.set_duration(0.0)
+        self.timeline.set_read_only(False)
         self.preview.set_blank(False)
         self._sync_transition_controls()
+        self._sync_compiled_preview_controls()
         self._refresh_media()
 
     def _on_new_project(self, *_args: object) -> None:
@@ -2409,10 +2491,14 @@ class EditorWindow(Adw.ApplicationWindow):
         widget.add_controller(dt)
 
     def _on_drop_enter(self, *_args: object) -> Gdk.DragAction:
+        if self._editing_locked():
+            return Gdk.DragAction(0)
         return Gdk.DragAction.COPY
 
     def _on_close(self, *_args: object) -> bool:
+        self._abandon_preview_render()
         self._stop()
+        self._reset_compiled_preview_flags()
         if self._ckpt_src:
             GLib.source_remove(self._ckpt_src)
             self._ckpt_src = 0
@@ -2445,7 +2531,7 @@ class EditorWindow(Adw.ApplicationWindow):
 
     def _sync_transform_controls(self) -> None:
         clip = self._selected_video_clip()
-        enabled = clip is not None
+        enabled = clip is not None and not self._editing_locked()
         controls = (
             self.transform_x_spin,
             self.transform_y_spin,
@@ -2466,6 +2552,9 @@ class EditorWindow(Adw.ApplicationWindow):
     def _on_transform_changed(self, *_args: object) -> None:
         if self._loading:
             return
+        if not self._guard_edit("transform"):
+            self._sync_transform_controls()
+            return
         clip = self._selected_video_clip()
         if clip is None:
             return
@@ -2477,6 +2566,8 @@ class EditorWindow(Adw.ApplicationWindow):
         self._schedule_autosave()
 
     def _on_transform_reset(self, *_args: object) -> None:
+        if not self._guard_edit("transform"):
+            return
         if self._selected_video_clip() is None:
             return
         self.transform_x_spin.set_value(0.0)
@@ -2494,7 +2585,9 @@ class EditorWindow(Adw.ApplicationWindow):
 
     def _sync_timeline_clips(self) -> None:
         if self._compiled_mode:
-            self._mark_compiled_stale_if_needed()
+            self._invalidate_compiled_preview_if_stale()
+            if not self._compiled_mode:
+                return
             self._sync_transform_controls()
             self._sync_transition_controls()
             self._sync_compiled_preview_controls()
@@ -2696,7 +2789,12 @@ class EditorWindow(Adw.ApplicationWindow):
             and 0 <= self.sel_v < len(self.video_clips)
             and self._has_touching_video_follower(self.sel_v)
         )
-        enabled = clip is not None and has_follower and not self.exporting
+        enabled = (
+            clip is not None
+            and has_follower
+            and not self.exporting
+            and not self._editing_locked()
+        )
         was_loading = self._loading
         self._loading = True
         try:
@@ -2716,7 +2814,9 @@ class EditorWindow(Adw.ApplicationWindow):
             self.transition_spin.set_sensitive(
                 enabled and self.transition_type.get_selected() > 0
             )
-            if clip is None:
+            if self._editing_locked():
+                self.transition_hint.set_text("Rendered preview — editing locked")
+            elif clip is None:
                 self.transition_hint.set_text("Select a video clip")
             elif not has_follower:
                 self.transition_hint.set_text(
@@ -2729,6 +2829,9 @@ class EditorWindow(Adw.ApplicationWindow):
 
     def _on_transition_changed(self, *_args: object) -> None:
         if self._loading:
+            return
+        if not self._guard_edit("transition"):
+            self._sync_transition_controls()
             return
         clip = self._selected_video_clip()
         if clip is None:
@@ -2761,6 +2864,8 @@ class EditorWindow(Adw.ApplicationWindow):
         self._schedule_checkpoint()
 
     def _pick(self, kind: str) -> None:
+        if not self._guard_edit("drop_media"):
+            return
         dialog = Gtk.FileDialog(title="Open video" if kind == "video" else "Open audio")
         filt = Gtk.FileFilter()
         if kind == "video":
@@ -2824,6 +2929,19 @@ class EditorWindow(Adw.ApplicationWindow):
         dropped = self._paths_from_drop(value)
         if not dropped:
             return False
+        if self._editing_locked():
+            # Opening a project file is allowed (exits compiled mode via apply).
+            projects = [
+                p
+                for p in dropped
+                if p.name.endswith(".clip.json") or self._looks_like_project(p)
+            ]
+            if not projects:
+                self._set_status("Rendered preview — editing locked")
+                return True
+            for p in projects:
+                self._load_project_file(p)
+            return True
         video_ext = {".mp4", ".mov", ".webm", ".mkv", ".m4v"}
         audio_ext = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".opus"}
         for p in dropped:
@@ -2853,6 +2971,8 @@ class EditorWindow(Adw.ApplicationWindow):
         return isinstance(data, dict) and data.get("format") == "clip-editor-project"
 
     def _add_media(self, path: Path, *, place: bool | None = None) -> str | None:
+        if not self._guard_edit("drop_media"):
+            return None
         try:
             path = path.expanduser().resolve()
         except OSError:
@@ -2906,6 +3026,8 @@ class EditorWindow(Adw.ApplicationWindow):
         self._add_media(path)
 
     def _on_clear_audio(self, *_args: object) -> None:
+        if not self._guard_edit("clear_audio"):
+            return
         self.media = [m for m in self.media if m.kind != "audio"]
         self._media_bin_ids = []
         self.use_video_soundtrack = False
@@ -2915,6 +3037,10 @@ class EditorWindow(Adw.ApplicationWindow):
         self._set_status("Audio cleared")
 
     def _on_follow_in(self, *_args: object) -> None:
+        if self._loading:
+            return
+        if not self._guard_edit("follow_in"):
+            return
         if self.follow_in.get_active() and self.audio_clips and self.video_clips:
             vs = (
                 self.video_clips[self.sel_v]
@@ -2927,6 +3053,8 @@ class EditorWindow(Adw.ApplicationWindow):
         self._refresh_fit()
 
     def _on_fit(self, *_args: object) -> None:
+        if not self._guard_edit("fit"):
+            return
         if not self.audio_path or not self.audio_clips:
             return
         v, a = self._edit_dur(), self._audio_usable()
@@ -2946,6 +3074,8 @@ class EditorWindow(Adw.ApplicationWindow):
     def _on_aspect(self, btn: Gtk.ToggleButton, name: str) -> None:
         if not btn.get_active():
             return
+        if not self._guard_edit("aspect"):
+            return
         self.aspect = name
         w, h = dest_size(name)
         self.aspect_frame.set_ratio(w / h)
@@ -2958,16 +3088,22 @@ class EditorWindow(Adw.ApplicationWindow):
         self._checkpoint()
 
     def _set_in(self, *_args: object) -> None:
+        if not self._guard_edit("set_in_out"):
+            return
         self.in_spin.set_value(self._playhead())
         self._refresh_fit()
         self._checkpoint()
 
     def _set_out(self, *_args: object) -> None:
+        if not self._guard_edit("set_in_out"):
+            return
         self.out_spin.set_value(self._playhead())
         self._refresh_fit()
         self._checkpoint()
 
     def _on_video_move(self, index: int, start: float, done: bool) -> None:
+        if not self._guard_edit("move"):
+            return
         if not 0 <= index < len(self.video_clips):
             return
         inn = max(0.0, self.video_clips[index].in_s)
@@ -2988,6 +3124,8 @@ class EditorWindow(Adw.ApplicationWindow):
         self._set_status(f"Video at {self.video_clips[index].start + inn:.2f}s")
 
     def _on_audio_move(self, index: int, start: float, done: bool) -> None:
+        if not self._guard_edit("move"):
+            return
         if not 0 <= index < len(self.audio_clips):
             return
         inn = max(0.0, self.audio_clips[index].in_s)
@@ -3004,6 +3142,8 @@ class EditorWindow(Adw.ApplicationWindow):
         self._set_status(f"Audio at {self.audio_clips[index].start + inn:.2f}s")
 
     def _on_track_change(self, kind: str, index: int, track: int) -> None:
+        if not self._guard_edit("track"):
+            return
         clips = self.video_clips if kind == "video" else self.audio_clips
         if not 0 <= index < len(clips):
             return
@@ -3011,6 +3151,8 @@ class EditorWindow(Adw.ApplicationWindow):
         self._set_status(f"Moved clip to {kind[0].upper()}{clips[index].track}")
 
     def _on_video_trim(self, index: int, in_s: float, out_s: float, done: bool) -> None:
+        if not self._guard_edit("trim"):
+            return
         if not 0 <= index < len(self.video_clips):
             return
         self.video_clips[index].in_s = in_s
@@ -3031,6 +3173,8 @@ class EditorWindow(Adw.ApplicationWindow):
         self._set_status(f"Video {in_s:.2f}s–{out_s:.2f}s")
 
     def _on_audio_trim(self, index: int, in_s: float, out_s: float, done: bool) -> None:
+        if not self._guard_edit("trim"):
+            return
         if not 0 <= index < len(self.audio_clips):
             return
         self.audio_clips[index].in_s = max(0.0, in_s)
@@ -3052,6 +3196,8 @@ class EditorWindow(Adw.ApplicationWindow):
         )
 
     def _on_clip_select(self, kind: str, index: int) -> None:
+        if not self._guard_edit("select_rebind"):
+            return
         if kind == "video" and 0 <= index < len(self.video_clips):
             self.sel_v = index
             self.sel_kind = "video"
@@ -3080,6 +3226,8 @@ class EditorWindow(Adw.ApplicationWindow):
         self._sync_transform_controls()
 
     def _place_clip(self, kind: str, t: float, media_id: str = "", track: int = 1) -> None:
+        if not self._guard_edit("media_place"):
+            return
         t = max(0.0, float(t))
         track = max(1, min(2, int(track)))
         if kind == "video":
@@ -3152,6 +3300,8 @@ class EditorWindow(Adw.ApplicationWindow):
     def _delete_selected_clip(self) -> bool:
         if self.exporting:
             return False
+        if not self._guard_edit("delete"):
+            return True
         kind = self._selected_clip_kind()
         if kind == "video":
             idx = self.sel_v
@@ -3232,6 +3382,8 @@ class EditorWindow(Adw.ApplicationWindow):
     def _split_selected_clip(self) -> bool:
         if self.exporting:
             return False
+        if not self._guard_edit("split"):
+            return True
         kind = self._selected_clip_kind()
         t = self._timeline_now()
         if kind == "video":
@@ -3292,20 +3444,28 @@ class EditorWindow(Adw.ApplicationWindow):
         if self._syncing_scrub:
             return
         end = self._program_end()
+        value = min(max(0.0, float(value)), end)
         self.clock.set_text(f"{value:.2f} / {end:.2f}")
         if self._compiled_mode:
+            # Compiled A/V come from one MediaFile; keep edit ffplay/mpv silent.
+            self._stop_preview_audio()
             if self._vmedia is not None:
                 self.preview.set_blank(False)
                 self.preview.set_media(self._vmedia)
+                self._vmedia.set_muted(False)
+                self._vmedia.set_volume(1.0)
                 try:
-                    self._vmedia.seek(int(max(0.0, value) * 1_000_000))
+                    self._vmedia.seek(int(value * 1_000_000))
                 except GLib.Error:
                     pass
                 if self.playing:
                     self._vmedia.play()
+                else:
+                    self._vmedia.pause()
             if self.playing:
                 self._play_t0 = value
                 self._play_mono = time.monotonic()
+            self.timeline.set_playhead(value)
             return
         self._apply_timeline_frame(value, start_media=self.playing)
         if not self.playing:
@@ -3529,6 +3689,10 @@ class EditorWindow(Adw.ApplicationWindow):
             self.preview.queue_draw()
 
     def _start_preview_audio(self, timeline_t: float) -> None:
+        if self._compiled_mode:
+            # Compiled preview uses MediaFile audio only.
+            self._stop_preview_audio()
+            return
         self._stop_preview_audio()
         begins = self._audio_begins_at()
         specs = self._preview_audio_specs(timeline_t)
@@ -3705,19 +3869,45 @@ class EditorWindow(Adw.ApplicationWindow):
             self._seek_audio_src = 0
         if self._vmedia is not None:
             self._vmedia.pause()
-        t = self.timeline.playhead
-        clip = self._video_at(t)
-        if clip is None or self._vmedia is None:
-            self.preview.set_blank(True)
+        if self._compiled_mode:
+            if self._vmedia is not None:
+                self.preview.set_blank(False)
+                self.preview.set_media(self._vmedia)
+                self.preview.queue_draw()
         else:
-            # Keep the paused MediaFile on screen. Clearing it falls back
-            # to the opening still (first frame).
-            self.preview.set_blank(False)
-            self.preview.set_media(self._vmedia)
-            self.preview.queue_draw()
+            t = self.timeline.playhead
+            clip = self._video_at(t)
+            if clip is None or self._vmedia is None:
+                self.preview.set_blank(True)
+            else:
+                # Keep the paused MediaFile on screen. Clearing it falls back
+                # to the opening still (first frame).
+                self.preview.set_blank(False)
+                self.preview.set_media(self._vmedia)
+                self.preview.queue_draw()
         if self._tick is not None:
             GLib.source_remove(self._tick)
             self._tick = None
+
+    def _compiled_media_timestamp_us(self) -> int | None:
+        m = self._vmedia
+        if m is None or not m.is_prepared():
+            return None
+        ts = m.get_timestamp()
+        if ts < 0:
+            return None
+        return int(ts)
+
+    def _compiled_timeline_t(self) -> float:
+        return compiled_playhead_seconds(
+            playing=self.playing,
+            duration=self._compiled_duration,
+            media_timestamp_us=self._compiled_media_timestamp_us(),
+            play_t0=self._play_t0,
+            play_mono=self._play_mono,
+            now_mono=time.monotonic(),
+            paused_playhead=self.timeline.playhead,
+        )
 
     def _on_play(self, *_args: object) -> None:
         if self._busy_rendering():
@@ -3734,7 +3924,9 @@ class EditorWindow(Adw.ApplicationWindow):
                 t = 0.0
             self._play_t0 = t
             self._play_mono = time.monotonic()
+            # Never mix edit-preview ffplay/mpv with compiled MediaFile audio.
             self._stop_preview_audio()
+            self._audio_pending = False
             self.preview.set_blank(False)
             self.preview.set_media(self._vmedia)
             m = self._vmedia
@@ -3746,7 +3938,12 @@ class EditorWindow(Adw.ApplicationWindow):
                 pass
             m.play()
             self.playing = True
+            self._clip_playing = True
             self.btn_play.set_label("Pause")
+            self._syncing_scrub = True
+            self.timeline.set_playhead(t)
+            self._syncing_scrub = False
+            self.clock.set_text(f"{t:.2f} / {end:.2f}")
             self._tick = GLib.timeout_add(50, self._on_tick)
             return
         if not self.video_path and not self.audio_path:
@@ -3785,19 +3982,28 @@ class EditorWindow(Adw.ApplicationWindow):
         self._tick = GLib.timeout_add(50, self._on_tick)
 
     def _on_tick(self) -> bool:
+        if self._compiled_mode:
+            t = self._compiled_timeline_t()
+            end = self._program_end()
+            self._syncing_scrub = True
+            self.timeline.set_playhead(t)
+            self._syncing_scrub = False
+            self.clock.set_text(f"{t:.2f} / {end:.2f}")
+            if self._vmedia is not None:
+                self.preview.queue_draw()
+            if t >= end - 0.02:
+                self._stop()
+                self._syncing_scrub = True
+                self.timeline.set_playhead(end)
+                self._syncing_scrub = False
+                return False
+            return True
         t = self._timeline_now()
         end = self._program_end()
         self._syncing_scrub = True
         self.timeline.set_playhead(t)
         self._syncing_scrub = False
         self.clock.set_text(f"{t:.2f} / {end:.2f}")
-        if self._compiled_mode:
-            if self._vmedia is not None:
-                self.preview.queue_draw()
-            if t >= end - 0.02:
-                self._stop()
-                return False
-            return True
         vdur = float((self.video_info or {}).get("duration") or 0)
         vclip = self._video_at(t)
         prev_v = getattr(self, "_video_play_clip", None)
@@ -3875,6 +4081,7 @@ class EditorWindow(Adw.ApplicationWindow):
 
     def _sync_compiled_preview_controls(self) -> None:
         busy = self._busy_rendering()
+        locked = self._editing_locked()
         has_video = bool(self.video_clips) and bool(self.video_path)
         can_cut = False
         if has_video and self.sel_kind == "video" and 0 <= self.sel_v < len(self.video_clips):
@@ -3882,13 +4089,31 @@ class EditorWindow(Adw.ApplicationWindow):
                 self.video_clips, self.sel_v, self._src_durs()
             )
         if hasattr(self, "btn_preview_cut"):
-            self.btn_preview_cut.set_sensitive(has_video and can_cut and not busy)
-            self.btn_preview_full.set_sensitive(has_video and not busy)
+            self.btn_preview_cut.set_sensitive(
+                has_video and can_cut and not busy and not locked
+            )
+            self.btn_preview_full.set_sensitive(has_video and not busy and not locked)
             self.btn_preview_cancel.set_sensitive(self._preview_rendering)
             self.btn_back_edit_preview.set_sensitive(
                 self._compiled_mode and not self._preview_rendering
             )
             self.btn_export.set_sensitive(has_video and not busy)
+        if hasattr(self, "btn_open_video"):
+            self.btn_open_video.set_sensitive(not locked and not busy)
+            self.btn_open_audio.set_sensitive(not locked and not busy)
+        if hasattr(self, "btn_clear_audio"):
+            self.btn_clear_audio.set_sensitive(bool(self.audio_path) and not locked)
+        if hasattr(self, "btn_fit"):
+            self.btn_fit.set_sensitive(bool(self.audio_path) and not locked)
+        if hasattr(self, "follow_in"):
+            self.follow_in.set_sensitive(not locked)
+        if hasattr(self, "in_spin"):
+            self.in_spin.set_sensitive(not locked)
+            self.out_spin.set_sensitive(not locked)
+        if hasattr(self, "aspect_buttons"):
+            for btn in self.aspect_buttons.values():
+                btn.set_sensitive(not locked)
+        self._update_history_actions()
         self._update_compiled_preview_label()
 
     def _update_compiled_preview_label(self) -> None:
@@ -3901,14 +4126,11 @@ class EditorWindow(Adw.ApplicationWindow):
             self.compiled_preview_label.set_text("")
             return
         kind = "cut" if self._compiled_kind == "cut" else "full timeline"
-        if self._compiled_stale:
-            self.compiled_preview_label.set_text(
-                f"Compiled preview ({kind}) — STALE (edit changed)"
-            )
-        else:
-            self.compiled_preview_label.set_text(f"Compiled preview ({kind})")
+        self.compiled_preview_label.set_text(
+            f"Rendered preview — editing locked ({kind})"
+        )
 
-    def _mark_compiled_stale_if_needed(self) -> None:
+    def _invalidate_compiled_preview_if_stale(self) -> None:
         if not self._compiled_mode or self._compiled_hash is None:
             return
         window = None
@@ -3917,20 +4139,31 @@ class EditorWindow(Adw.ApplicationWindow):
         current = self._current_render_fingerprint(
             kind=self._compiled_kind or "full", window=window
         )
-        if current != self._compiled_hash and not self._compiled_stale:
-            self._compiled_stale = True
-            self._update_compiled_preview_label()
+        if current != self._compiled_hash:
+            self._exit_compiled_preview(
+                status="Rendered preview ended — project changed"
+            )
+
+    def _mark_compiled_stale_if_needed(self) -> None:
+        # Kept for callers; unexpected edits exit rather than leave a stale preview.
+        self._invalidate_compiled_preview_if_stale()
 
     def _on_cancel_preview_render(self, *_args: object) -> None:
         if self._preview_rendering:
             self._preview_cancel.set()
             self._set_status("Cancelling preview render…")
 
+    def _abandon_preview_render(self) -> None:
+        """Cancel preview work and make any queued completion callback stale."""
+        if self._preview_rendering:
+            self._preview_cancel.set()
+        self._preview_generation += 1
+        self._preview_rendering = False
+
     def _on_back_edit_preview(self, *_args: object) -> None:
         self._exit_compiled_preview()
 
-    def _exit_compiled_preview(self) -> None:
-        self._stop()
+    def _reset_compiled_preview_flags(self) -> None:
         self._compiled_mode = False
         self._compiled_stale = False
         self._compiled_path = None
@@ -3938,7 +4171,22 @@ class EditorWindow(Adw.ApplicationWindow):
         self._compiled_kind = ""
         self._compiled_duration = 0.0
         self._compiled_window = None
+        self._edit_vmedia_path = None
+        if hasattr(self, "timeline"):
+            self.timeline.set_read_only(False)
+        if hasattr(self, "preview"):
+            self.preview.read_only = False
+            self.preview.set_cursor_from_name("grab")
+
+    def _exit_compiled_preview(self, *, status: str = "Back to edit") -> None:
+        was = self._compiled_mode
+        playhead = self.timeline.playhead if was else 0.0
         restore = self._edit_vmedia_path
+        self._stop()
+        self._reset_compiled_preview_flags()
+        if not was:
+            self._sync_compiled_preview_controls()
+            return
         if restore is not None and restore.is_file():
             self._load_media(restore)
             self.preview.set_blank(False)
@@ -3950,14 +4198,23 @@ class EditorWindow(Adw.ApplicationWindow):
                 if item is not None:
                     self._bind_video(item.id)
         self._sync_timeline_clips()
-        self._apply_timeline_frame(self.timeline.playhead, start_media=False)
+        end = self._program_end()
+        t = min(max(0.0, playhead), end)
+        self._syncing_scrub = True
+        self.timeline.set_playhead(t)
+        self._syncing_scrub = False
+        self.clock.set_text(f"{t:.2f} / {end:.2f}")
+        self._apply_timeline_frame(t, start_media=False)
+        self._sync_transform_controls()
+        self._sync_transition_controls()
         self._sync_compiled_preview_controls()
-        self._set_status("Back to edit preview")
+        self._set_status(status)
 
     def _enter_compiled_preview(
         self, path: Path, *, kind: str, fingerprint: str, duration: float,
         window: tuple[float, float] | None = None,
     ) -> None:
+        # Stop edit-preview audio/video before compiled MediaFile playback.
         self._stop()
         if not self._compiled_mode:
             self._edit_vmedia_path = self._vmedia_path
@@ -3968,7 +4225,14 @@ class EditorWindow(Adw.ApplicationWindow):
         self._compiled_kind = kind
         self._compiled_duration = max(0.05, float(duration))
         self._compiled_window = window
+        self.timeline.set_read_only(True)
+        self.preview.read_only = True
+        self.preview.set_cursor_from_name("default")
         self._load_media(path)
+        if self._vmedia is not None:
+            self._vmedia.set_muted(False)
+            self._vmedia.set_volume(1.0)
+            self._vmedia.pause()
         self.preview.set_blank(False)
         self.preview.set_media(self._vmedia)
         self.preview.set_transform(0.0, 0.0, 1.0, *dest_size(self.aspect))
@@ -3976,8 +4240,10 @@ class EditorWindow(Adw.ApplicationWindow):
         self.timeline.set_playhead(0.0)
         self.timeline.set_range(0.0, self._compiled_duration)
         self.clock.set_text(f"0.00 / {self._compiled_duration:.2f}")
+        self._sync_transform_controls()
+        self._sync_transition_controls()
         self._sync_compiled_preview_controls()
-        self._set_status(f"Compiled preview ready ({kind})")
+        self._set_status("Rendered preview — editing locked")
 
     def _on_compiled_preview(self, kind: str) -> None:
         if self._busy_rendering() or not self.video_path or not self.video_clips:
@@ -4029,6 +4295,8 @@ class EditorWindow(Adw.ApplicationWindow):
         self._stop()
         self._preview_rendering = True
         self._preview_cancel = threading.Event()
+        self._preview_generation += 1
+        generation = self._preview_generation
         self.progress.set_fraction(0)
         self._set_status(
             "Rendering cut preview…" if kind == "cut" else "Rendering full preview…"
@@ -4084,10 +4352,17 @@ class EditorWindow(Adw.ApplicationWindow):
                     kind,
                     fingerprint,
                     window,
+                    generation,
                 )
             except (ExportCancelled, ExportError, ProbeError, OSError) as exc:
                 GLib.idle_add(
-                    self._compiled_preview_done, None, exc, kind, fingerprint, window
+                    self._compiled_preview_done,
+                    None,
+                    exc,
+                    kind,
+                    fingerprint,
+                    window,
+                    generation,
                 )
 
         threading.Thread(target=work, daemon=True).start()
@@ -4099,7 +4374,10 @@ class EditorWindow(Adw.ApplicationWindow):
         kind: str,
         fingerprint: str,
         window: tuple[float, float] | None,
+        generation: int,
     ) -> bool:
+        if generation != self._preview_generation:
+            return False
         self._preview_rendering = False
         self._sync_compiled_preview_controls()
         if err is not None:
