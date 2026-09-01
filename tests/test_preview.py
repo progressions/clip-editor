@@ -4,6 +4,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from clip_editor.export import ExportCancelled, build_cmd, run_export
@@ -488,6 +489,27 @@ class TimelineReadOnlyTest(unittest.TestCase):
         tl._on_drag_begin(_G(), 0.0, 0.0)
         self.assertEqual(tl._drag_mode, "seek")
         self.assertTrue(sought)
+
+    def test_abandon_preview_cancels_and_invalidates_completion(self) -> None:
+        from clip_editor.ui import EditorWindow
+
+        cancel = threading.Event()
+        state = SimpleNamespace(
+            _preview_rendering=True,
+            _preview_cancel=cancel,
+            _preview_generation=4,
+        )
+        EditorWindow._abandon_preview_render(state)
+        self.assertTrue(cancel.is_set())
+        self.assertFalse(state._preview_rendering)
+        self.assertEqual(state._preview_generation, 5)
+
+        # A queued callback from the abandoned generation must have no effect.
+        self.assertFalse(
+            EditorWindow._compiled_preview_done(
+                state, None, RuntimeError("stale"), "full", "hash", None, 4
+            )
+        )
 
 
 if __name__ == "__main__":

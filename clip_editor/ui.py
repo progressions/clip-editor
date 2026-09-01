@@ -1470,6 +1470,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.exporting = False
         self._preview_rendering = False
         self._preview_cancel = threading.Event()
+        self._preview_generation = 0
         self._compiled_mode = False
         self._compiled_stale = False
         self._compiled_path: Path | None = None
@@ -2087,6 +2088,7 @@ class EditorWindow(Adw.ApplicationWindow):
     def _apply_project(self, proj: Project) -> None:
         was_loading = self._loading
         self._loading = True
+        self._abandon_preview_render()
         if self._compiled_mode:
             self._reset_compiled_preview_flags()
         self._stop()
@@ -2194,6 +2196,7 @@ class EditorWindow(Adw.ApplicationWindow):
         return store
 
     def _clear_session(self) -> None:
+        self._abandon_preview_render()
         self._stop()
         self._reset_compiled_preview_flags()
         self.media = []
@@ -2493,8 +2496,7 @@ class EditorWindow(Adw.ApplicationWindow):
         return Gdk.DragAction.COPY
 
     def _on_close(self, *_args: object) -> bool:
-        if self._preview_rendering:
-            self._preview_cancel.set()
+        self._abandon_preview_render()
         self._stop()
         self._reset_compiled_preview_flags()
         if self._ckpt_src:
@@ -4151,6 +4153,13 @@ class EditorWindow(Adw.ApplicationWindow):
             self._preview_cancel.set()
             self._set_status("Cancelling preview render…")
 
+    def _abandon_preview_render(self) -> None:
+        """Cancel preview work and make any queued completion callback stale."""
+        if self._preview_rendering:
+            self._preview_cancel.set()
+        self._preview_generation += 1
+        self._preview_rendering = False
+
     def _on_back_edit_preview(self, *_args: object) -> None:
         self._exit_compiled_preview()
 
@@ -4286,6 +4295,8 @@ class EditorWindow(Adw.ApplicationWindow):
         self._stop()
         self._preview_rendering = True
         self._preview_cancel = threading.Event()
+        self._preview_generation += 1
+        generation = self._preview_generation
         self.progress.set_fraction(0)
         self._set_status(
             "Rendering cut preview…" if kind == "cut" else "Rendering full preview…"
@@ -4341,10 +4352,17 @@ class EditorWindow(Adw.ApplicationWindow):
                     kind,
                     fingerprint,
                     window,
+                    generation,
                 )
             except (ExportCancelled, ExportError, ProbeError, OSError) as exc:
                 GLib.idle_add(
-                    self._compiled_preview_done, None, exc, kind, fingerprint, window
+                    self._compiled_preview_done,
+                    None,
+                    exc,
+                    kind,
+                    fingerprint,
+                    window,
+                    generation,
                 )
 
         threading.Thread(target=work, daemon=True).start()
@@ -4356,7 +4374,10 @@ class EditorWindow(Adw.ApplicationWindow):
         kind: str,
         fingerprint: str,
         window: tuple[float, float] | None,
+        generation: int,
     ) -> bool:
+        if generation != self._preview_generation:
+            return False
         self._preview_rendering = False
         self._sync_compiled_preview_controls()
         if err is not None:
