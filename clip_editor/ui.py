@@ -1825,51 +1825,30 @@ class EditorWindow(Adw.ApplicationWindow):
         right.append(transition_dur)
         self.transition_hint = self._wrapping_label("")
         right.append(self.transition_hint)
-        right.append(self._section("Timeline cache"))
+        right.append(self._section("Preview render"))
         self.cache_hint = self._wrapping_label(
-            "Red = unbaked, green = baked. Render, then press Play — you stay on the timeline."
+            "Bar above the lanes: red = not rendered, green = rendered. "
+            "Play always uses the same timeline."
         )
         self.cache_hint.add_css_class("dim-label")
         right.append(self.cache_hint)
         cache_row = Gtk.Box(spacing=8)
-        self.btn_render_dirty = Gtk.Button(label="Render dirty")
+        self.btn_render_dirty = Gtk.Button(label="Render")
         self.btn_render_dirty.add_css_class("suggested-action")
         self.btn_render_dirty.set_tooltip_text(
-            "Bake red ranges. Play uses the regular Play button; editing stays unlocked."
+            "Render the red ranges. Then press Play — same timeline, no mode switch."
         )
         self.btn_render_dirty.connect("clicked", lambda *_: self._on_render_cache(all_segs=False))
         cache_row.append(self.btn_render_dirty)
         self.btn_render_all = Gtk.Button(label="Render all")
-        self.btn_render_all.set_tooltip_text("Re-bake every range on the cache bar")
+        self.btn_render_all.set_tooltip_text("Re-render every range, even if already green")
         self.btn_render_all.connect("clicked", lambda *_: self._on_render_cache(all_segs=True))
         cache_row.append(self.btn_render_all)
         right.append(cache_row)
-        self.btn_preview_cancel = Gtk.Button(label="Cancel cache render")
+        self.btn_preview_cancel = Gtk.Button(label="Cancel render")
         self.btn_preview_cancel.set_sensitive(False)
         self.btn_preview_cancel.connect("clicked", self._on_cancel_preview_render)
         right.append(self.btn_preview_cancel)
-
-        right.append(self._section("QC (locks editing)"))
-        qc_row = Gtk.Box(spacing=8)
-        self.btn_preview_cut = Gtk.Button(label="Locked cut")
-        self.btn_preview_cut.set_tooltip_text(
-            "One-shot QC of the selected cut. Locks the timeline until Back to edit."
-        )
-        self.btn_preview_cut.connect("clicked", lambda *_: self._on_compiled_preview("cut"))
-        qc_row.append(self.btn_preview_cut)
-        self.btn_preview_full = Gtk.Button(label="Locked full")
-        self.btn_preview_full.set_tooltip_text(
-            "One-shot QC of the whole timeline. Locks editing until Back to edit."
-        )
-        self.btn_preview_full.connect(
-            "clicked", lambda *_: self._on_compiled_preview("full")
-        )
-        qc_row.append(self.btn_preview_full)
-        right.append(qc_row)
-        self.btn_back_edit_preview = Gtk.Button(label="Back to edit")
-        self.btn_back_edit_preview.set_sensitive(False)
-        self.btn_back_edit_preview.connect("clicked", self._on_back_edit_preview)
-        right.append(self.btn_back_edit_preview)
         self.compiled_preview_label = self._wrapping_label("")
         self.compiled_preview_label.add_css_class("dim-label")
         right.append(self.compiled_preview_label)
@@ -4745,19 +4724,22 @@ class EditorWindow(Adw.ApplicationWindow):
                 has_video and can_cut and not busy and not locked
             )
             self.btn_preview_full.set_sensitive(has_video and not busy and not locked)
-            if hasattr(self, "btn_render_dirty"):
-                n_dirty = len(dirty_segments(self._cache_segments))
-                n_all = len(self._cache_segments)
-                self.btn_render_dirty.set_sensitive(
-                    has_video and n_dirty > 0 and not busy and not locked
-                )
-                self.btn_render_all.set_sensitive(
-                    has_video and n_all > 0 and not busy and not locked
-                )
+        if hasattr(self, "btn_render_dirty"):
+            n_dirty = len(dirty_segments(self._cache_segments))
+            n_all = len(self._cache_segments)
+            self.btn_render_dirty.set_sensitive(
+                has_video and n_dirty > 0 and not busy and not locked
+            )
+            self.btn_render_all.set_sensitive(
+                has_video and n_all > 0 and not busy and not locked
+            )
+        if hasattr(self, "btn_preview_cancel"):
             self.btn_preview_cancel.set_sensitive(self._preview_rendering)
+        if hasattr(self, "btn_back_edit_preview"):
             self.btn_back_edit_preview.set_sensitive(
                 self._compiled_mode and not self._preview_rendering
             )
+        if hasattr(self, "btn_export"):
             self.btn_export.set_sensitive(has_video and not busy)
         if hasattr(self, "btn_open_video"):
             self.btn_open_video.set_sensitive(not locked and not busy)
@@ -4784,7 +4766,7 @@ class EditorWindow(Adw.ApplicationWindow):
         if not hasattr(self, "compiled_preview_label"):
             return
         if self._preview_rendering:
-            self.compiled_preview_label.set_text("Rendering compiled preview…")
+            self.compiled_preview_label.set_text("Rendering preview…")
             return
         if not self._compiled_mode:
             self.compiled_preview_label.set_text("")
