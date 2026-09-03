@@ -74,6 +74,12 @@ from clip_editor.selection import (
     prune_video_selection,
 )
 
+def application_id() -> str:
+    """GApplication id. Override with CLIP_EDITOR_APP_ID to run beside production."""
+    raw = os.environ.get("CLIP_EDITOR_APP_ID", "").strip()
+    return raw or "local.clip.Editor"
+
+
 APP_ID = "local.clip.Editor"
 HISTORY_LIMIT = 80
 JOIN_EPS = 0.04
@@ -1649,7 +1655,6 @@ class MediaCard(Gtk.Box):
 class EditorWindow(Adw.ApplicationWindow):
     def __init__(self, **kwargs: object) -> None:
         super().__init__(**kwargs)
-        self.set_title("Clip editor")
         self.set_default_size(1100, 760)
 
         self.video_path: Path | None = None
@@ -1678,6 +1683,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self._clip_playing = False
         self._audio_pending = False
         self.project_path: Path | None = None
+        self.set_title(self._title_text())
         self._loading = False
         self._autosave_src: int = 0
         self.exporting = False
@@ -1819,39 +1825,49 @@ class EditorWindow(Adw.ApplicationWindow):
         right.append(transition_dur)
         self.transition_hint = self._wrapping_label("")
         right.append(self.transition_hint)
-        preview_row = Gtk.Box(spacing=8)
-        self.btn_preview_cut = Gtk.Button(label="Preview transition")
+        right.append(self._section("Timeline cache"))
+        self.cache_hint = self._wrapping_label(
+            "Red = unbaked, green = baked. Render, then press Play — you stay on the timeline."
+        )
+        self.cache_hint.add_css_class("dim-label")
+        right.append(self.cache_hint)
+        cache_row = Gtk.Box(spacing=8)
+        self.btn_render_dirty = Gtk.Button(label="Render dirty")
+        self.btn_render_dirty.add_css_class("suggested-action")
+        self.btn_render_dirty.set_tooltip_text(
+            "Bake red ranges. Play uses the regular Play button; editing stays unlocked."
+        )
+        self.btn_render_dirty.connect("clicked", lambda *_: self._on_render_cache(all_segs=False))
+        cache_row.append(self.btn_render_dirty)
+        self.btn_render_all = Gtk.Button(label="Render all")
+        self.btn_render_all.set_tooltip_text("Re-bake every range on the cache bar")
+        self.btn_render_all.connect("clicked", lambda *_: self._on_render_cache(all_segs=True))
+        cache_row.append(self.btn_render_all)
+        right.append(cache_row)
+        self.btn_preview_cancel = Gtk.Button(label="Cancel cache render")
+        self.btn_preview_cancel.set_sensitive(False)
+        self.btn_preview_cancel.connect("clicked", self._on_cancel_preview_render)
+        right.append(self.btn_preview_cancel)
+
+        right.append(self._section("QC (locks editing)"))
+        qc_row = Gtk.Box(spacing=8)
+        self.btn_preview_cut = Gtk.Button(label="Locked cut")
         self.btn_preview_cut.set_tooltip_text(
-            "Render a proxy around the selected cut and play it"
+            "One-shot QC of the selected cut. Locks the timeline until Back to edit."
         )
         self.btn_preview_cut.connect("clicked", lambda *_: self._on_compiled_preview("cut"))
-        preview_row.append(self.btn_preview_cut)
-        self.btn_preview_full = Gtk.Button(label="Render full preview")
+        qc_row.append(self.btn_preview_cut)
+        self.btn_preview_full = Gtk.Button(label="Locked full")
         self.btn_preview_full.set_tooltip_text(
-            "Render a proxy of the whole timeline and play it"
+            "One-shot QC of the whole timeline. Locks editing until Back to edit."
         )
         self.btn_preview_full.connect(
             "clicked", lambda *_: self._on_compiled_preview("full")
         )
-        preview_row.append(self.btn_preview_full)
-        self.btn_render_dirty = Gtk.Button(label="Render dirty")
-        self.btn_render_dirty.set_tooltip_text(
-            "Bake red timeline ranges into the proxy cache (stay in edit mode)"
-        )
-        self.btn_render_dirty.connect("clicked", lambda *_: self._on_render_cache(all_segs=False))
-        preview_row.append(self.btn_render_dirty)
-        self.btn_render_all = Gtk.Button(label="Render all")
-        self.btn_render_all.set_tooltip_text("Re-bake every timeline cache segment")
-        self.btn_render_all.connect("clicked", lambda *_: self._on_render_cache(all_segs=True))
-        preview_row.append(self.btn_render_all)
-        right.append(preview_row)
-        self.btn_preview_cancel = Gtk.Button(label="Cancel preview render")
-        self.btn_preview_cancel.set_sensitive(False)
-        self.btn_preview_cancel.connect("clicked", self._on_cancel_preview_render)
-        right.append(self.btn_preview_cancel)
+        qc_row.append(self.btn_preview_full)
+        right.append(qc_row)
         self.btn_back_edit_preview = Gtk.Button(label="Back to edit")
         self.btn_back_edit_preview.set_sensitive(False)
-        self.btn_back_edit_preview.add_css_class("suggested-action")
         self.btn_back_edit_preview.connect("clicked", self._on_back_edit_preview)
         right.append(self.btn_back_edit_preview)
         self.compiled_preview_label = self._wrapping_label("")
@@ -2281,11 +2297,19 @@ class EditorWindow(Adw.ApplicationWindow):
             path=self.project_path,
         )
 
+    def _title_text(self, project_name: str | None = None) -> str:
+        base = "Clip editor"
+        if application_id() != "local.clip.Editor":
+            base = "Clip editor (dev)"
+        name = project_name
+        if name is None and self.project_path:
+            name = self.project_path.name
+        if name:
+            return f"{base} — {name}"
+        return base
+
     def _update_title(self) -> None:
-        if self.project_path:
-            self.set_title(f"Clip editor — {self.project_path.name}")
-        else:
-            self.set_title("Clip editor")
+        self.set_title(self._title_text())
 
     def _schedule_autosave(self) -> None:
         if self._loading:
@@ -4924,7 +4948,11 @@ class EditorWindow(Adw.ApplicationWindow):
                 self._set_status("Cache render cancelled")
             else:
                 n = self._cache_render_total
-                self._set_status(f"Cache ready — {n} segment(s) baked")
+                self._set_status(
+                    f"Cache ready — {n} segment(s) green. Press Play on the timeline."
+                )
+                t = self.timeline.playhead
+                self._apply_timeline_frame(t, start_media=False)
             self.progress.set_fraction(1 if not self._preview_cancel.is_set() else 0)
             return
         seg = self._cache_render_queue.pop(0)
@@ -5258,7 +5286,7 @@ class EditorWindow(Adw.ApplicationWindow):
 class EditorApp(Adw.Application):
     def __init__(self) -> None:
         super().__init__(
-            application_id=APP_ID,
+            application_id=application_id(),
             flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE,
         )
         self.connect("activate", self._activate)
