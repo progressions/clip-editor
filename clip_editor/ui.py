@@ -59,6 +59,11 @@ from clip_editor.project import (
     write_autosave,
     write_project,
 )
+from clip_editor.selection import (
+    group_moved_starts,
+    next_video_selection,
+    prune_video_selection,
+)
 
 APP_ID = "local.clip.Editor"
 HISTORY_LIMIT = 80
@@ -329,6 +334,7 @@ class Timeline(Gtk.DrawingArea):
         self.clip_names: dict[str, str] = {}
         self.sel_v = -1
         self.sel_a = -1
+        self.sel_vs: set[int] = set()
         self.playhead = 0.0
         self.read_only = False
         self.on_seek = None
@@ -345,6 +351,7 @@ class Timeline(Gtk.DrawingArea):
         self._drag_y0 = 0.0
         self._drag_span = 0.0
         self._drag_inner = 1.0
+        self._drag_group_starts: dict[int, float] = {}
         self._snap_line: float | None = None
         self._drop_hover: tuple[str, float, int] | None = None
         self.set_hexpand(False)
@@ -358,8 +365,9 @@ class Timeline(Gtk.DrawingArea):
         self.set_cursor_from_name("col-resize")
         self.set_tooltip_text(
             "Drag a clip to slide it. Drag either edge to trim. "
+            "Shift+click adds a clip to the selection; drag moves the group. "
             "Drag the ruler or playhead to seek. T splits at the playhead. "
-            "Del removes the selected clip (A-track too)."
+            "Del removes the selected clip (A-track too). Esc clears multi-select."
         )
         click = Gtk.GestureClick()
         click.connect("pressed", self._on_pressed)
@@ -423,6 +431,7 @@ class Timeline(Gtk.DrawingArea):
         aclips: list[ClipInst] | None = None,
         sel_v: int = 0,
         sel_a: int = 0,
+        sel_vs: set[int] | None = None,
         src_durs: dict[str, float] | None = None,
         clip_names: dict[str, str] | None = None,
     ) -> None:
@@ -450,7 +459,11 @@ class Timeline(Gtk.DrawingArea):
             ]
         else:
             self.aclips = []
-        self.sel_v = sel_v if self.vclips else -1
+        if self.vclips:
+            seed = set(sel_vs) if sel_vs is not None else ({sel_v} if sel_v >= 0 else set())
+            self.sel_v, self.sel_vs = prune_video_selection(seed, sel_v, len(self.vclips))
+        else:
+            self.sel_v, self.sel_vs = -1, set()
         self.sel_a = sel_a if self.aclips else -1
         self._mirror_sel()
         self._recompute_span()
@@ -707,20 +720,51 @@ class Timeline(Gtk.DrawingArea):
         if callable(self.on_seek):
             self.on_seek(t)
 
-    def _select_hit(self, x: float, y: float) -> bool:
+    def _shift_held(self, gesture: Gtk.GestureClick) -> bool:
+        """True when Shift is down at click time.
+
+        Prefer the seat keyboard's live modifier state — under Hyprland/Wayland,
+        GestureClick's event state often omits Shift.
+        """
+        display = Gdk.Display.get_default()
+        if display is not None:
+            seat = display.get_default_seat()
+            keyboard = seat.get_keyboard() if seat is not None else None
+            if keyboard is not None:
+                mods = (
+                    keyboard.get_modifier_state()
+                    & Gtk.accelerator_get_default_mod_mask()
+                )
+                if mods & Gdk.ModifierType.SHIFT_MASK:
+                    return True
+        state = gesture.get_current_event_state()
+        mods = state & Gtk.accelerator_get_default_mod_mask()
+        return bool(mods & Gdk.ModifierType.SHIFT_MASK)
+
+    def _select_hit(self, x: float, y: float, *, shift: bool = False) -> bool:
         vi, _vp = self._hit_kind(x, y, "video")
         if vi >= 0:
-            self.sel_v = vi
+            self.sel_v, self.sel_vs = next_video_selection(
+                clicked=vi,
+                primary=self.sel_v,
+                selected=self.sel_vs,
+                shift=shift,
+                n_clips=len(self.vclips),
+            )
             self._mirror_sel()
             if callable(self.on_select):
-                self.on_select("video", vi)
+                self.on_select("video", self.sel_v, frozenset(self.sel_vs))
+            self.queue_draw()
             return True
         ai, _ap = self._hit_kind(x, y, "audio")
         if ai >= 0:
+            # Audio stays single-select for now; clear video multi-select.
+            self.sel_vs = set()
             self.sel_a = ai
             self._mirror_sel()
             if callable(self.on_select):
-                self.on_select("audio", ai)
+                self.on_select("audio", ai, frozenset())
+            self.queue_draw()
             return True
         return False
 
@@ -729,6 +773,7 @@ class Timeline(Gtk.DrawingArea):
         if locked:
             self._drag_mode = ""
             self._drag_index = -1
+            self._drag_group_starts = {}
             self._drop_hover = None
             self.set_cursor_from_name("col-resize")
             self.set_tooltip_text(
@@ -737,17 +782,27 @@ class Timeline(Gtk.DrawingArea):
         else:
             self.set_tooltip_text(
                 "Drag a clip to slide it. Drag either edge to trim. "
+                "Shift+click adds a clip to the selection; drag moves the group. "
                 "Drag the ruler or playhead to seek. T splits at the playhead. "
-                "Del removes the selected clip (A-track too)."
+                "Del removes the selected clip (A-track too). Esc clears multi-select."
             )
         self.queue_draw()
 
-    def _on_pressed(self, _g: Gtk.GestureClick, _n: int, x: float, y: float) -> None:
+    def _on_pressed(self, gesture: Gtk.GestureClick, _n: int, x: float, y: float) -> None:
         if self.read_only:
             self._seek_x(x)
             return
-        if self._select_hit(x, y):
+        shift = self._shift_held(gesture)
+        if self._select_hit(x, y, shift=shift):
             return
+        # Empty click: clear multi-select, then seek.
+        if self.sel_vs or self.sel_v >= 0:
+            self.sel_v = -1
+            self.sel_vs = set()
+            self._mirror_sel()
+            if callable(self.on_select):
+                self.on_select("video", -1, frozenset())
+            self.queue_draw()
         self._seek_x(x)
 
     def _on_motion(self, _c: Gtk.EventControllerMotion, x: float, y: float) -> None:
@@ -756,7 +811,7 @@ class Timeline(Gtk.DrawingArea):
             return
         if self._drag_mode in ("video-in", "video-out", "audio-in", "audio-out"):
             self.set_cursor_from_name("ew-resize")
-        elif self._drag_mode in ("video", "audio"):
+        elif self._drag_mode in ("video", "video-group", "audio"):
             self.set_cursor_from_name("grabbing")
         elif self._hit_video_edge(x, y) or self._hit_audio_edge(x, y):
             self.set_cursor_from_name("ew-resize")
@@ -773,6 +828,7 @@ class Timeline(Gtk.DrawingArea):
         self._drag_inner = inner
         self._drag_span = max(self._map_span(), 0.01)
         self._drag_y0 = oy
+        self._drag_group_starts = {}
         if self.read_only:
             self._drag_mode = "seek"
             self._drag_index = -1
@@ -783,12 +839,17 @@ class Timeline(Gtk.DrawingArea):
         if self.audio_kind != "source":
             ai, ap = self._hit_kind(ox, oy, "audio")
         if vp in ("in", "out", "body"):
-            self.sel_v = vi
+            # Keep multi-select when dragging an already-selected clip.
+            if vi not in self.sel_vs:
+                self.sel_v = vi
+                self.sel_vs = {vi}
+            else:
+                self.sel_v = vi
             self._drag_index = vi
             c = self.vclips[vi]
             self._mirror_sel()
             if callable(self.on_select):
-                self.on_select("video", vi)
+                self.on_select("video", self.sel_v, frozenset(self.sel_vs))
             if vp == "in":
                 self._drag_mode = "video-in"
                 self._drag_v0 = c.in_s
@@ -798,16 +859,26 @@ class Timeline(Gtk.DrawingArea):
                 self._drag_v0 = c.out_s
                 self.set_cursor_from_name("ew-resize")
             else:
-                self._drag_mode = "video"
-                self._drag_v0 = c.start
+                if len(self.sel_vs) > 1 and vi in self.sel_vs:
+                    self._drag_mode = "video-group"
+                    self._drag_group_starts = {
+                        i: float(self.vclips[i].start)
+                        for i in self.sel_vs
+                        if 0 <= i < len(self.vclips)
+                    }
+                    self._drag_v0 = c.start
+                else:
+                    self._drag_mode = "video"
+                    self._drag_v0 = c.start
                 self.set_cursor_from_name("grabbing")
         elif ap in ("in", "out", "body"):
             self.sel_a = ai
             self._drag_index = ai
             c = self.aclips[ai]
             self._mirror_sel()
+            self.sel_vs = set()
             if callable(self.on_select):
-                self.on_select("audio", ai)
+                self.on_select("audio", ai, frozenset())
             if ap == "in":
                 self._drag_mode = "audio-in"
                 self._drag_v0 = c.in_s
@@ -833,16 +904,18 @@ class Timeline(Gtk.DrawingArea):
         return max(0.04, self._SNAP_PX / inner * self._map_span())
 
     def _other_edges(self, which: str) -> list[float]:
-        skip = self._drag_index
+        skip = {self._drag_index}
+        if which == "video" and self._drag_mode == "video-group":
+            skip |= set(self._drag_group_starts)
         times: list[float] = []
         for i, c in enumerate(self.vclips):
-            if which == "video" and i == skip:
+            if which == "video" and i in skip:
                 continue
             t0, t1 = self._clip_times(c, self._clip_src_dur(c, "v"))
             times += [t0, t1]
         if self.audio_kind != "source":
             for i, c in enumerate(self.aclips):
-                if which == "audio" and i == skip:
+                if which == "audio" and i in skip:
                     continue
                 t0, t1 = self._clip_times(c, self._clip_src_dur(c, "a"))
                 times += [t0, t1]
@@ -953,6 +1026,30 @@ class Timeline(Gtk.DrawingArea):
                 self.on_audio_trim(self._drag_index, ain, c.out_s, False)
             self.queue_draw()
             return
+        if self._drag_mode == "video-group":
+            anchor = self._vclip()
+            if anchor is None or self._drag_index not in self._drag_group_starts:
+                return
+            inn, out = self._clip_used(anchor, self._clip_src_dur(anchor, "v"))
+            start = max(-inn, self._drag_v0 + dt)
+            start = self._snap_move(start, inn, out, self._other_edges("video"))
+            start = max(-inn, start)
+            moved = group_moved_starts(
+                self._drag_group_starts,
+                anchor=self._drag_index,
+                new_anchor_start=start,
+            )
+            for i, new_start in moved.items():
+                if not 0 <= i < len(self.vclips):
+                    continue
+                c = self.vclips[i]
+                used_in, _used_out = self._clip_used(c, self._clip_src_dur(c, "v"))
+                c.start = max(-used_in, float(new_start))
+                if callable(self.on_video_move):
+                    self.on_video_move(i, c.start, False)
+            self.video_start = self.vclips[self._drag_index].start
+            self.queue_draw()
+            return
         if self._drag_mode in ("video", "audio"):
             if self._drag_mode == "video":
                 c = self._vclip()
@@ -996,12 +1093,23 @@ class Timeline(Gtk.DrawingArea):
 
     def _on_drag_end(self, *_args: object) -> None:
         mode = self._drag_mode
+        group_starts = dict(self._drag_group_starts)
         self._drag_mode = ""
+        self._drag_group_starts = {}
         self._snap_line = None
         self._recompute_span()
         idx = self._drag_index
         self._drag_index = -1
-        if mode == "video":
+        if mode == "video-group":
+            self.set_cursor_from_name("grab")
+            if callable(self.on_video_move):
+                ordered = [i for i in sorted(group_starts) if self._vclip(i) is not None]
+                for n, i in enumerate(ordered):
+                    c = self._vclip(i)
+                    assert c is not None
+                    # One undo checkpoint for the whole group (done only on last).
+                    self.on_video_move(i, c.start, n == len(ordered) - 1)
+        elif mode == "video":
             self.set_cursor_from_name("grab")
             c = self._vclip(idx)
             if c is not None and callable(self.on_video_move):
@@ -1190,10 +1298,16 @@ class Timeline(Gtk.DrawingArea):
                 cr, x0, clip_lane_y + clip_y, max(3.0, x1 - x0), clip_h, sel, name
             )
             self._draw_handles(cr, x0, x1, clip_lane_y + clip_y, clip_h, fg)
-            if i == self.sel_v:
-                cr.set_source_rgb(*fg)
-                cr.set_line_width(1)
-                cr.rectangle(x0, clip_lane_y + clip_y, max(3.0, x1 - x0), clip_h)
+            if i in self.sel_vs or i == self.sel_v:
+                # Accent outline so multi-select stays obvious vs muted neighbors.
+                cr.set_source_rgb(*sel)
+                cr.set_line_width(3.0 if i == self.sel_v else 2.0)
+                cr.rectangle(
+                    x0 - 1.0,
+                    clip_lane_y + clip_y - 1.0,
+                    max(3.0, x1 - x0) + 2.0,
+                    clip_h + 2.0,
+                )
                 cr.stroke()
             if getattr(c, "transition", TRANSITION_NONE) not in ("", TRANSITION_NONE):
                 # Compact marker at the outgoing cut of a configured transition.
@@ -1469,6 +1583,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.audio_clips: list[ClipInst] = []
         self.sel_v = -1
         self.sel_a = -1
+        self.sel_vs: set[int] = set()
         self.sel_kind = ""
         self._clip_playing = False
         self._audio_pending = False
@@ -1845,6 +1960,16 @@ class EditorWindow(Adw.ApplicationWindow):
             return True
         if mods:
             return False
+        if keyval in (Gdk.KEY_Escape,):
+            if self.sel_vs or self.sel_v >= 0:
+                self.sel_v = -1
+                self.sel_vs = set()
+                self.sel_kind = ""
+                self._sync_timeline_clips()
+                self._sync_transition_controls()
+                self._set_status("Selection cleared")
+                return True
+            return False
         if keyval in (Gdk.KEY_Delete, Gdk.KEY_KP_Delete):
             if not self._guard_edit("delete"):
                 return True
@@ -2178,6 +2303,7 @@ class EditorWindow(Adw.ApplicationWindow):
                     )
                 ]
             self.sel_v = 0 if self.video_clips else -1
+            self.sel_vs = {0} if self.video_clips else set()
             self.sel_a = 0 if self.audio_clips else -1
             if self.video_clips:
                 self.sel_kind = "video"
@@ -2311,6 +2437,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.audio_clips = []
         self.sel_v = -1
         self.sel_a = -1
+        self.sel_vs: set[int] = set()
         self.sel_kind = ""
         self.btn_play.set_label("Play")
         self.progress.set_fraction(0)
@@ -2701,6 +2828,9 @@ class EditorWindow(Adw.ApplicationWindow):
             aname = ""
             adur = 0.0
             kind = ""
+        self.sel_v, self.sel_vs = prune_video_selection(
+            self.sel_vs, self.sel_v, len(self.video_clips)
+        )
         if 0 <= self.sel_v < len(self.video_clips):
             c = self.video_clips[self.sel_v]
             self.video_start = c.start
@@ -2727,6 +2857,7 @@ class EditorWindow(Adw.ApplicationWindow):
             aclips=self.audio_clips if kind == "replace" else source_aclips,
             sel_v=self.sel_v,
             sel_a=self.sel_a,
+            sel_vs=self.sel_vs,
             src_durs=self._src_durs(),
             clip_names=self._clip_names(),
         )
@@ -2866,16 +2997,26 @@ class EditorWindow(Adw.ApplicationWindow):
             TRANSITION_WHITE_FLASH,
         )[max(0, min(2, int(index)))]
 
+    def _selected_video_indices(self) -> list[int]:
+        if self.sel_kind != "video":
+            if self.sel_vs:
+                return sorted(i for i in self.sel_vs if 0 <= i < len(self.video_clips))
+            if 0 <= self.sel_v < len(self.video_clips):
+                return [self.sel_v]
+            return []
+        if self.sel_vs:
+            return sorted(i for i in self.sel_vs if 0 <= i < len(self.video_clips))
+        if 0 <= self.sel_v < len(self.video_clips):
+            return [self.sel_v]
+        return []
+
     def _sync_transition_controls(self) -> None:
-        clip = self._selected_video_clip()
-        has_follower = (
-            self.sel_kind == "video"
-            and 0 <= self.sel_v < len(self.video_clips)
-            and self._has_touching_video_follower(self.sel_v)
-        )
+        indices = self._selected_video_indices()
+        clips = [self.video_clips[i] for i in indices]
+        clip = clips[0] if clips else None
+        any_follower = any(self._has_touching_video_follower(i) for i in indices)
         enabled = (
-            clip is not None
-            and has_follower
+            bool(clips)
             and not self.exporting
             and not self._editing_locked()
         )
@@ -2900,11 +3041,16 @@ class EditorWindow(Adw.ApplicationWindow):
             )
             if self._editing_locked():
                 self.transition_hint.set_text("Rendered preview — editing locked")
-            elif clip is None:
+            elif not clips:
                 self.transition_hint.set_text("Select a video clip")
-            elif not has_follower:
+            elif len(clips) > 1:
+                note = f"{len(clips)} clips selected"
+                if not any_follower:
+                    note += " · some have no following cut (still applied)"
+                self.transition_hint.set_text(note)
+            elif not any_follower:
                 self.transition_hint.set_text(
-                    "No touching video segment follows this clip"
+                    "No touching video segment follows this clip (value still saved)"
                 )
             else:
                 self.transition_hint.set_text("")
@@ -2917,16 +3063,12 @@ class EditorWindow(Adw.ApplicationWindow):
         if not self._guard_edit("transition"):
             self._sync_transition_controls()
             return
-        clip = self._selected_video_clip()
-        if clip is None:
-            return
-        if not self._has_touching_video_follower(self.sel_v):
-            self._sync_transition_controls()
+        indices = self._selected_video_indices()
+        if not indices:
             return
         ttype = self._transition_from_index(self.transition_type.get_selected())
         if ttype == TRANSITION_NONE:
-            clip.transition = TRANSITION_NONE
-            clip.transition_s = 0.0
+            applied_type, applied_dur = TRANSITION_NONE, 0.0
         else:
             raw_dur = float(self.transition_spin.get_value())
             if raw_dur <= 0.0:
@@ -2937,12 +3079,22 @@ class EditorWindow(Adw.ApplicationWindow):
                     self.transition_spin.set_value(raw_dur)
                 finally:
                     self._loading = was_loading
-            ttype, tdur = normalize_transition(ttype, raw_dur)
-            clip.transition = ttype
-            clip.transition_s = tdur
+            applied_type, applied_dur = normalize_transition(ttype, raw_dur)
+        for idx in indices:
+            clip = self.video_clips[idx]
+            clip.transition = applied_type
+            clip.transition_s = applied_dur
         self.transition_spin.set_sensitive(
             not self.exporting and self.transition_type.get_selected() > 0
         )
+        n = len(indices)
+        if n > 1:
+            label = {
+                TRANSITION_NONE: "None",
+                TRANSITION_DISSOLVE: "Dissolve",
+                TRANSITION_WHITE_FLASH: "White flash",
+            }.get(applied_type, applied_type)
+            self._set_status(f"Transition → {label} on {n} clips")
         self._sync_timeline_clips()
         self._schedule_autosave()
         self._schedule_checkpoint()
@@ -3305,24 +3457,43 @@ class EditorWindow(Adw.ApplicationWindow):
             f"Audio {self.audio_clips[index].in_s:.2f}s–{self.audio_clips[index].out_s:.2f}s"
         )
 
-    def _on_clip_select(self, kind: str, index: int) -> None:
+    def _on_clip_select(
+        self, kind: str, index: int, selected: frozenset[int] | None = None
+    ) -> None:
         if not self._guard_edit("select_rebind"):
             return
-        if kind == "video" and 0 <= index < len(self.video_clips):
-            self.sel_v = index
-            self.sel_kind = "video"
-            c = self.video_clips[index]
-            self.video_start = c.start
-            item = self._clip_item(c, "video")
-            if item is not None:
-                self._bind_video(item.id)
-            self._loading = True
-            try:
-                self.in_spin.set_value(c.in_s)
-                self.out_spin.set_value(c.out_s)
-            finally:
-                self._loading = False
+        if kind == "video":
+            if index < 0:
+                self.sel_v = -1
+                self.sel_vs = set()
+                self.sel_kind = ""
+                self._sync_transform_controls()
+                self._sync_transition_controls()
+                return
+            if 0 <= index < len(self.video_clips):
+                self.sel_v = index
+                self.sel_vs = (
+                    set(selected)
+                    if selected is not None
+                    else {index}
+                )
+                self.sel_v, self.sel_vs = prune_video_selection(
+                    self.sel_vs, self.sel_v, len(self.video_clips)
+                )
+                self.sel_kind = "video"
+                c = self.video_clips[self.sel_v]
+                self.video_start = c.start
+                item = self._clip_item(c, "video")
+                if item is not None:
+                    self._bind_video(item.id)
+                self._loading = True
+                try:
+                    self.in_spin.set_value(c.in_s)
+                    self.out_spin.set_value(c.out_s)
+                finally:
+                    self._loading = False
         elif kind == "audio":
+            self.sel_vs = set()
             self.sel_kind = "audio"
             self.sel_a = index
             if 0 <= index < len(self.audio_clips):
@@ -3334,6 +3505,7 @@ class EditorWindow(Adw.ApplicationWindow):
                 if item is not None:
                     self._bind_audio(item.id)
         self._sync_transform_controls()
+        self._sync_transition_controls()
 
     def _place_clip(self, kind: str, t: float, media_id: str = "", track: int = 1) -> None:
         if not self._guard_edit("media_place"):
@@ -3353,6 +3525,7 @@ class EditorWindow(Adw.ApplicationWindow):
                 ClipInst(start=t, in_s=0.0, out_s=dur, media_id=item.id, track=track)
             )
             self.sel_v = len(self.video_clips) - 1
+            self.sel_vs = {self.sel_v}
             self.sel_kind = "video"
             self._bind_video(item.id)
             self._loading = True
@@ -3377,6 +3550,7 @@ class EditorWindow(Adw.ApplicationWindow):
             )
             self.use_video_soundtrack = False
             self.sel_a = len(self.audio_clips) - 1
+            self.sel_vs = set()
             self.sel_kind = "audio"
             self._bind_audio(item.id)
             self.audio_start = t
@@ -3419,8 +3593,18 @@ class EditorWindow(Adw.ApplicationWindow):
                 return False
             self._stop()
             del self.video_clips[idx]
+            # Remap multi-select indices after the deletion.
+            remapped = {
+                (i - 1 if i > idx else i)
+                for i in self.sel_vs
+                if i != idx
+            }
             if self.video_clips:
-                self.sel_v = min(idx, len(self.video_clips) - 1)
+                self.sel_v, self.sel_vs = prune_video_selection(
+                    remapped or {min(idx, len(self.video_clips) - 1)},
+                    min(idx, len(self.video_clips) - 1),
+                    len(self.video_clips),
+                )
                 self.sel_kind = "video"
                 c = self.video_clips[self.sel_v]
                 self.video_start = c.start
@@ -3432,6 +3616,7 @@ class EditorWindow(Adw.ApplicationWindow):
                     self._loading = False
             else:
                 self.sel_v = -1
+                self.sel_vs = set()
                 self.video_start = 0.0
                 self.sel_kind = "audio" if self.audio_clips else ""
             self._set_status("Removed video clip")
@@ -3506,7 +3691,12 @@ class EditorWindow(Adw.ApplicationWindow):
                 self._set_status("Playhead is not on the selected clip")
                 return False
             self.video_clips.insert(idx + 1, right)
+            remapped = {
+                (i + 1 if i > idx else i) for i in self.sel_vs if i != idx
+            }
+            remapped.add(idx + 1)
             self.sel_v = idx + 1
+            self.sel_vs = remapped
             self.sel_kind = "video"
             self.video_start = right.start
             self._loading = True

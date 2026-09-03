@@ -1,0 +1,91 @@
+"""Multi-select helpers for timeline clips (#530)."""
+
+from __future__ import annotations
+
+import unittest
+
+from clip_editor.selection import (
+    group_moved_starts,
+    next_video_selection,
+    prune_video_selection,
+)
+
+
+class NextVideoSelectionTest(unittest.TestCase):
+    def test_plain_click_replaces_selection(self) -> None:
+        primary, selected = next_video_selection(
+            clicked=2,
+            primary=0,
+            selected={0, 1},
+            shift=False,
+            n_clips=4,
+        )
+        self.assertEqual(primary, 2)
+        self.assertEqual(selected, {2})
+
+    def test_shift_click_adds_to_selection(self) -> None:
+        primary, selected = next_video_selection(
+            clicked=2,
+            primary=0,
+            selected={0},
+            shift=True,
+            n_clips=4,
+        )
+        self.assertEqual(primary, 2)
+        self.assertEqual(selected, {0, 2})
+
+    def test_shift_click_seeds_from_primary_when_set_empty(self) -> None:
+        primary, selected = next_video_selection(
+            clicked=1,
+            primary=0,
+            selected=set(),
+            shift=True,
+            n_clips=3,
+        )
+        self.assertEqual(primary, 1)
+        self.assertEqual(selected, {0, 1})
+
+    def test_shift_click_keeps_already_selected(self) -> None:
+        primary, selected = next_video_selection(
+            clicked=0,
+            primary=0,
+            selected={0, 2},
+            shift=True,
+            n_clips=4,
+        )
+        self.assertEqual(primary, 0)
+        self.assertEqual(selected, {0, 2})
+
+    def test_invalid_click_clears(self) -> None:
+        primary, selected = next_video_selection(
+            clicked=9,
+            primary=0,
+            selected={0},
+            shift=True,
+            n_clips=3,
+        )
+        self.assertEqual(primary, -1)
+        self.assertEqual(selected, set())
+
+
+class PruneVideoSelectionTest(unittest.TestCase):
+    def test_prunes_out_of_range(self) -> None:
+        primary, selected = prune_video_selection({0, 2, 9}, 2, 3)
+        self.assertEqual(primary, 2)
+        self.assertEqual(selected, {0, 2})
+
+    def test_empty_when_all_invalid(self) -> None:
+        primary, selected = prune_video_selection({5, 6}, 5, 2)
+        self.assertEqual(primary, -1)
+        self.assertEqual(selected, set())
+
+
+class GroupMovedStartsTest(unittest.TestCase):
+    def test_translates_all_by_anchor_delta(self) -> None:
+        starts = {0: 1.0, 2: 4.0, 3: 7.5}
+        moved = group_moved_starts(starts, anchor=2, new_anchor_start=5.5)
+        self.assertEqual(moved, {0: 2.5, 2: 5.5, 3: 9.0})
+
+
+if __name__ == "__main__":
+    unittest.main()
