@@ -47,6 +47,11 @@ from clip_editor.preview import (
     selected_cut_window,
 )
 from clip_editor.probe import ProbeError, probe, which_ffmpeg
+from clip_editor.ripple import (
+    follower_indices,
+    resolve_edge_hits,
+    ripple_starts,
+)
 from clip_editor.project import (
     DEFAULT_SPEED,
     DEFAULT_TRANSITION_S,
@@ -371,6 +376,9 @@ class Timeline(Gtk.DrawingArea):
         self._drag_span = 0.0
         self._drag_inner = 1.0
         self._drag_group_starts: dict[int, float] = {}
+        self._ripple_t1_0 = 0.0
+        self._ripple_starts: dict[int, float] = {}
+        self._drag_moved = False
         self._snap_line: float | None = None
         self._drop_hover: tuple[str, float, int] | None = None
         self.set_hexpand(False)
@@ -467,7 +475,8 @@ class Timeline(Gtk.DrawingArea):
         self.src_durs = dict(src_durs or {})
         self.clip_names = dict(clip_names or {})
         if vclips is not None:
-            self.vclips = [c.copy() for c in vclips]
+            # Same ClipInst objects as the editor so ripple/trim persist on sync.
+            self.vclips = list(vclips)
         elif video_dur > 0:
             self.vclips = [
                 ClipInst(start=float(video_start), in_s=self.in_s, out_s=self.out_s or video_dur)
@@ -475,7 +484,7 @@ class Timeline(Gtk.DrawingArea):
         else:
             self.vclips = []
         if aclips is not None:
-            self.aclips = [c.copy() for c in aclips]
+            self.aclips = list(aclips)
         elif audio_dur > 0:
             aout = float(audio_out) if audio_out else audio_dur
             self.aclips = [
@@ -667,11 +676,17 @@ class Timeline(Gtk.DrawingArea):
         for track in (1, 2):
             lane_y = self._lane_y(kind, track)
             candidates = [i for i, c in enumerate(clips) if int(c.track) == track]
-            for i in reversed(candidates):
+            edge_hits: list[tuple[int, str, float, float]] = []
+            for i in candidates:
                 t0, t1 = self._clip_times(clips[i], self._clip_src_dur(clips[i], lane))
                 edge = self._hit_edge(x, y, t0, t1, lane_y)
                 if edge:
-                    return i, edge
+                    edge_hits.append((i, edge, t0, t1))
+            resolved = resolve_edge_hits(edge_hits)
+            if resolved is not None:
+                return resolved
+            for i in reversed(candidates):
+                t0, t1 = self._clip_times(clips[i], self._clip_src_dur(clips[i], lane))
                 if self._hit_clip(x, y, t0, t1, lane_y):
                     return i, "body"
         return -1, ""
@@ -718,11 +733,17 @@ class Timeline(Gtk.DrawingArea):
     ) -> tuple[int, str]:
         if not self._in_lane(y, lane_y):
             return -1, ""
-        for i in range(len(clips) - 1, -1, -1):
+        edge_hits: list[tuple[int, str, float, float]] = []
+        for i in range(len(clips)):
             t0, t1 = self._clip_times(clips[i], self._clip_src_dur(clips[i], lane))
             edge = self._hit_edge(x, y, t0, t1, lane_y)
             if edge:
-                return i, edge
+                edge_hits.append((i, edge, t0, t1))
+        resolved = resolve_edge_hits(edge_hits)
+        if resolved is not None:
+            return resolved
+        for i in range(len(clips) - 1, -1, -1):
+            t0, t1 = self._clip_times(clips[i], self._clip_src_dur(clips[i], lane))
             if self._hit_clip(x, y, t0, t1, lane_y):
                 return i, "body"
         return -1, ""
@@ -815,7 +836,8 @@ class Timeline(Gtk.DrawingArea):
             )
         else:
             self.set_tooltip_text(
-                "Drag a clip to slide it. Drag either edge to trim. "
+                "Drag a clip to slide it. Drag the right edge to trim and "
+                "ripple later clips on that track. Drag the left edge to trim in. "
                 "Shift+click adds a clip to the selection; drag moves the group. "
                 "Drag the ruler or playhead to seek. T splits at the playhead. "
                 "Del removes the selected clip (A-track too). Esc clears multi-select."
@@ -857,6 +879,8 @@ class Timeline(Gtk.DrawingArea):
             self.set_cursor_from_name("ew-resize")
         elif self._drag_mode in ("video", "video-group", "audio"):
             self.set_cursor_from_name("grabbing")
+        elif self._hit_video_edge(x, y) == "out" or self._hit_audio_edge(x, y) == "out":
+            self.set_cursor_from_name("col-resize")
         elif self._hit_video_edge(x, y) or self._hit_audio_edge(x, y):
             self.set_cursor_from_name("ew-resize")
         elif self._hit_video(x, y) or self._hit_audio(x, y):
@@ -873,6 +897,7 @@ class Timeline(Gtk.DrawingArea):
         self._drag_span = max(self._map_span(), 0.01)
         self._drag_y0 = oy
         self._drag_group_starts = {}
+        self._drag_moved = False
         if self.read_only:
             self._drag_mode = "seek"
             self._drag_index = -1
@@ -924,7 +949,8 @@ class Timeline(Gtk.DrawingArea):
             elif vp == "out":
                 self._drag_mode = "video-out"
                 self._drag_v0 = c.out_s
-                self.set_cursor_from_name("ew-resize")
+                self._begin_ripple("video", vi)
+                self.set_cursor_from_name("col-resize")
             else:
                 if len(self.sel_vs) > 1 and vi in self.sel_vs:
                     self._drag_mode = "video-group"
@@ -953,7 +979,8 @@ class Timeline(Gtk.DrawingArea):
             elif ap == "out":
                 self._drag_mode = "audio-out"
                 self._drag_v0 = c.out_s if c.out_s > 0 else self.audio_dur
-                self.set_cursor_from_name("ew-resize")
+                self._begin_ripple("audio", ai)
+                self.set_cursor_from_name("col-resize")
             else:
                 self._drag_mode = "audio"
                 self._drag_v0 = c.start
@@ -966,6 +993,31 @@ class Timeline(Gtk.DrawingArea):
     def _dt(self, dx: float) -> float:
         return dx / self._drag_inner * self._drag_span
 
+    def _clip_times_list(self, clips: list[ClipInst], lane: str) -> list[tuple[float, float]]:
+        return [
+            self._clip_times(c, self._clip_src_dur(c, lane)) for c in clips
+        ]
+
+    def _begin_ripple(self, kind: str, index: int) -> None:
+        clips = self.vclips if kind == "video" else self.aclips
+        lane = "v" if kind == "video" else "a"
+        times = self._clip_times_list(clips, lane)
+        tracks = [int(c.track) for c in clips]
+        self._ripple_t1_0 = times[index][1] if 0 <= index < len(times) else 0.0
+        follow = follower_indices(tracks, times, index)
+        self._ripple_starts = {i: float(clips[i].start) for i in follow}
+
+    def _apply_ripple(self, kind: str, index: int) -> None:
+        clips = self.vclips if kind == "video" else self.aclips
+        lane = "v" if kind == "video" else "a"
+        if not 0 <= index < len(clips) or not self._ripple_starts:
+            return
+        _t0, t1 = self._clip_times(clips[index], self._clip_src_dur(clips[index], lane))
+        delta = t1 - self._ripple_t1_0
+        for i, start in ripple_starts(self._ripple_starts, delta).items():
+            if 0 <= i < len(clips):
+                clips[i].start = start
+
     def _snap_thresh(self) -> float:
         inner = max(self._drag_inner, 1.0)
         return max(0.04, self._SNAP_PX / inner * self._map_span())
@@ -974,6 +1026,8 @@ class Timeline(Gtk.DrawingArea):
         skip = {self._drag_index}
         if which == "video" and self._drag_mode == "video-group":
             skip |= set(self._drag_group_starts)
+        if self._drag_mode in ("video-out", "audio-out"):
+            skip |= set(self._ripple_starts)
         times: list[float] = []
         for i, c in enumerate(self.vclips):
             if which == "video" and i in skip:
@@ -1030,6 +1084,8 @@ class Timeline(Gtk.DrawingArea):
         return max(-used_in, best)
 
     def _on_drag_update(self, gesture: Gtk.GestureDrag, dx: float, dy: float) -> None:
+        if abs(dx) >= 1.0 or abs(dy) >= 1.0:
+            self._drag_moved = True
         dt = self._dt(dx)
         if self._drag_mode == "video-in":
             c = self._vclip()
@@ -1064,6 +1120,7 @@ class Timeline(Gtk.DrawingArea):
                 self._snap_line = None
             if callable(self.on_video_trim):
                 self.on_video_trim(self._drag_index, inn, c.out_s, False)
+            self._apply_ripple("video", self._drag_index)
             self.queue_draw()
             return
         if self._drag_mode == "audio-in":
@@ -1098,6 +1155,7 @@ class Timeline(Gtk.DrawingArea):
                 self._snap_line = None
             if callable(self.on_audio_trim):
                 self.on_audio_trim(self._drag_index, ain, c.out_s, False)
+            self._apply_ripple("audio", self._drag_index)
             self.queue_draw()
             return
         if self._drag_mode == "video-group":
@@ -1171,11 +1229,16 @@ class Timeline(Gtk.DrawingArea):
     def _on_drag_end(self, *_args: object) -> None:
         mode = self._drag_mode
         group_starts = dict(self._drag_group_starts)
+        idx = self._drag_index
+        if self._drag_moved and mode == "video-out":
+            self._apply_ripple("video", idx)
+        elif self._drag_moved and mode == "audio-out":
+            self._apply_ripple("audio", idx)
         self._drag_mode = ""
         self._drag_group_starts = {}
+        self._ripple_starts = {}
         self._snap_line = None
         self._recompute_span()
-        idx = self._drag_index
         self._drag_index = -1
         if mode == "video-group":
             self.set_cursor_from_name("grab")
@@ -1197,15 +1260,15 @@ class Timeline(Gtk.DrawingArea):
             if c is not None and callable(self.on_audio_move):
                 self.on_audio_move(idx, c.start, True)
         elif mode in ("video-in", "video-out"):
-            self.set_cursor_from_name("ew-resize")
+            self.set_cursor_from_name("col-resize" if mode == "video-out" else "ew-resize")
             c = self._vclip(idx)
-            if c is not None and callable(self.on_video_trim):
+            if c is not None and callable(self.on_video_trim) and self._drag_moved:
                 inn, out = self._clip_used(c, self._clip_src_dur(c, "v"))
                 self.on_video_trim(idx, inn, out, True)
         elif mode in ("audio-in", "audio-out"):
             self.set_cursor_from_name("ew-resize")
             c = self._aclip(idx)
-            if c is not None and callable(self.on_audio_trim):
+            if c is not None and callable(self.on_audio_trim) and self._drag_moved:
                 inn, out = self._clip_used(c, self._clip_src_dur(c, "a"))
                 self.on_audio_trim(idx, inn, out, True)
         elif mode == "seek" and callable(self.on_seek):
@@ -1955,12 +2018,12 @@ class EditorWindow(Adw.ApplicationWindow):
         trim.append(Gtk.Label(label="In"))
         self.in_spin = Gtk.SpinButton.new_with_range(0, 99999, 0.05)
         self.in_spin.set_digits(2)
-        self.in_spin.connect("value-changed", lambda *_: self._refresh_fit())
+        self.in_spin.connect("value-changed", self._on_trim_spin_changed)
         trim.append(self.in_spin)
         trim.append(Gtk.Label(label="Out"))
         self.out_spin = Gtk.SpinButton.new_with_range(0, 99999, 0.05)
         self.out_spin.set_digits(2)
-        self.out_spin.connect("value-changed", lambda *_: self._refresh_fit())
+        self.out_spin.connect("value-changed", self._on_trim_spin_changed)
         trim.append(self.out_spin)
         right.append(trim)
         row = Gtk.Box(spacing=8)
@@ -3132,10 +3195,16 @@ class EditorWindow(Adw.ApplicationWindow):
                 )
             self.media_list.append(card)
 
-    def _refresh_fit(self) -> None:
-        if 0 <= self.sel_v < len(self.video_clips) and not self._loading:
+    def _on_trim_spin_changed(self, *_args: object) -> None:
+        """Inspector In/Out only; do not run this on timeline click/trim."""
+        if self._loading:
+            return
+        if 0 <= self.sel_v < len(self.video_clips):
             self.video_clips[self.sel_v].in_s = self.in_spin.get_value()
             self.video_clips[self.sel_v].out_s = self.out_spin.get_value()
+        self._refresh_fit()
+
+    def _refresh_fit(self) -> None:
         v = self._edit_dur()
         a = self._audio_usable()
         longer = bool(self.audio_path) and a > v + 0.05 and v > 0.04
@@ -3639,6 +3708,7 @@ class EditorWindow(Adw.ApplicationWindow):
             return
         self.video_clips[index].in_s = in_s
         self.video_clips[index].out_s = out_s
+        # Timeline may have rippled follower starts on the same objects.
         if not done:
             return
         self.sel_v = index
