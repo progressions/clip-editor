@@ -30,14 +30,19 @@ from clip_editor.eagle import apply_omarchy_theme, theme_rgb
 from clip_editor.export import ExportCancelled, ExportError, default_out_path, run_export
 from clip_editor.preview import (
     PREVIEW_PROFILE,
+    TimelineSegment,
     assert_preview_path_safe,
+    build_timeline_segments,
     cleanup_preview_cache,
     compiled_allows_action,
     compiled_playhead_seconds,
+    dirty_segments,
     has_touching_follower,
+    playback_source,
     preview_out_path,
     rebase_clips_for_window,
     render_fingerprint,
+    segment_at,
     selected_cut_window,
 )
 from clip_editor.probe import ProbeError, probe, which_ffmpeg
@@ -307,6 +312,7 @@ class Timeline(Gtk.DrawingArea):
     _GUTTER = 22.0
     _PAD_RIGHT = 8.0
     _RULER_H = 16.0
+    _CACHE_BAR_H = 8.0
     _LANE_H = 28.0
     _LANE_GAP = 6.0
     _BOTTOM = 16.0
@@ -316,7 +322,7 @@ class Timeline(Gtk.DrawingArea):
     _TRAIL_PX = 160.0
     _TRAIL_MIN_S = 8.0
     _MIN_PPS = 8.0
-    _HEIGHT = 162
+    _HEIGHT = 170
 
     def __init__(self) -> None:
         super().__init__()
@@ -341,6 +347,8 @@ class Timeline(Gtk.DrawingArea):
         self.sel_vs: set[int] = set()
         self.playhead = 0.0
         self.read_only = False
+        # (t0, t1, green) spans for the Premiere-style cache bar (#532)
+        self.cache_spans: list[tuple[float, float, bool]] = []
         self.on_seek = None
         self.on_video_move = None
         self.on_audio_move = None
@@ -476,6 +484,10 @@ class Timeline(Gtk.DrawingArea):
         self.sel_a = sel_a if self.aclips else -1
         self._mirror_sel()
         self._recompute_span()
+        self.queue_draw()
+
+    def set_cache_spans(self, spans: list[tuple[float, float, bool]]) -> None:
+        self.cache_spans = list(spans)
         self.queue_draw()
 
     def _mirror_sel(self) -> None:
@@ -630,7 +642,11 @@ class Timeline(Gtk.DrawingArea):
         slot = {("video", 2): 0, ("video", 1): 1, ("audio", 1): 2, ("audio", 2): 3}[
             (kind, max(1, min(2, int(track))))
         ]
-        return self._RULER_H + slot * (self._LANE_H + self._LANE_GAP)
+        return (
+            self._RULER_H
+            + self._CACHE_BAR_H
+            + slot * (self._LANE_H + self._LANE_GAP)
+        )
 
     def _track_at(self, kind: str, y: float) -> int | None:
         for track in (1, 2):
@@ -1319,6 +1335,23 @@ class Timeline(Gtk.DrawingArea):
         v_y = self._lane_y("video", 1)
         lanes_bottom = self._lane_y("audio", 2) + self._LANE_H
 
+        # Render-cache bar: gray empty, red dirty, green baked (#532).
+        bar_y = self._RULER_H + 1.0
+        bar_h = max(3.0, self._CACHE_BAR_H - 3.0)
+        _round_rect(cr, left, bar_y, inner, bar_h, 2)
+        cr.set_source_rgb(*muted)
+        cr.fill()
+        red = theme_rgb("red", (0.75, 0.28, 0.32))
+        span = self._map_span()
+        for t0, t1, green_ok in self.cache_spans:
+            if span <= 0 or t1 <= t0:
+                continue
+            x0 = self._t_to_x(t0, width)
+            x1 = self._t_to_x(t1, width)
+            cr.set_source_rgb(*(green if green_ok else red))
+            cr.rectangle(x0, bar_y, max(1.0, x1 - x0), bar_h)
+            cr.fill()
+
         for kind, track_no in (("video", 2), ("video", 1), ("audio", 1), ("audio", 2)):
             lane_y = self._lane_y(kind, track_no)
             _round_rect(cr, left, lane_y, inner, self._LANE_H, 4)
@@ -1659,6 +1692,10 @@ class EditorWindow(Adw.ApplicationWindow):
         self._compiled_kind: str = ""
         self._compiled_duration = 0.0
         self._compiled_window: tuple[float, float] | None = None
+        self._cache_segments: list[TimelineSegment] = []
+        self._cache_play_seg: TimelineSegment | None = None
+        self._cache_render_queue: list[TimelineSegment] = []
+        self._cache_render_total = 0
         self._edit_vmedia_path: Path | None = None
         self.playing = False
         self._vmedia: Gtk.MediaFile | None = None
@@ -1711,7 +1748,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.aspect_frame.set_vexpand(True)
         self.preview = CoverPreview()
         self.preview.on_pan = self._refresh_crop
-        self.preview.on_pan_end = self._checkpoint
+        self.preview.on_pan_end = self._on_preview_pan_end
         self.aspect_frame.set_child(self.preview)
         left.append(self.aspect_frame)
 
@@ -1797,6 +1834,16 @@ class EditorWindow(Adw.ApplicationWindow):
             "clicked", lambda *_: self._on_compiled_preview("full")
         )
         preview_row.append(self.btn_preview_full)
+        self.btn_render_dirty = Gtk.Button(label="Render dirty")
+        self.btn_render_dirty.set_tooltip_text(
+            "Bake red timeline ranges into the proxy cache (stay in edit mode)"
+        )
+        self.btn_render_dirty.connect("clicked", lambda *_: self._on_render_cache(all_segs=False))
+        preview_row.append(self.btn_render_dirty)
+        self.btn_render_all = Gtk.Button(label="Render all")
+        self.btn_render_all.set_tooltip_text("Re-bake every timeline cache segment")
+        self.btn_render_all.connect("clicked", lambda *_: self._on_render_cache(all_segs=True))
+        preview_row.append(self.btn_render_all)
         right.append(preview_row)
         self.btn_preview_cancel = Gtk.Button(label="Cancel preview render")
         self.btn_preview_cancel.set_sensitive(False)
@@ -2126,6 +2173,10 @@ class EditorWindow(Adw.ApplicationWindow):
                 and self._hist_i >= 0
                 and self._hist_i < len(self._history) - 1
             )
+
+    def _on_preview_pan_end(self, *_args: object) -> None:
+        self._checkpoint()
+        self._refresh_cache_bar()
 
     def _checkpoint(self, *_args: object) -> None:
         if self._loading or self._applying_history or self._editing_locked():
@@ -3012,6 +3063,7 @@ class EditorWindow(Adw.ApplicationWindow):
             src_durs=self._src_durs(),
             clip_names=self._clip_names(),
         )
+        self._refresh_cache_bar()
         if 0 <= self.sel_v < len(self.video_clips):
             c = self.video_clips[self.sel_v]
             self.timeline.set_range(c.in_s, c.out_s)
@@ -3023,6 +3075,29 @@ class EditorWindow(Adw.ApplicationWindow):
         self._sync_compiled_preview_controls()
         self._mark_compiled_stale_if_needed()
         self._refresh_media()
+
+    def _refresh_cache_bar(self) -> None:
+        if not self.video_clips or not self.video_path:
+            self._cache_segments = []
+            self.timeline.set_cache_spans([])
+            return
+        self._cache_segments = build_timeline_segments(
+            video_clips=self.video_clips,
+            audio_clips=self.audio_clips,
+            src_durs=self._src_durs(),
+            aspect=self.aspect,
+            pan_x=self.preview.pan_x,
+            pan_y=self.preview.pan_y,
+            audio_follows_in=self.follow_in.get_active(),
+            use_video_soundtrack=self.use_video_soundtrack,
+            audio_offset=0.0,
+            media=self.media,
+        )
+        self.timeline.set_cache_spans(
+            [(s.t0, s.t1, s.is_green()) for s in self._cache_segments]
+        )
+        if hasattr(self, "btn_render_dirty"):
+            self._sync_compiled_preview_controls()
 
     def _refresh_media(self) -> None:
         ids = [m.id for m in self.media]
@@ -4118,7 +4193,67 @@ class EditorWindow(Adw.ApplicationWindow):
                 hit = c
         return hit
 
+    def _apply_cache_segment(
+        self, seg: TimelineSegment, timeline_t: float, *, start_media: bool
+    ) -> bool:
+        """Play a green cache file at *timeline_t* without locking edit mode."""
+        path = seg.path
+        try:
+            if not path.is_file() or path.stat().st_size <= 0:
+                return False
+        except OSError:
+            return False
+        self._stop_preview_audio()
+        self._load_media(path)
+        if self._vmedia is None:
+            return False
+        dw, dh = dest_size(self.aspect, self.resolution)
+        self.preview.set_transform(0.0, 0.0, 1.0, dw, dh)
+        self.preview.set_blank(False)
+        self.preview.set_media(self._vmedia)
+        offset = seg.file_offset(timeline_t)
+        self._cache_play_seg = seg
+        m = self._vmedia
+        m.set_muted(False)
+        m.set_volume(1.0)
+
+        def go(*_a: object) -> bool:
+            try:
+                m.seek(int(max(0.0, offset) * 1_000_000))
+            except GLib.Error:
+                pass
+            if start_media:
+                m.play()
+            else:
+                m.pause()
+            self.preview.queue_draw()
+            return False
+
+        if start_media:
+            self._clip_playing = True
+        if m.is_prepared():
+            go()
+        else:
+            if self._prep_handler:
+                try:
+                    m.disconnect(self._prep_handler)
+                except (TypeError, RuntimeError):
+                    pass
+            self._prep_handler = m.connect("notify::prepared", go)
+            if start_media:
+                m.play()
+        return True
+
     def _apply_timeline_frame(self, timeline_t: float, *, start_media: bool) -> None:
+        if not self._compiled_mode and playback_source(
+            timeline_t, self._cache_segments
+        ) == "cache":
+            seg = segment_at(timeline_t, self._cache_segments)
+            if seg is not None and self._apply_cache_segment(
+                seg, timeline_t, start_media=start_media
+            ):
+                return
+        self._cache_play_seg = None
         clip = self._video_at(timeline_t)
         if clip is None or self._vmedia is None:
             dw, dh = dest_size(self.aspect, self.resolution)
@@ -4153,8 +4288,8 @@ class EditorWindow(Adw.ApplicationWindow):
             self.preview.queue_draw()
 
     def _start_preview_audio(self, timeline_t: float) -> None:
-        if self._compiled_mode:
-            # Compiled preview uses MediaFile audio only.
+        if self._compiled_mode or self._cache_play_seg is not None:
+            # Compiled / segment-cache preview uses MediaFile audio only.
             self._stop_preview_audio()
             return
         self._stop_preview_audio()
@@ -4462,6 +4597,35 @@ class EditorWindow(Adw.ApplicationWindow):
                 self._syncing_scrub = False
                 return False
             return True
+        if self._cache_play_seg is not None:
+            seg = self._cache_play_seg
+            ts = self._compiled_media_timestamp_us()
+            if ts is not None:
+                t = float(seg.render_t0) + ts / 1_000_000.0
+            else:
+                t = self._timeline_now()
+            end = self._program_end()
+            t = min(max(0.0, t), end)
+            self._syncing_scrub = True
+            self.timeline.set_playhead(t)
+            self._syncing_scrub = False
+            self.clock.set_text(f"{t:.2f} / {end:.2f}")
+            if self._vmedia is not None:
+                self.preview.queue_draw()
+            nxt = segment_at(t, self._cache_segments)
+            if t >= end - 0.02:
+                self._stop()
+                self._syncing_scrub = True
+                self.timeline.set_playhead(end)
+                self._syncing_scrub = False
+                return False
+            if nxt is None or not nxt.is_green() or nxt.fingerprint != seg.fingerprint:
+                self._play_t0 = t
+                self._play_mono = time.monotonic()
+                self._apply_timeline_frame(t, start_media=True)
+                if self._cache_play_seg is None:
+                    self._start_preview_audio(t)
+            return True
         t = self._timeline_now()
         end = self._program_end()
         self._syncing_scrub = True
@@ -4557,6 +4721,15 @@ class EditorWindow(Adw.ApplicationWindow):
                 has_video and can_cut and not busy and not locked
             )
             self.btn_preview_full.set_sensitive(has_video and not busy and not locked)
+            if hasattr(self, "btn_render_dirty"):
+                n_dirty = len(dirty_segments(self._cache_segments))
+                n_all = len(self._cache_segments)
+                self.btn_render_dirty.set_sensitive(
+                    has_video and n_dirty > 0 and not busy and not locked
+                )
+                self.btn_render_all.set_sensitive(
+                    has_video and n_all > 0 and not busy and not locked
+                )
             self.btn_preview_cancel.set_sensitive(self._preview_rendering)
             self.btn_back_edit_preview.set_sensitive(
                 self._compiled_mode and not self._preview_rendering
@@ -4713,6 +4886,136 @@ class EditorWindow(Adw.ApplicationWindow):
         self._sync_transition_controls()
         self._sync_compiled_preview_controls()
         self._set_status("Rendered preview — editing locked")
+
+    def _on_render_cache(self, *, all_segs: bool) -> None:
+        if self._busy_rendering() or not self.video_path or not self.video_clips:
+            return
+        if self._compiled_mode:
+            self._set_status("Leave compiled preview (Back to edit) to bake the cache")
+            return
+        self._refresh_cache_bar()
+        queue = (
+            list(self._cache_segments)
+            if all_segs
+            else dirty_segments(self._cache_segments)
+        )
+        if not queue:
+            self._set_status("Cache is already green")
+            return
+        self._stop()
+        self._preview_rendering = True
+        self._preview_cancel = threading.Event()
+        self._preview_generation += 1
+        generation = self._preview_generation
+        self._cache_render_queue = queue
+        self._cache_render_total = len(queue)
+        self.progress.set_fraction(0)
+        self._sync_compiled_preview_controls()
+        self._render_next_cache_segment(generation)
+
+    def _render_next_cache_segment(self, generation: int) -> None:
+        if generation != self._preview_generation:
+            return
+        if self._preview_cancel.is_set() or not self._cache_render_queue:
+            self._preview_rendering = False
+            self._refresh_cache_bar()
+            self._sync_compiled_preview_controls()
+            if self._preview_cancel.is_set():
+                self._set_status("Cache render cancelled")
+            else:
+                n = self._cache_render_total
+                self._set_status(f"Cache ready — {n} segment(s) baked")
+            self.progress.set_fraction(1 if not self._preview_cancel.is_set() else 0)
+            return
+        seg = self._cache_render_queue.pop(0)
+        done_i = self._cache_render_total - len(self._cache_render_queue)
+        self._set_status(
+            f"Rendering cache {done_i}/{self._cache_render_total}…"
+        )
+        src_durs = self._src_durs()
+        t0, t1 = seg.render_t0, seg.render_t1
+        v_clips = rebase_clips_for_window(
+            [c.copy() for c in self.video_clips], t0, t1, src_durs
+        )
+        a_clips = rebase_clips_for_window(
+            [c.copy() for c in self.audio_clips], t0, t1, src_durs
+        )
+        if not v_clips:
+            GLib.idle_add(self._render_next_cache_segment, generation)
+            return
+        out = seg.path
+        try:
+            assert_preview_path_safe(out)
+        except ValueError as exc:
+            self._preview_rendering = False
+            self._set_status(str(exc))
+            self._sync_compiled_preview_controls()
+            return
+        video = self.video_path
+        audio = self.audio_path
+        aspect = self.aspect
+        pan_x, pan_y = self.preview.pan_x, self.preview.pan_y
+        follows = self.follow_in.get_active()
+        use_soundtrack = self.use_video_soundtrack
+        media = [m.copy() for m in self.media]
+        if a_clips:
+            item = self._clip_item(a_clips[0], "audio")
+            audio = item.path if item is not None else audio
+        else:
+            audio = None
+        prim = next((m for m in media if m.kind == "video"), None)
+        if prim is not None:
+            video = prim.path
+        cancel_event = self._preview_cancel
+        total = self._cache_render_total
+
+        def progress(pct: float, _state: str) -> None:
+            base = (done_i - 1) / max(1, total)
+            GLib.idle_add(
+                self.progress.set_fraction, base + pct / max(1, total)
+            )
+
+        def work() -> None:
+            err: BaseException | None = None
+            try:
+                run_export(
+                    video,
+                    out,
+                    audio=audio,
+                    aspect=aspect,
+                    pan_x=pan_x,
+                    pan_y=pan_y,
+                    in_s=0.0,
+                    out_s=None,
+                    audio_follows_in=follows,
+                    video_clips=v_clips,
+                    audio_clips=a_clips or None,
+                    media=media or None,
+                    use_video_soundtrack=use_soundtrack,
+                    profile=PREVIEW_PROFILE,
+                    progress=progress,
+                    cancel_event=cancel_event,
+                )
+            except (ExportCancelled, ExportError, ProbeError, OSError) as exc:
+                err = exc
+
+            def done() -> bool:
+                if generation != self._preview_generation:
+                    return False
+                if err is not None and not isinstance(err, ExportCancelled):
+                    self._preview_rendering = False
+                    self.progress.set_fraction(0)
+                    self._set_status(str(err))
+                    self._sync_compiled_preview_controls()
+                    return False
+                cleanup_preview_cache()
+                self._refresh_cache_bar()
+                self._render_next_cache_segment(generation)
+                return False
+
+            GLib.idle_add(done)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _on_compiled_preview(self, kind: str) -> None:
         if self._busy_rendering() or not self.video_path or not self.video_clips:
