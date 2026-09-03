@@ -7,6 +7,16 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-09-03
+
+### Added
+
+- Ripple right-edge trim: at a packed join, drag the earlier clip’s right edge; later clips on the same track stay packed ([#533](https://app.fizzy.do/6109848/cards/533) / PR #15).
+
+### Fixed
+
+- Timeline click no longer restamps clip in/out from the inspector spins (that had rescaled every clip).
+
 ## [0.6.0] — 2026-09-03
 
 ### Added
@@ -62,7 +72,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 - Initial packaged release of the native GTK clip editor for Buffer-safe H.264/AAC exports.
 
-[Unreleased]: https://github.com/progressions/clip-editor/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/progressions/clip-editor/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/progressions/clip-editor/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/progressions/clip-editor/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/progressions/clip-editor/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/progressions/clip-editor/compare/v0.3.0...v0.4.0
