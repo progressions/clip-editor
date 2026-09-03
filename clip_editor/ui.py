@@ -474,7 +474,8 @@ class Timeline(Gtk.DrawingArea):
         self.src_durs = dict(src_durs or {})
         self.clip_names = dict(clip_names or {})
         if vclips is not None:
-            self.vclips = [c.copy() for c in vclips]
+            # Same ClipInst objects as the editor so ripple/trim persist on sync.
+            self.vclips = list(vclips)
         elif video_dur > 0:
             self.vclips = [
                 ClipInst(start=float(video_start), in_s=self.in_s, out_s=self.out_s or video_dur)
@@ -482,7 +483,7 @@ class Timeline(Gtk.DrawingArea):
         else:
             self.vclips = []
         if aclips is not None:
-            self.aclips = [c.copy() for c in aclips]
+            self.aclips = list(aclips)
         elif audio_dur > 0:
             aout = float(audio_out) if audio_out else audio_dur
             self.aclips = [
@@ -1224,12 +1225,16 @@ class Timeline(Gtk.DrawingArea):
     def _on_drag_end(self, *_args: object) -> None:
         mode = self._drag_mode
         group_starts = dict(self._drag_group_starts)
+        idx = self._drag_index
+        if mode == "video-out":
+            self._apply_ripple("video", idx)
+        elif mode == "audio-out":
+            self._apply_ripple("audio", idx)
         self._drag_mode = ""
         self._drag_group_starts = {}
         self._ripple_starts = {}
         self._snap_line = None
         self._recompute_span()
-        idx = self._drag_index
         self._drag_index = -1
         if mode == "video-group":
             self.set_cursor_from_name("grab")
@@ -3693,6 +3698,7 @@ class EditorWindow(Adw.ApplicationWindow):
             return
         self.video_clips[index].in_s = in_s
         self.video_clips[index].out_s = out_s
+        # Timeline may have rippled follower starts on the same objects.
         if not done:
             return
         self.sel_v = index

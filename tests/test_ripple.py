@@ -70,6 +70,28 @@ class FollowerIndicesTest(unittest.TestCase):
         self.assertEqual(follower_indices(tracks, times, 0), [1])
 
 
+class RippleApplyOnClipsTest(unittest.TestCase):
+    def test_shorten_packed_v1_moves_follower_start(self) -> None:
+        from clip_editor.project import ClipInst
+
+        a = ClipInst(start=0.0, in_s=0.0, out_s=4.0, track=1)
+        b = ClipInst(start=4.0, in_s=0.0, out_s=3.0, track=1)
+        clips = [a, b]
+        times = [(0.0, 4.0), (4.0, 7.0)]
+        tracks = [1, 1]
+        follow = follower_indices(tracks, times, 0)
+        self.assertEqual(follow, [1])
+        starts0 = {i: clips[i].start for i in follow}
+        t1_0 = 4.0
+        a.out_s = 2.0
+        t1 = 2.0
+        for i, start in ripple_starts(starts0, t1 - t1_0).items():
+            clips[i].start = start
+        self.assertAlmostEqual(b.start, 2.0)
+        self.assertAlmostEqual(b.in_s, 0.0)
+        self.assertAlmostEqual(b.out_s, 3.0)
+
+
 class RippleStartsTest(unittest.TestCase):
     def test_shift(self) -> None:
         self.assertEqual(
