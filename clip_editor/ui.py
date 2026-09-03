@@ -793,8 +793,18 @@ class Timeline(Gtk.DrawingArea):
             self._seek_x(x)
             return
         shift = self._shift_held(gesture)
-        if self._select_hit(x, y, shift=shift):
+        vi, _vp = self._hit_kind(x, y, "video")
+        if vi >= 0:
+            # Plain clip presses are owned by drag-begin so a group drag does not
+            # get collapsed by a later GestureClick. Shift+click still adds here.
+            if shift:
+                self._select_hit(x, y, shift=True)
             return
+        if self.audio_kind != "source":
+            ai, _ap = self._hit_kind(x, y, "audio")
+            if ai >= 0:
+                # Same race as video: let drag-begin own plain audio selection.
+                return
         # Empty click: clear multi-select, then seek.
         if self.sel_vs or self.sel_v >= 0:
             self.sel_v = -1
@@ -839,8 +849,31 @@ class Timeline(Gtk.DrawingArea):
         if self.audio_kind != "source":
             ai, ap = self._hit_kind(ox, oy, "audio")
         if vp in ("in", "out", "body"):
-            # Keep multi-select when dragging an already-selected clip.
-            if vi not in self.sel_vs:
+            # Selection lives here (not in GestureClick) to avoid races and to
+            # read Shift from the seat keyboard under Hyprland.
+            shift = False
+            display = Gdk.Display.get_default()
+            if display is not None:
+                seat = display.get_default_seat()
+                keyboard = seat.get_keyboard() if seat is not None else None
+                if keyboard is not None:
+                    mods = (
+                        keyboard.get_modifier_state()
+                        & Gtk.accelerator_get_default_mod_mask()
+                    )
+                    shift = bool(mods & Gdk.ModifierType.SHIFT_MASK)
+            # Do not collapse a multi-select already applied by _on_pressed.
+            # Only change membership here when Shift is held (add) or the hit
+            # clip is outside the current set (plain replace).
+            if shift:
+                self.sel_v, self.sel_vs = next_video_selection(
+                    clicked=vi,
+                    primary=self.sel_v,
+                    selected=self.sel_vs,
+                    shift=True,
+                    n_clips=len(self.vclips),
+                )
+            elif vi not in self.sel_vs:
                 self.sel_v = vi
                 self.sel_vs = {vi}
             else:
@@ -863,10 +896,10 @@ class Timeline(Gtk.DrawingArea):
                     self._drag_mode = "video-group"
                     self._drag_group_starts = {
                         i: float(self.vclips[i].start)
-                        for i in self.sel_vs
+                        for i in sorted(self.sel_vs)
                         if 0 <= i < len(self.vclips)
                     }
-                    self._drag_v0 = c.start
+                    self._drag_v0 = float(self._drag_group_starts[vi])
                 else:
                     self._drag_mode = "video"
                     self._drag_v0 = c.start
@@ -3372,9 +3405,10 @@ class EditorWindow(Adw.ApplicationWindow):
         self.video_clips[index].start = max(-inn, float(start))
         if index == self.sel_v:
             self.video_start = self.video_clips[index].start
-        if self.follow_in.get_active() and 0 <= self.sel_a < len(self.audio_clips):
-            self.audio_clips[self.sel_a].start = self.video_clips[index].start
-            self.audio_start = self.audio_clips[self.sel_a].start
+            # Follow-in tracks the primary clip only (not every group member).
+            if self.follow_in.get_active() and 0 <= self.sel_a < len(self.audio_clips):
+                self.audio_clips[self.sel_a].start = self.video_clips[index].start
+                self.audio_start = self.audio_clips[self.sel_a].start
         if not done:
             return
         self._sync_timeline_clips()
@@ -3383,7 +3417,11 @@ class EditorWindow(Adw.ApplicationWindow):
         self._apply_timeline_frame(t, start_media=False)
         self._checkpoint()
         self._schedule_autosave()
-        self._set_status(f"Video at {self.video_clips[index].start + inn:.2f}s")
+        n = len(self.sel_vs) if len(self.sel_vs) > 1 else 1
+        if n > 1:
+            self._set_status(f"Moved {n} video clips")
+        else:
+            self._set_status(f"Video at {self.video_clips[index].start + inn:.2f}s")
 
     def _on_audio_move(self, index: int, start: float, done: bool) -> None:
         if not self._guard_edit("move"):
@@ -3492,6 +3530,9 @@ class EditorWindow(Adw.ApplicationWindow):
                     self.out_spin.set_value(c.out_s)
                 finally:
                     self._loading = False
+                n = len(self.sel_vs)
+                if n > 1:
+                    self._set_status(f"{n} video clips selected")
         elif kind == "audio":
             self.sel_vs = set()
             self.sel_kind = "audio"
