@@ -8,13 +8,13 @@ cd ~/tech/clip-editor-532-timeline-render-cache
 CLIP_EDITOR_APP_ID=local.clip.Editor.Dev python3 -m clip_editor
 ```
 
-Title should read **Clip editor (dev)**. Use **Render**, not any locked-preview control.
+Title should read **Clip editor (dev)**. There is no Render button — **Play / Space** bakes if needed.
 
-Use a project with at least two abutting video clips and a dissolve on the first.
-
-1. Confirm the thin bar above the lanes is **red** on used ranges (gray in gaps).
-2. Click **Render**. Status counts segments. Bar turns **green** on those ranges.
-3. Press **Play** (Space) on the same timeline. No second mode, no “editing locked”. Trim/move still work.
+1. New project, drop one clip. Bar over that clip is **red**.
+2. Press Space. It renders, bar turns **green**, then plays (picture + audio) on the same timeline.
+3. Add a second clip. First range stays **green**; the new one is **red**.
+4. Press Space. Renders the new range (and the join), whole bar **green**, plays through including transitions and audio.
+5. Playhead moves at 1× with no skips. Editing is never locked.
 4. Picture includes the dissolve; audio comes from the cache file (no second ffplay mix).
 5. Edit the **first** clip (trim or transform). Only that span (and the transition neighbor) turn **red**; a later unused clip stays green.
 6. **Render dirty** again — only red ranges re-bake.

@@ -19,6 +19,7 @@ from clip_editor.preview import (
     extract_acrossfade_signature,
     extract_xfade_signature,
     has_touching_follower,
+    mark_segments_green,
     playback_source,
     preview_out_path,
     proxy_dest_size,
@@ -598,6 +599,14 @@ class TimelineRenderCacheTest(unittest.TestCase):
         self.assertIs(segment_at(0.2, segs), segs[0])
         self.assertIs(segment_at(1.2, segs), segs[1])
         self.assertEqual(dirty_segments(segs), segs)
+
+    def test_mark_green_uses_marker_not_mp4(self) -> None:
+        clips = [ClipInst(start=0.0, in_s=0.0, out_s=1.0, media_id="a")]
+        segs = build_timeline_segments(video_clips=clips, **_seg_kwargs())
+        self.assertFalse(segs[0].is_green())
+        mark_segments_green(segs)
+        self.assertTrue(segs[0].is_green())
+        segs[0].marker_path.unlink(missing_ok=True)
 
     def test_rebase_preserves_speed(self) -> None:
         clips = [ClipInst(start=0.0, in_s=0.0, out_s=4.0, speed=2.0)]

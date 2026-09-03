@@ -302,16 +302,25 @@ class TimelineSegment:
     def path(self) -> Path:
         return preview_out_path(self.fingerprint, "seg")
 
+    @property
+    def marker_path(self) -> Path:
+        return self.path.with_suffix(".ok")
+
     def is_green(self) -> bool:
-        path = self.path
         try:
-            return path.is_file() and path.stat().st_size > 0
+            return self.marker_path.is_file()
         except OSError:
             return False
 
-    def file_offset(self, timeline_t: float) -> float:
-        """Seconds into the cached MP4 for a timeline time (file starts at render_t0)."""
-        return max(0.0, float(timeline_t) - float(self.render_t0))
+
+def mark_segments_green(segments: list[TimelineSegment]) -> None:
+    """Record that these ranges were covered by a successful preview bake."""
+    preview_cache_dir()
+    for seg in segments:
+        try:
+            seg.marker_path.write_text("", encoding="utf-8")
+        except OSError:
+            continue
 
 
 def _unique_times(values: list[float], *, eps: float = 0.001) -> list[float]:
