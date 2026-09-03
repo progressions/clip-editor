@@ -25,8 +25,9 @@ from clip_editor.project import (
 
 PREVIEW_CACHE_DIR = Path.home() / ".cache" / "clip-editor" / "previews"
 PREVIEW_PAD_S = 2.0
-PREVIEW_CACHE_KEEP = 10
+PREVIEW_CACHE_KEEP = 40
 PREVIEW_SHORT_AXIS = 540
+SEGMENT_MIN_S = 0.04
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +216,7 @@ def rebase_clips_for_window(
                 track=c.track,
                 transition=ttype,
                 transition_s=tdur,
+                speed=c.playback_speed(),
             )
         )
     return out
@@ -284,6 +286,197 @@ def render_fingerprint(
     }
     body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class TimelineSegment:
+    """One non-overlapping timeline span for the render-cache bar (#532)."""
+
+    t0: float
+    t1: float
+    render_t0: float
+    render_t1: float
+    fingerprint: str
+
+    @property
+    def path(self) -> Path:
+        return preview_out_path(self.fingerprint, "seg")
+
+    @property
+    def marker_path(self) -> Path:
+        return self.path.with_suffix(".ok")
+
+    def is_green(self) -> bool:
+        try:
+            return self.marker_path.is_file()
+        except OSError:
+            return False
+
+
+def mark_segments_green(segments: list[TimelineSegment]) -> None:
+    """Record that these ranges were covered by a successful preview bake."""
+    preview_cache_dir()
+    for seg in segments:
+        try:
+            seg.marker_path.write_text("", encoding="utf-8")
+        except OSError:
+            continue
+
+
+def _unique_times(values: list[float], *, eps: float = 0.001) -> list[float]:
+    if not values:
+        return []
+    ordered = sorted(float(v) for v in values)
+    out = [ordered[0]]
+    for t in ordered[1:]:
+        if t - out[-1] > eps:
+            out.append(t)
+    return out
+
+
+def clips_touching_window(
+    clips: list[ClipInst],
+    t0: float,
+    t1: float,
+    src_durs: dict[str, float] | float,
+    *,
+    eps: float = 0.001,
+) -> list[ClipInst]:
+    """Clips whose used range overlaps ``[t0, t1)``."""
+    a, b = float(t0), float(t1)
+    hit: list[ClipInst] = []
+    for c in clips:
+        u0, u1, inn, out = _clip_used_range(c, _dur_lookup(c, src_durs))
+        if out <= inn + SEGMENT_MIN_S:
+            continue
+        if u1 > a + eps and u0 < b - eps:
+            hit.append(c)
+    return hit
+
+
+def _cut_has_transition(
+    video_clips: list[ClipInst],
+    cut_t: float,
+    src_durs: dict[str, float] | float,
+    *,
+    eps: float = 0.04,
+) -> bool:
+    """True if a clip ending at *cut_t* has an outgoing transition into a follower."""
+    for i, c in enumerate(video_clips):
+        _u0, u1, inn, out = _clip_used_range(c, _dur_lookup(c, src_durs))
+        if out <= inn + SEGMENT_MIN_S:
+            continue
+        if abs(u1 - cut_t) > eps:
+            continue
+        ttype, _tdur = normalize_transition(c.transition, c.transition_s)
+        if ttype == TRANSITION_NONE:
+            continue
+        if has_touching_follower(video_clips, i, src_durs, eps=eps):
+            return True
+    return False
+
+
+def _render_pad_for_edge(
+    video_clips: list[ClipInst],
+    edge_t: float,
+    src_durs: dict[str, float] | float,
+) -> float:
+    return PREVIEW_PAD_S if _cut_has_transition(video_clips, edge_t, src_durs) else 0.0
+
+
+def build_timeline_segments(
+    *,
+    video_clips: list[ClipInst],
+    audio_clips: list[ClipInst],
+    src_durs: dict[str, float] | float,
+    aspect: str,
+    pan_x: float,
+    pan_y: float,
+    audio_follows_in: bool,
+    use_video_soundtrack: bool,
+    audio_offset: float,
+    media: list[MediaItem],
+) -> list[TimelineSegment]:
+    """Cover used video ranges with fingerprintable segments.
+
+    Gaps with no video stay off the bar (gray). Render windows grow by
+    ``PREVIEW_PAD_S`` only at cuts that have an outgoing transition.
+    """
+    times: list[float] = []
+    used: list[tuple[float, float]] = []
+    for c in video_clips:
+        u0, u1, inn, out = _clip_used_range(c, _dur_lookup(c, src_durs))
+        if out <= inn + SEGMENT_MIN_S or u1 <= u0 + SEGMENT_MIN_S:
+            continue
+        used.append((u0, u1))
+        times.extend((u0, u1))
+    if not used:
+        return []
+    bounds = _unique_times(times)
+    end = timeline_end(video_clips, src_durs, audio_clips)
+    segs: list[TimelineSegment] = []
+    for a, b in zip(bounds, bounds[1:]):
+        if b - a < SEGMENT_MIN_S:
+            continue
+        if not any(u0 < b - 0.001 and u1 > a + 0.001 for u0, u1 in used):
+            continue
+        pad0 = _render_pad_for_edge(video_clips, a, src_durs)
+        pad1 = _render_pad_for_edge(video_clips, b, src_durs)
+        render_t0 = max(0.0, a - pad0)
+        render_t1 = min(end, b + pad1)
+        if render_t1 <= render_t0 + SEGMENT_MIN_S:
+            render_t1 = min(end, render_t0 + SEGMENT_MIN_S + 0.1)
+        v_touch = clips_touching_window(video_clips, render_t0, render_t1, src_durs)
+        a_touch = clips_touching_window(audio_clips, render_t0, render_t1, src_durs)
+        fp = render_fingerprint(
+            aspect=aspect,
+            pan_x=pan_x,
+            pan_y=pan_y,
+            audio_follows_in=audio_follows_in,
+            use_video_soundtrack=use_video_soundtrack,
+            audio_offset=audio_offset,
+            video_clips=v_touch,
+            audio_clips=a_touch,
+            media=media,
+            kind="seg",
+            window=(render_t0, render_t1),
+        )
+        segs.append(
+            TimelineSegment(
+                t0=a,
+                t1=b,
+                render_t0=render_t0,
+                render_t1=render_t1,
+                fingerprint=fp,
+            )
+        )
+    return segs
+
+
+def segment_at(
+    timeline_t: float, segments: list[TimelineSegment]
+) -> TimelineSegment | None:
+    t = float(timeline_t)
+    for seg in segments:
+        if seg.t0 - 0.001 <= t < seg.t1 - 0.001:
+            return seg
+        if abs(t - seg.t1) <= 0.02 and seg is segments[-1]:
+            return seg
+    return None
+
+
+def playback_source(
+    timeline_t: float, segments: list[TimelineSegment]
+) -> str:
+    """``cache`` if the playhead sits in a green segment, else ``edit``."""
+    seg = segment_at(timeline_t, segments)
+    if seg is not None and seg.is_green():
+        return "cache"
+    return "edit"
+
+
+def dirty_segments(segments: list[TimelineSegment]) -> list[TimelineSegment]:
+    return [s for s in segments if not s.is_green()]
 
 
 def preview_cache_dir() -> Path:

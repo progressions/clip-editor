@@ -13,14 +13,19 @@ from clip_editor.preview import (
     PREVIEW_CACHE_DIR,
     PREVIEW_PROFILE,
     assert_preview_path_safe,
+    build_timeline_segments,
     cleanup_preview_cache,
+    dirty_segments,
     extract_acrossfade_signature,
     extract_xfade_signature,
     has_touching_follower,
+    mark_segments_green,
+    playback_source,
     preview_out_path,
     proxy_dest_size,
     rebase_clips_for_window,
     render_fingerprint,
+    segment_at,
     selected_cut_window,
 )
 from clip_editor.project import (
@@ -510,6 +515,103 @@ class TimelineReadOnlyTest(unittest.TestCase):
                 state, None, RuntimeError("stale"), "full", "hash", None, 4
             )
         )
+
+
+def _seg_kwargs(**extra: object) -> dict:
+    base: dict = {
+        "audio_clips": [],
+        "src_durs": 10.0,
+        "aspect": "9:16",
+        "pan_x": 0.5,
+        "pan_y": 0.5,
+        "audio_follows_in": False,
+        "use_video_soundtrack": False,
+        "audio_offset": 0.0,
+        "media": [],
+    }
+    base.update(extra)
+    return base
+
+
+class TimelineRenderCacheTest(unittest.TestCase):
+    def test_segments_split_at_clip_edges(self) -> None:
+        clips = [
+            ClipInst(start=0.0, in_s=0.0, out_s=2.0, media_id="a"),
+            ClipInst(start=2.0, in_s=0.0, out_s=3.0, media_id="b"),
+        ]
+        segs = build_timeline_segments(video_clips=clips, **_seg_kwargs())
+        self.assertEqual(len(segs), 2)
+        self.assertAlmostEqual(segs[0].t0, 0.0)
+        self.assertAlmostEqual(segs[0].t1, 2.0)
+        self.assertAlmostEqual(segs[1].t0, 2.0)
+        self.assertAlmostEqual(segs[1].t1, 5.0)
+
+    def test_gap_is_not_a_segment(self) -> None:
+        clips = [
+            ClipInst(start=0.0, in_s=0.0, out_s=1.0, media_id="a"),
+            ClipInst(start=3.0, in_s=0.0, out_s=1.0, media_id="b"),
+        ]
+        segs = build_timeline_segments(video_clips=clips, **_seg_kwargs())
+        self.assertEqual(len(segs), 2)
+        self.assertAlmostEqual(segs[0].t1, 1.0)
+        self.assertAlmostEqual(segs[1].t0, 3.0)
+
+    def test_distant_clip_edit_does_not_change_other_fingerprint(self) -> None:
+        a = ClipInst(start=0.0, in_s=0.0, out_s=1.0, media_id="a")
+        b = ClipInst(start=4.0, in_s=0.0, out_s=1.0, media_id="b")
+        segs = build_timeline_segments(video_clips=[a, b], **_seg_kwargs())
+        fp_a = segs[0].fingerprint
+        b2 = ClipInst(start=4.0, in_s=0.0, out_s=1.0, media_id="b", transform_x=40.0)
+        segs2 = build_timeline_segments(video_clips=[a, b2], **_seg_kwargs())
+        self.assertEqual(fp_a, segs2[0].fingerprint)
+        self.assertNotEqual(segs[1].fingerprint, segs2[1].fingerprint)
+
+    def test_transition_neighbor_pad_invalidates_both(self) -> None:
+        a = ClipInst(
+            start=0.0,
+            in_s=0.0,
+            out_s=2.0,
+            media_id="a",
+            transition=TRANSITION_DISSOLVE,
+            transition_s=0.5,
+        )
+        b = ClipInst(start=2.0, in_s=0.0, out_s=2.0, media_id="b")
+        segs = build_timeline_segments(video_clips=[a, b], **_seg_kwargs())
+        self.assertGreater(segs[0].render_t1, segs[0].t1)
+        b2 = ClipInst(start=2.0, in_s=0.0, out_s=2.0, media_id="b", scale=1.2)
+        segs2 = build_timeline_segments(video_clips=[a, b2], **_seg_kwargs())
+        self.assertNotEqual(segs[0].fingerprint, segs2[0].fingerprint)
+
+    def test_playback_source_cache_vs_edit(self) -> None:
+        clips = [ClipInst(start=0.0, in_s=0.0, out_s=2.0, media_id="a")]
+        segs = build_timeline_segments(video_clips=clips, **_seg_kwargs())
+        self.assertEqual(playback_source(0.5, segs), "edit")
+        with mock.patch.object(type(segs[0]), "is_green", return_value=True):
+            self.assertEqual(playback_source(0.5, segs), "cache")
+            self.assertEqual(playback_source(3.0, segs), "edit")
+
+    def test_segment_at_and_dirty(self) -> None:
+        clips = [
+            ClipInst(start=0.0, in_s=0.0, out_s=1.0, media_id="a"),
+            ClipInst(start=1.0, in_s=0.0, out_s=1.0, media_id="b"),
+        ]
+        segs = build_timeline_segments(video_clips=clips, **_seg_kwargs())
+        self.assertIs(segment_at(0.2, segs), segs[0])
+        self.assertIs(segment_at(1.2, segs), segs[1])
+        self.assertEqual(dirty_segments(segs), segs)
+
+    def test_mark_green_uses_marker_not_mp4(self) -> None:
+        clips = [ClipInst(start=0.0, in_s=0.0, out_s=1.0, media_id="a")]
+        segs = build_timeline_segments(video_clips=clips, **_seg_kwargs())
+        self.assertFalse(segs[0].is_green())
+        mark_segments_green(segs)
+        self.assertTrue(segs[0].is_green())
+        segs[0].marker_path.unlink(missing_ok=True)
+
+    def test_rebase_preserves_speed(self) -> None:
+        clips = [ClipInst(start=0.0, in_s=0.0, out_s=4.0, speed=2.0)]
+        rebased = rebase_clips_for_window(clips, 0.0, 1.0, 10.0)
+        self.assertAlmostEqual(rebased[0].playback_speed(), 2.0)
 
 
 if __name__ == "__main__":
