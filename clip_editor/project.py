@@ -73,6 +73,23 @@ def normalize_transition(type_s: object, duration_s: object = 0.0) -> tuple[str,
     return raw, max(0.1, min(3.0, dur))
 
 
+# Playback rate for a clip instance (#531). Pitch follows rate via atempo on export.
+MIN_SPEED = 0.25
+MAX_SPEED = 4.0
+DEFAULT_SPEED = 1.0
+
+
+def normalize_speed(value: object, default: float = DEFAULT_SPEED) -> float:
+    """Clamp a speed factor into the supported range; invalid → *default*."""
+    try:
+        speed = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return float(default)
+    if speed <= 0.0 or speed != speed:  # NaN
+        return float(default)
+    return max(MIN_SPEED, min(MAX_SPEED, speed))
+
+
 @dataclass
 class ClipInst:
     """One instance of a bin item on the timeline."""
@@ -88,15 +105,33 @@ class ClipInst:
     # Outgoing cut into the next touching flattened video segment.
     transition: str = TRANSITION_NONE
     transition_s: float = 0.0
+    # Timeline rate vs source (2.0 = twice as fast → half the timeline length).
+    speed: float = DEFAULT_SPEED
 
     def used(self) -> tuple[float, float]:
         inn = max(0.0, float(self.in_s))
         out = float(self.out_s) if self.out_s > inn else inn
         return inn, out
 
-    def used_times(self) -> tuple[float, float]:
+    def playback_speed(self) -> float:
+        return normalize_speed(self.speed)
+
+    def source_len(self, src_dur: float = 0.0) -> float:
         inn, out = self.used()
-        return self.start + inn, self.start + out
+        if src_dur > 0:
+            if out <= inn:
+                out = float(src_dur)
+            out = min(out, float(src_dur))
+        return max(0.0, out - inn)
+
+    def timeline_len(self, src_dur: float = 0.0) -> float:
+        src = self.source_len(src_dur)
+        return src / self.playback_speed() if src > 0 else 0.0
+
+    def used_times(self, src_dur: float = 0.0) -> tuple[float, float]:
+        inn, _out = self.used()
+        t0 = float(self.start) + inn
+        return t0, t0 + self.timeline_len(src_dur)
 
     def copy(self) -> ClipInst:
         return ClipInst(
@@ -110,6 +145,7 @@ class ClipInst:
             track=self.track,
             transition=self.transition,
             transition_s=self.transition_s,
+            speed=self.playback_speed(),
         )
 
     def split_at(
@@ -144,6 +180,7 @@ class ClipInst:
             track=self.track,
             transition=self.transition,
             transition_s=self.transition_s,
+            speed=self.playback_speed(),
         )
         self.out_s = src_cut
         self.transition = TRANSITION_NONE
@@ -167,6 +204,9 @@ def clip_to_dict(c: ClipInst) -> dict:
     if ttype != TRANSITION_NONE:
         d["transition"] = ttype
         d["transition_s"] = tdur
+    speed = c.playback_speed()
+    if abs(speed - DEFAULT_SPEED) > 0.0001:
+        d["speed"] = speed
     return d
 
 
@@ -185,6 +225,7 @@ def clip_from_dict(data: object) -> ClipInst | None:
         return None
     mid = str(data.get("media_id") or "")
     ttype, tdur = normalize_transition(data.get("transition"), data.get("transition_s"))
+    speed = normalize_speed(data.get("speed", DEFAULT_SPEED))
     return ClipInst(
         start=start,
         in_s=inn,
@@ -196,7 +237,25 @@ def clip_from_dict(data: object) -> ClipInst | None:
         track=track,
         transition=ttype,
         transition_s=tdur,
+        speed=speed,
     )
+
+
+def atempo_chain(speed: float) -> list[str]:
+    """FFmpeg ``atempo`` filters for *speed* (each factor must be in 0.5–2.0)."""
+    speed = normalize_speed(speed)
+    if abs(speed - 1.0) <= 1e-6:
+        return []
+    factors: list[float] = []
+    rem = speed
+    while rem > 2.0 + 1e-9:
+        factors.append(2.0)
+        rem /= 2.0
+    while rem < 0.5 - 1e-9:
+        factors.append(0.5)
+        rem /= 0.5
+    factors.append(rem)
+    return [f"atempo={f:.6f}" for f in factors if abs(f - 1.0) > 1e-6]
 
 
 def apply_legacy_crossfade(clips: list[ClipInst], crossfade_s: float) -> None:
