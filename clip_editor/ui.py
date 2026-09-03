@@ -4209,8 +4209,9 @@ class EditorWindow(Adw.ApplicationWindow):
         self.preview.set_blank(False)
         self.preview.set_media(self._vmedia)
         m = self._vmedia
-        m.set_muted(False)
-        m.set_volume(1.0)
+        # Gtk.Picture is video-only; playthrough audio is ffplay/mpv on this file.
+        m.set_muted(True)
+        m.set_volume(0.0)
         offset = max(0.0, float(timeline_t))
         self._playthrough_playing = True
 
@@ -4280,13 +4281,19 @@ class EditorWindow(Adw.ApplicationWindow):
             self.preview.queue_draw()
 
     def _start_preview_audio(self, timeline_t: float) -> None:
-        if self._compiled_mode or self._playthrough_playing:
-            # Compiled / segment-cache preview uses MediaFile audio only.
+        if self._compiled_mode:
             self._stop_preview_audio()
             return
         self._stop_preview_audio()
         begins = self._audio_begins_at()
-        specs = self._preview_audio_specs(timeline_t)
+        if self._playthrough_playing and self._playthrough_path is not None:
+            start = max(0.0, float(timeline_t))
+            remaining = max(0.05, self._program_end() - start)
+            specs: list[tuple[Path, float, float]] = [
+                (self._playthrough_path, start, remaining)
+            ]
+        else:
+            specs = self._preview_audio_specs(timeline_t)
         # Gain and routing follow the specs playing at timeline_t, not every clip
         # in the project: a clip on A1 at 0-5s and one on A2 at 10-15s never
         # overlap, so halving both would preview quieter than the export, which
@@ -4377,9 +4384,12 @@ class EditorWindow(Adw.ApplicationWindow):
             return
         if mix_proc is not None and mix_proc.stdout is not None:
             mix_proc.stdout.close()
-        src = "A1 + A2" if len(specs) > 1 else (
-            self.audio_path.name if self.audio_path else "video soundtrack"
-        )
+        if self._playthrough_playing:
+            src = "preview"
+        elif len(specs) > 1:
+            src = "A1 + A2"
+        else:
+            src = self.audio_path.name if self.audio_path else "video soundtrack"
         self._set_status(f"Playing {src}")
         GLib.timeout_add(400, self._check_preview_audio, log)
 
