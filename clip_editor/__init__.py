@@ -1,3 +1,3 @@
 """Local clip editor: crop, mux audio, export Buffer-safe H.264."""
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"

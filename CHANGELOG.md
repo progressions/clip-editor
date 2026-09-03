@@ -7,6 +7,14 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-03
+
+### Added
+
+- Per-clip playback speed (0.25×–4×) in the inspector; multi-select applies one rate to every selected video clip ([#531](https://app.fizzy.do/6109848/cards/531) / PR #11).
+- Timeline bar shrinks/grows with rate; export uses `setpts` + `atempo` (pitch follows rate).
+- Speed persists in `.clip.json` (default remains 1×).
+
 ## [0.4.0] — 2026-09-02
 
 ### Added
@@ -46,7 +54,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 - Initial packaged release of the native GTK clip editor for Buffer-safe H.264/AAC exports.
 
-[Unreleased]: https://github.com/progressions/clip-editor/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/progressions/clip-editor/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/progressions/clip-editor/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/progressions/clip-editor/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/progressions/clip-editor/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/progressions/clip-editor/compare/v0.1.0...v0.2.0
