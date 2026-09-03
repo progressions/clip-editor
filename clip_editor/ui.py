@@ -378,6 +378,7 @@ class Timeline(Gtk.DrawingArea):
         self._drag_group_starts: dict[int, float] = {}
         self._ripple_t1_0 = 0.0
         self._ripple_starts: dict[int, float] = {}
+        self._drag_moved = False
         self._snap_line: float | None = None
         self._drop_hover: tuple[str, float, int] | None = None
         self.set_hexpand(False)
@@ -896,6 +897,7 @@ class Timeline(Gtk.DrawingArea):
         self._drag_span = max(self._map_span(), 0.01)
         self._drag_y0 = oy
         self._drag_group_starts = {}
+        self._drag_moved = False
         if self.read_only:
             self._drag_mode = "seek"
             self._drag_index = -1
@@ -1082,6 +1084,8 @@ class Timeline(Gtk.DrawingArea):
         return max(-used_in, best)
 
     def _on_drag_update(self, gesture: Gtk.GestureDrag, dx: float, dy: float) -> None:
+        if abs(dx) >= 1.0 or abs(dy) >= 1.0:
+            self._drag_moved = True
         dt = self._dt(dx)
         if self._drag_mode == "video-in":
             c = self._vclip()
@@ -1226,9 +1230,9 @@ class Timeline(Gtk.DrawingArea):
         mode = self._drag_mode
         group_starts = dict(self._drag_group_starts)
         idx = self._drag_index
-        if mode == "video-out":
+        if self._drag_moved and mode == "video-out":
             self._apply_ripple("video", idx)
-        elif mode == "audio-out":
+        elif self._drag_moved and mode == "audio-out":
             self._apply_ripple("audio", idx)
         self._drag_mode = ""
         self._drag_group_starts = {}
@@ -1258,13 +1262,13 @@ class Timeline(Gtk.DrawingArea):
         elif mode in ("video-in", "video-out"):
             self.set_cursor_from_name("col-resize" if mode == "video-out" else "ew-resize")
             c = self._vclip(idx)
-            if c is not None and callable(self.on_video_trim):
+            if c is not None and callable(self.on_video_trim) and self._drag_moved:
                 inn, out = self._clip_used(c, self._clip_src_dur(c, "v"))
                 self.on_video_trim(idx, inn, out, True)
         elif mode in ("audio-in", "audio-out"):
             self.set_cursor_from_name("ew-resize")
             c = self._aclip(idx)
-            if c is not None and callable(self.on_audio_trim):
+            if c is not None and callable(self.on_audio_trim) and self._drag_moved:
                 inn, out = self._clip_used(c, self._clip_src_dur(c, "a"))
                 self.on_audio_trim(idx, inn, out, True)
         elif mode == "seek" and callable(self.on_seek):
@@ -2014,12 +2018,12 @@ class EditorWindow(Adw.ApplicationWindow):
         trim.append(Gtk.Label(label="In"))
         self.in_spin = Gtk.SpinButton.new_with_range(0, 99999, 0.05)
         self.in_spin.set_digits(2)
-        self.in_spin.connect("value-changed", lambda *_: self._refresh_fit())
+        self.in_spin.connect("value-changed", self._on_trim_spin_changed)
         trim.append(self.in_spin)
         trim.append(Gtk.Label(label="Out"))
         self.out_spin = Gtk.SpinButton.new_with_range(0, 99999, 0.05)
         self.out_spin.set_digits(2)
-        self.out_spin.connect("value-changed", lambda *_: self._refresh_fit())
+        self.out_spin.connect("value-changed", self._on_trim_spin_changed)
         trim.append(self.out_spin)
         right.append(trim)
         row = Gtk.Box(spacing=8)
@@ -3191,10 +3195,16 @@ class EditorWindow(Adw.ApplicationWindow):
                 )
             self.media_list.append(card)
 
-    def _refresh_fit(self) -> None:
-        if 0 <= self.sel_v < len(self.video_clips) and not self._loading:
+    def _on_trim_spin_changed(self, *_args: object) -> None:
+        """Inspector In/Out only; do not run this on timeline click/trim."""
+        if self._loading:
+            return
+        if 0 <= self.sel_v < len(self.video_clips):
             self.video_clips[self.sel_v].in_s = self.in_spin.get_value()
             self.video_clips[self.sel_v].out_s = self.out_spin.get_value()
+        self._refresh_fit()
+
+    def _refresh_fit(self) -> None:
         v = self._edit_dur()
         a = self._audio_usable()
         longer = bool(self.audio_path) and a > v + 0.05 and v > 0.04
