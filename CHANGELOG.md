@@ -7,6 +7,14 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-09-03
+
+### Added
+
+- Timeline preview bar: red = not rendered, green = rendered ([#532](https://app.fizzy.do/6109848/cards/532) / PR #13).
+- Play (Space) bakes a preview when anything is red, then plays that preview on the same timeline (transitions + audio). Already-green ranges stay green when you add new clips.
+- `CLIP_EDITOR_APP_ID` to run a second window beside the packaged app.
+
 ## [0.5.0] — 2026-09-03
 
 ### Added
@@ -54,7 +62,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 - Initial packaged release of the native GTK clip editor for Buffer-safe H.264/AAC exports.
 
-[Unreleased]: https://github.com/progressions/clip-editor/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/progressions/clip-editor/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/progressions/clip-editor/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/progressions/clip-editor/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/progressions/clip-editor/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/progressions/clip-editor/compare/v0.2.0...v0.3.0
