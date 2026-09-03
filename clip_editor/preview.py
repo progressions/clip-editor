@@ -79,7 +79,10 @@ def _clip_used_range(
         out = min(out, src_dur)
     if out <= inn:
         return float(clip.start), float(clip.start), inn, inn
-    return float(clip.start) + inn, float(clip.start) + out, inn, out
+    speed = clip.playback_speed()
+    t0 = float(clip.start) + inn
+    t1 = t0 + (out - inn) / speed
+    return t0, t1, inn, out
 
 
 def timeline_end(
@@ -263,6 +266,7 @@ def render_fingerprint(
                 "track": int(c.track),
                 "transition": c.transition,
                 "transition_s": round(float(c.transition_s), 6),
+                "speed": round(float(c.playback_speed()), 6),
             }
             for c in video_clips
         ],
@@ -273,6 +277,7 @@ def render_fingerprint(
                 "out_s": round(float(c.out_s), 6),
                 "media_id": c.media_id,
                 "track": int(c.track),
+                "speed": round(float(c.playback_speed()), 6),
             }
             for c in audio_clips
         ],
@@ -367,6 +372,7 @@ COMPILED_BLOCKED_ACTIONS = frozenset(
         "duplicate",
         "track",
         "transform",
+        "speed",
         "transition",
         "audio_route",
         "media_place",

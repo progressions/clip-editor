@@ -42,7 +42,10 @@ from clip_editor.preview import (
 )
 from clip_editor.probe import ProbeError, probe, which_ffmpeg
 from clip_editor.project import (
+    DEFAULT_SPEED,
     DEFAULT_TRANSITION_S,
+    MAX_SPEED,
+    MIN_SPEED,
     TRANSITION_DISSOLVE,
     TRANSITION_NONE,
     TRANSITION_WHITE_FLASH,
@@ -53,6 +56,7 @@ from clip_editor.project import (
     clear_autosave,
     media_load_errors,
     next_media_id,
+    normalize_speed,
     normalize_transition,
     read_autosave,
     read_project,
@@ -568,7 +572,9 @@ class Timeline(Gtk.DrawingArea):
 
     def _clip_times(self, c: ClipInst, src_dur: float) -> tuple[float, float]:
         inn, out = self._clip_used(c, src_dur)
-        return c.start + inn, c.start + out
+        speed = c.playback_speed()
+        t0 = c.start + inn
+        return t0, t0 + (out - inn) / speed
 
     def _video_used(self) -> tuple[float, float]:
         c = self._vclip()
@@ -1017,12 +1023,16 @@ class Timeline(Gtk.DrawingArea):
             if c is None:
                 return
             inn, _out = self._clip_used(c, self._clip_src_dur(c, "v"))
-            top = self._clip_src_dur(c, "v") or self._drag_v0 + dt
-            raw = max(inn + self._MIN, min(top, self._drag_v0 + dt))
-            snapped = self._snap_time(c.start + raw, self._other_edges("video"))
-            c.out_s = max(inn + self._MIN, min(top, snapped - c.start))
+            top = self._clip_src_dur(c, "v") or max(inn + self._MIN, self._drag_v0)
+            speed = c.playback_speed()
+            # _drag_v0 is source out; map dx through timeline then back to source.
+            t0 = c.start + inn
+            timeline_end = t0 + max(self._MIN, (self._drag_v0 - inn) / speed) + dt
+            snapped = self._snap_time(timeline_end, self._other_edges("video"))
+            source_len = max(self._MIN, (snapped - t0) * speed)
+            c.out_s = max(inn + self._MIN, min(top, inn + source_len))
             self.out_s = c.out_s
-            if abs((c.start + c.out_s) - snapped) > 1e-4:
+            if abs((t0 + (c.out_s - inn) / speed) - snapped) > 1e-4:
                 self._snap_line = None
             if callable(self.on_video_trim):
                 self.on_video_trim(self._drag_index, inn, c.out_s, False)
@@ -1048,12 +1058,15 @@ class Timeline(Gtk.DrawingArea):
             if c is None:
                 return
             ain, _aout = self._clip_used(c, self._clip_src_dur(c, "a"))
-            top = self._clip_src_dur(c, "a") or self._drag_v0 + dt
-            raw = max(ain + self._MIN, min(top, self._drag_v0 + dt))
-            snapped = self._snap_time(c.start + raw, self._other_edges("audio"))
-            c.out_s = max(ain + self._MIN, min(top, snapped - c.start))
+            top = self._clip_src_dur(c, "a") or max(ain + self._MIN, self._drag_v0)
+            speed = c.playback_speed()
+            t0 = c.start + ain
+            timeline_end = t0 + max(self._MIN, (self._drag_v0 - ain) / speed) + dt
+            snapped = self._snap_time(timeline_end, self._other_edges("audio"))
+            source_len = max(self._MIN, (snapped - t0) * speed)
+            c.out_s = max(ain + self._MIN, min(top, ain + source_len))
             self.audio_out = c.out_s
-            if abs((c.start + c.out_s) - snapped) > 1e-4:
+            if abs((t0 + (c.out_s - ain) / speed) - snapped) > 1e-4:
                 self._snap_line = None
             if callable(self.on_audio_trim):
                 self.on_audio_trim(self._drag_index, ain, c.out_s, False)
@@ -1064,8 +1077,9 @@ class Timeline(Gtk.DrawingArea):
             if anchor is None or self._drag_index not in self._drag_group_starts:
                 return
             inn, out = self._clip_used(anchor, self._clip_src_dur(anchor, "v"))
+            right = inn + (out - inn) / anchor.playback_speed()
             start = max(-inn, self._drag_v0 + dt)
-            start = self._snap_move(start, inn, out, self._other_edges("video"))
+            start = self._snap_move(start, inn, right, self._other_edges("video"))
             start = max(-inn, start)
             moved = group_moved_starts(
                 self._drag_group_starts,
@@ -1089,8 +1103,9 @@ class Timeline(Gtk.DrawingArea):
                 if c is None:
                     return
                 inn, out = self._clip_used(c, self._clip_src_dur(c, "v"))
+                right = inn + (out - inn) / c.playback_speed()
                 start = max(-inn, self._drag_v0 + dt)
-                start = self._snap_move(start, inn, out, self._other_edges("video"))
+                start = self._snap_move(start, inn, right, self._other_edges("video"))
                 start = max(-inn, start)
                 c.start = start
                 track = self._track_at("video", self._drag_y0 + dy)
@@ -1106,8 +1121,9 @@ class Timeline(Gtk.DrawingArea):
                 if c is None:
                     return
                 inn, out = self._clip_used(c, self._clip_src_dur(c, "a"))
+                right = inn + (out - inn) / c.playback_speed()
                 start = max(-inn, self._drag_v0 + dt)
-                start = self._snap_move(start, inn, out, self._other_edges("audio"))
+                start = self._snap_move(start, inn, right, self._other_edges("audio"))
                 start = max(-inn, start)
                 c.start = start
                 track = self._track_at("audio", self._drag_y0 + dy)
@@ -1812,6 +1828,29 @@ class EditorWindow(Adw.ApplicationWindow):
         self.btn_transform_reset.connect("clicked", self._on_transform_reset)
         transform.attach(self.btn_transform_reset, 2, 0, 1, 3)
         right.append(transform)
+
+        right.append(self._section("Speed"))
+        speed_row = Gtk.Box(spacing=8)
+        speed_row.append(Gtk.Label(label="Rate", xalign=0))
+        self.speed_spin = Gtk.SpinButton.new_with_range(MIN_SPEED, MAX_SPEED, 0.05)
+        self.speed_spin.set_digits(2)
+        self.speed_spin.set_value(DEFAULT_SPEED)
+        self.speed_spin.set_tooltip_text(
+            "Playback rate for the selected clip(s). "
+            "Faster shortens the timeline; slower lengthens it. "
+            "Export audio pitch follows rate (atempo)."
+        )
+        self.speed_spin.connect("value-changed", self._on_speed_changed)
+        speed_row.append(self.speed_spin)
+        speed_row.append(Gtk.Label(label="×"))
+        self.btn_speed_reset = Gtk.Button(label="1×")
+        self.btn_speed_reset.set_tooltip_text("Reset selected clip(s) to 1×")
+        self.btn_speed_reset.connect("clicked", self._on_speed_reset)
+        speed_row.append(self.btn_speed_reset)
+        right.append(speed_row)
+        self.speed_hint = self._wrapping_label("")
+        self.speed_hint.add_css_class("dim-label")
+        right.append(self.speed_hint)
 
         right.append(self._section("Audio"))
         row = Gtk.Box(spacing=8)
@@ -2792,6 +2831,7 @@ class EditorWindow(Adw.ApplicationWindow):
             self.transform_scale_spin.set_value(clip.scale if clip else 1.0)
         finally:
             self._loading = was_loading
+        self._sync_speed_controls()
 
     def _on_transform_changed(self, *_args: object) -> None:
         if self._loading:
@@ -2818,6 +2858,71 @@ class EditorWindow(Adw.ApplicationWindow):
         self.transform_y_spin.set_value(0.0)
         self.transform_scale_spin.set_value(1.0)
         self._checkpoint()
+
+    def _speed_target_clips(self) -> list[ClipInst]:
+        """Clips that should receive a speed change (video multi-select, else audio)."""
+        indices = self._selected_video_indices()
+        if indices:
+            return [self.video_clips[i] for i in indices]
+        if self.sel_kind == "audio" and 0 <= self.sel_a < len(self.audio_clips):
+            return [self.audio_clips[self.sel_a]]
+        return []
+
+    def _sync_speed_controls(self) -> None:
+        clips = self._speed_target_clips()
+        enabled = bool(clips) and not self.exporting and not self._editing_locked()
+        was_loading = self._loading
+        self._loading = True
+        try:
+            if not clips:
+                self.speed_spin.set_value(DEFAULT_SPEED)
+                self.speed_hint.set_text("")
+            else:
+                speeds = [c.playback_speed() for c in clips]
+                self.speed_spin.set_value(speeds[0])
+                if len(speeds) > 1 and max(speeds) - min(speeds) > 0.001:
+                    self.speed_hint.set_text(
+                        f"{len(clips)} selected — spin sets all to the same rate"
+                    )
+                else:
+                    src = clips[0].source_len(
+                        self._media_dur(clips[0].media_id)
+                        if clips[0].media_id
+                        else 0.0
+                    )
+                    tl = src / speeds[0] if speeds[0] > 0 else 0.0
+                    self.speed_hint.set_text(
+                        f"Source {src:.2f}s → timeline {tl:.2f}s at {speeds[0]:.2f}×"
+                    )
+            self.speed_spin.set_sensitive(enabled)
+            self.btn_speed_reset.set_sensitive(enabled)
+        finally:
+            self._loading = was_loading
+
+    def _on_speed_changed(self, *_args: object) -> None:
+        if self._loading:
+            return
+        if not self._guard_edit("speed"):
+            self._sync_speed_controls()
+            return
+        clips = self._speed_target_clips()
+        if not clips:
+            return
+        speed = normalize_speed(self.speed_spin.get_value())
+        for clip in clips:
+            clip.speed = speed
+        self._sync_timeline_clips()
+        self._sync_speed_controls()
+        self._apply_timeline_frame(self.timeline.playhead, start_media=False)
+        self._schedule_checkpoint()
+        self._schedule_autosave()
+
+    def _on_speed_reset(self, *_args: object) -> None:
+        if not self._guard_edit("speed"):
+            return
+        if not self._speed_target_clips():
+            return
+        self.speed_spin.set_value(DEFAULT_SPEED)
 
     def _refresh_export_name(self) -> None:
         if not self.video_path:
@@ -3848,7 +3953,10 @@ class EditorWindow(Adw.ApplicationWindow):
         out = float(c.out_s) if c.out_s > inn else src_dur
         if src_dur > 0:
             out = min(out, src_dur)
-        src = float(timeline_t) - float(c.start)
+        speed = c.playback_speed()
+        t0 = float(c.start) + inn
+        # Map timeline progress through the sped clip back onto source inn..out.
+        src = inn + (float(timeline_t) - t0) * speed
         src = max(src, inn)
         if out > inn:
             src = min(src, out)
@@ -3926,7 +4034,9 @@ class EditorWindow(Adw.ApplicationWindow):
         out = c.out_s if c.out_s > inn else dur
         if dur > 0:
             out = min(out, dur)
-        return c.start + inn, c.start + out
+        speed = c.playback_speed()
+        t0 = c.start + inn
+        return t0, t0 + (out - inn) / speed
 
     def _continuous_with(self, prev: ClipInst | None, nxt: ClipInst | None, src_dur: float) -> bool:
         """True if nxt is the same source file playing on from prev (a split, not moved)."""

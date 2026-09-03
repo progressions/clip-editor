@@ -24,6 +24,8 @@ from clip_editor.project import (
     ClipInst,
     MediaItem,
     apply_legacy_crossfade,
+    atempo_chain,
+    normalize_speed,
     normalize_transition,
 )
 
@@ -49,10 +51,11 @@ def _dur_for(c: ClipInst, src_dur: float | dict[str, float]) -> float:
 def _flatten_clips(
     clips: list[ClipInst], src_dur: float | dict[str, float]
 ) -> list[tuple]:
-    """Return timeline/source bounds, media id, transform, and outgoing transition.
+    """Return timeline/source bounds, media id, transform, transition, speed.
 
-    Row: ``(t0, t1, sinn, sout, mid, tx, ty, scale, transition, transition_s)``.
-    Later clips overwrite earlier ones on overlap, matching playback.
+    Row: ``(t0, t1, sinn, sout, mid, tx, ty, scale, transition, transition_s, speed)``.
+    ``t1 - t0`` is timeline length ``(sout - sinn) / speed``. Later clips
+    overwrite earlier ones on overlap, matching playback.
     """
     segs: list[tuple] = []
     for c in clips:
@@ -63,13 +66,24 @@ def _flatten_clips(
             out = min(out, dur)
         if out <= inn + 0.04:
             continue
+        speed = normalize_speed(c.speed)
+        source_len = out - inn
+        timeline_len = source_len / speed
         t0 = float(c.start) + inn
-        t1 = float(c.start) + out
+        t1 = t0 + timeline_len
         if t1 <= 0.02:
             continue
         if t0 < 0:
-            inn += -t0
+            # Shift source in-point so timeline starts at 0.
+            skip_tl = -t0
+            skip_src = skip_tl * speed
+            inn += skip_src
             t0 = 0.0
+            source_len = out - inn
+            if source_len <= 0.04:
+                continue
+            timeline_len = source_len / speed
+            t1 = t0 + timeline_len
         if out <= inn + 0.04:
             continue
         mid = c.media_id or ""
@@ -79,19 +93,60 @@ def _flatten_clips(
             st0, st1, sinn, sout, smid, sx, sy, scale = row[:8]
             st_type = row[8] if len(row) > 8 else TRANSITION_NONE
             st_dur = row[9] if len(row) > 9 else 0.0
+            st_speed = float(row[10]) if len(row) > 10 else 1.0
             if st1 <= t0 + 0.001 or st0 >= t1 - 0.001:
-                nxt.append((st0, st1, sinn, sout, smid, sx, sy, scale, st_type, st_dur))
-                continue
-            if st0 < t0 - 0.001:
-                keep = t0 - st0
-                # Remnant keeps its outgoing transition into the overlapping clip.
                 nxt.append(
-                    (st0, t0, sinn, sinn + keep, smid, sx, sy, scale, st_type, st_dur)
+                    (
+                        st0,
+                        st1,
+                        sinn,
+                        sout,
+                        smid,
+                        sx,
+                        sy,
+                        scale,
+                        st_type,
+                        st_dur,
+                        st_speed,
+                    )
+                )
+                continue
+            # Overlap remap in timeline space → source via this remnant's speed.
+            if st0 < t0 - 0.001:
+                keep_tl = t0 - st0
+                keep_src = keep_tl * st_speed
+                nxt.append(
+                    (
+                        st0,
+                        t0,
+                        sinn,
+                        sinn + keep_src,
+                        smid,
+                        sx,
+                        sy,
+                        scale,
+                        st_type,
+                        st_dur,
+                        st_speed,
+                    )
                 )
             if st1 > t1 + 0.001:
-                skip = t1 - st0
+                skip_tl = t1 - st0
+                skip_src = skip_tl * st_speed
                 nxt.append(
-                    (t1, st1, sinn + skip, sout, smid, sx, sy, scale, st_type, st_dur)
+                    (
+                        t1,
+                        st1,
+                        sinn + skip_src,
+                        sout,
+                        smid,
+                        sx,
+                        sy,
+                        scale,
+                        st_type,
+                        st_dur,
+                        st_speed,
+                    )
                 )
         nxt.append(
             (
@@ -105,6 +160,7 @@ def _flatten_clips(
                 max(0.05, float(c.scale)),
                 ttype,
                 tdur,
+                speed,
             )
         )
         segs = nxt
@@ -329,17 +385,28 @@ def build_cmd(
 
 
 def _timeline_parts(flat: list[tuple], out_dur: float) -> list[tuple]:
+    """Build gap/seg parts. Seg: ``(seg, sinn, source_len, mid, tx, ty, scale, ttype, tdur, speed)``."""
     parts: list[tuple] = []
     t = 0.0
     for row in flat:
-        t0, t1, sinn = float(row[0]), float(row[1]), float(row[2])
+        t0, t1, sinn, sout = (
+            float(row[0]),
+            float(row[1]),
+            float(row[2]),
+            float(row[3]),
+        )
         mid = str(row[4]) if len(row) > 4 else ""
         if t0 > t + 0.02:
             parts.append(("gap", t0 - t))
         transform = tuple(row[5:8]) if len(row) >= 8 else (0.0, 0.0, 1.0)
         ttype = row[8] if len(row) > 8 else TRANSITION_NONE
         tdur = float(row[9]) if len(row) > 9 else 0.0
-        parts.append(("seg", sinn, t1 - t0, mid, *transform, ttype, tdur))
+        speed = normalize_speed(row[10] if len(row) > 10 else 1.0)
+        source_len = max(0.0, sout - sinn)
+        # Prefer source_len from bounds; fall back to timeline*speed if needed.
+        if source_len <= 0.04:
+            source_len = max(0.0, (t1 - t0) * speed)
+        parts.append(("seg", sinn, source_len, mid, *transform, ttype, tdur, speed))
         t = t1
     if out_dur > t + 0.02:
         parts.append(("gap", out_dur - t))
@@ -461,10 +528,20 @@ def _encode_tail(
     ]
 
 
+def _part_speed(part: tuple) -> float:
+    if part[0] != "seg":
+        return 1.0
+    if len(part) >= 10:
+        return normalize_speed(part[9])
+    return 1.0
+
+
 def _part_duration(part: tuple) -> float:
+    """Timeline duration of a gap or seg (source_len / speed for segs)."""
     if part[0] == "gap":
         return max(0.0, float(part[1]))
-    return max(0.0, float(part[2]))
+    source_len = max(0.0, float(part[2]))
+    return source_len / _part_speed(part)
 
 
 def _join_parts(
@@ -728,6 +805,7 @@ def _build_cmd_many(
             sinn, sdur, mid = float(part[1]), float(part[2]), str(part[3])
             tx, ty = float(part[4]), float(part[5])
             clip_scale = max(0.05, float(part[6]))
+            speed = _part_speed(part)
             ii = idx_of.get(mid, 0)
             info = probes.get(mid) or src
             dur = float(info.get("duration") or src_dur or 0)
@@ -739,7 +817,10 @@ def _build_cmd_many(
             chain = []
             if _trim_needed(sinn, sdur, dur):
                 chain.append(f"trim=start={sinn:.6f}:duration={sdur:.6f}")
-            chain.append("setpts=PTS-STARTPTS")
+            if abs(speed - 1.0) > 1e-6:
+                chain.append(f"setpts=(PTS-STARTPTS)/{speed:.6f}")
+            else:
+                chain.append("setpts=PTS-STARTPTS")
             chain += [
                 this_crop.as_ffmpeg(),
                 f"scale={dw}:{dh}:flags=lanczos",
@@ -822,6 +903,7 @@ def _build_cmd_many(
                     )
                 else:
                     sinn, sdur, mid = float(part[1]), float(part[2]), str(part[3])
+                    speed = _part_speed(part)
                     ii = idx_of.get(mid, 0)
                     off = max(0.0, float(audio_offset or 0.0))
                     if a_idx_count[ii] > 1:
@@ -830,11 +912,14 @@ def _build_cmd_many(
                         pad = f"[ain{ii}_{k}]"
                     else:
                         pad = f"[{ii}:a]"
-                    filters.append(
-                        f"{pad}atrim=start={sinn + off:.6f}:duration={sdur:.6f},"
-                        f"asetpts=PTS-STARTPTS,"
-                        f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[{lab}]"
-                    )
+                    # Pitch follows rate (atempo); documented default for #531.
+                    achain = [
+                        f"atrim=start={sinn + off:.6f}:duration={sdur:.6f}",
+                        "asetpts=PTS-STARTPTS",
+                        *atempo_chain(speed),
+                        "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo",
+                    ]
+                    filters.append(f"{pad}{','.join(achain)}[{lab}]")
                 a_labs.append(f"[{lab}]")
             if len(a_labs) > 1:
                 a_joins: list[dict[str, Any]] = []
