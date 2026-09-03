@@ -395,13 +395,18 @@ class Timeline(Gtk.DrawingArea):
     def _recompute_span(self) -> None:
         ends = [0.0]
         for c in self.vclips:
+            _t0, t1 = self._clip_times(c, self._clip_src_dur(c, "v"))
+            ends.append(t1)
+            # Full-media ghost footprint at this speed (in=0..src_dur).
             d = self._clip_src_dur(c, "v")
-            ends.append(c.start + max(c.out_s, d))
-            ends.append(c.start + c.out_s)
+            if d > 0:
+                ends.append(c.start + d / c.playback_speed())
         for c in self.aclips:
+            _t0, t1 = self._clip_times(c, self._clip_src_dur(c, "a"))
+            ends.append(t1)
             d = self._clip_src_dur(c, "a")
-            ends.append(c.start + max(c.out_s, d))
-            ends.append(c.start + c.out_s)
+            if d > 0:
+                ends.append(c.start + d / c.playback_speed())
         self.duration = max(ends)
         self.set_sensitive(
             self.duration > 0.04
@@ -1334,12 +1339,14 @@ class Timeline(Gtk.DrawingArea):
         for i, c in enumerate(self.vclips):
             clip_lane_y = self._lane_y("video", c.track)
             d = self._clip_src_dur(c, "v")
-            inn, out = self._clip_used(c, d)
+            speed = c.playback_speed()
+            t0, t1 = self._clip_times(c, d)
+            # Ghost = full source placed at this speed (shrinks/grows with rate).
             gx0 = self._t_to_x(c.start, width)
-            gx1 = self._t_to_x(c.start + d, width)
+            gx1 = self._t_to_x(c.start + (d / speed if d > 0 else 0.0), width)
             self._draw_clip(cr, gx0, clip_lane_y + clip_y, max(3.0, gx1 - gx0), clip_h, sel, "", 0.28)
-            x0 = self._t_to_x(c.start + inn, width)
-            x1 = self._t_to_x(c.start + out, width)
+            x0 = self._t_to_x(t0, width)
+            x1 = self._t_to_x(t1, width)
             name = self.clip_names.get(c.media_id) or (
                 self.video_name if i == self.sel_v or len(self.vclips) == 1 else ""
             )
@@ -1373,12 +1380,13 @@ class Timeline(Gtk.DrawingArea):
         for i, c in enumerate(self.aclips):
             clip_lane_y = self._lane_y("audio", c.track)
             d = self._clip_src_dur(c, "a")
-            inn, out = self._clip_used(c, d)
+            speed = c.playback_speed()
+            t0, t1 = self._clip_times(c, d)
             gx0 = self._t_to_x(c.start, width)
-            gx1 = self._t_to_x(c.start + d, width)
+            gx1 = self._t_to_x(c.start + (d / speed if d > 0 else 0.0), width)
             self._draw_clip(cr, gx0, clip_lane_y + clip_y, max(3.0, gx1 - gx0), clip_h, color, "", 0.28)
-            x0 = self._t_to_x(c.start + inn, width)
-            x1 = self._t_to_x(c.start + out, width)
+            x0 = self._t_to_x(t0, width)
+            x1 = self._t_to_x(t1, width)
             name = self.clip_names.get(c.media_id) or (
                 self.audio_name if i == self.sel_a or len(self.aclips) == 1 else ""
             )
@@ -1411,10 +1419,10 @@ class Timeline(Gtk.DrawingArea):
 
         if 0 <= self.sel_v < len(self.vclips):
             c = self.vclips[self.sel_v]
-            inn, out = self._clip_used(c, self._clip_src_dur(c, "v"))
-            if out > inn:
-                x_in = self._t_to_x(c.start + inn, width)
-                x_out = self._t_to_x(c.start + out, width)
+            t0, t1 = self._clip_times(c, self._clip_src_dur(c, "v"))
+            if t1 > t0:
+                x_in = self._t_to_x(t0, width)
+                x_out = self._t_to_x(t1, width)
                 cr.set_source_rgb(*fg)
                 cr.set_line_width(1)
                 cr.move_to(x_in, v_y - 2)
@@ -2740,12 +2748,17 @@ class EditorWindow(Adw.ApplicationWindow):
             return max(0.05, float(self._compiled_duration))
         ends = [0.05]
         for c in self.video_clips:
-            _inn, out = c.used()
-            if out <= _inn:
-                out = float((self.video_info or {}).get("duration") or 0)
-            ends.append(c.start + out)
+            dur = self._media_dur(c.media_id) or float(
+                (self.video_info or {}).get("duration") or 0
+            )
+            _t0, t1 = c.used_times(dur)
+            ends.append(t1)
         for c in self.audio_clips:
-            ends.append(c.start + c.out_s)
+            dur = self._media_dur(c.media_id) or float(
+                (self.audio_info or {}).get("duration") or 0
+            )
+            _t0, t1 = c.used_times(dur)
+            ends.append(t1)
         return max(ends)
 
     def _timeline_now(self) -> float:
