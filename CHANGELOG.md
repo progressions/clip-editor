@@ -7,6 +7,16 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- Vim-style aspect commands ([#537](https://app.fizzy.do/6109848/cards/537) / PR #21): open `:` and use `:r916`, `:r34`, `:r45`, `:r11`, `:r43`, or `:r169` to select an output aspect ratio. Added 3:4 and 4:3 presets.
+- Explicit **Render Preview** control and `:rp` command ([#538](https://app.fizzy.do/6109848/cards/538) / PR #18). Space now starts immediate timeline playback, using rendered cache only for green spans.
+- Repeated `--video` / `--audio` GUI arguments ([#540](https://app.fizzy.do/6109848/cards/540) / PR #20), so Eagle Browse can add a selection to the current project.
+
+### Fixed
+
+- Per-clip X/Y position now moves the full source beneath the project viewport instead of shifting a pre-cropped project frame (PR #19), preventing blank side margins for mismatched source and project aspect ratios.
+
 ## [0.8.0] — 2026-09-03
 
 ### Added
