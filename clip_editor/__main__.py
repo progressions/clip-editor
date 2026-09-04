@@ -427,10 +427,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_serve)
 
     g = sub.add_parser("gui", help="native GTK window")
-    g.add_argument("--video", help="add this video to the current project")
+    g.add_argument(
+        "--video",
+        action="append",
+        default=[],
+        help="add this video to the current project (repeatable)",
+    )
     g.add_argument(
         "--audio",
-        help="add this audio to the current project (does not start a new project)",
+        action="append",
+        default=[],
+        help="add this audio to the current project (repeatable; does not start a new project)",
     )
     g.add_argument(
         "--new",
@@ -448,10 +455,14 @@ def build_parser() -> argparse.ArgumentParser:
 def cmd_gui(args: argparse.Namespace) -> int:
     from clip_editor.ui import run
 
-    video = getattr(args, "video", None) or getattr(args, "video_path", None)
+    videos = list(getattr(args, "video", None) or [])
+    extra = getattr(args, "video_path", None)
+    if extra:
+        videos.append(extra)
+    audios = list(getattr(args, "audio", None) or [])
     return run(
-        open_video=video,
-        open_audio=getattr(args, "audio", None),
+        open_videos=videos,
+        open_audios=audios,
         new_project=bool(getattr(args, "new", False)),
     )
 

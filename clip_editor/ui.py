@@ -19,6 +19,7 @@ gi.require_version("GdkPixbuf", "2.0")
 
 from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, GObject, Graphene, Gtk, Pango  # noqa: E402
 
+from clip_editor.cli_paths import cli_flag_paths
 from clip_editor.aspects import (
     ASPECTS,
     DEFAULT_RESOLUTION,
@@ -5422,43 +5423,37 @@ class EditorApp(Adw.Application):
     ) -> int:
         args = list(cmdline.get_arguments())
         new_project = "--new" in args
-        video = _cli_flag_path(args, "--video")
-        audio = _cli_flag_path(args, "--audio")
+        videos = cli_flag_paths(args, "--video")
+        audios = cli_flag_paths(args, "--audio")
         self.activate()
         win = self.props.active_window
         if isinstance(win, EditorWindow):
             if new_project:
                 # Skip autosave restore on first launch so --new is a blank project.
                 win._open_from_cli = True
-            if new_project or video is not None or audio is not None:
+            if new_project or videos or audios:
                 _idle_open_cli(
-                    win, video=video, audio=audio, new_project=new_project
+                    win,
+                    videos=videos,
+                    audios=audios,
+                    new_project=new_project,
                 )
         if win is not None:
             win.present()
         return 0
 
 
-def _cli_flag_path(args: list[str], flag: str) -> Path | None:
-    if flag not in args:
-        return None
-    i = args.index(flag)
-    if i + 1 >= len(args):
-        return None
-    return Path(args[i + 1]).expanduser()
-
-
 def _idle_open_cli(
     win: EditorWindow,
     *,
-    video: Path | None,
-    audio: Path | None,
+    videos: list[Path] | None = None,
+    audios: list[Path] | None = None,
     new_project: bool,
 ) -> None:
     def go(
         _w: EditorWindow = win,
-        _video: Path | None = video,
-        _audio: Path | None = audio,
+        _videos: list[Path] = list(videos or []),
+        _audios: list[Path] = list(audios or []),
         _new: bool = new_project,
     ) -> bool:
         if _new:
@@ -5466,16 +5461,24 @@ def _idle_open_cli(
                 _w._set_status("export in progress")
                 return False
             _w._on_new_project()
-        if _video is not None:
-            if _video.is_file():
-                _w._open_path("video", _video)
+        missing: list[str] = []
+        added = 0
+        for path in _videos:
+            if path.is_file():
+                _w._open_path("video", path)
+                added += 1
             else:
-                _w._set_status(f"missing {_video}")
-        if _audio is not None:
-            if _audio.is_file():
-                _w._open_path("audio", _audio)
+                missing.append(str(path))
+        for path in _audios:
+            if path.is_file():
+                _w._open_path("audio", path)
+                added += 1
             else:
-                _w._set_status(f"missing {_audio}")
+                missing.append(str(path))
+        if missing:
+            _w._set_status("missing " + ", ".join(missing))
+        elif added > 1:
+            _w._set_status(f"Added {added} clips")
         return False
 
     GLib.idle_add(go)
@@ -5485,6 +5488,8 @@ def run(
     *,
     open_video: str | Path | None = None,
     open_audio: str | Path | None = None,
+    open_videos: list[str | Path] | None = None,
+    open_audios: list[str | Path] | None = None,
     new_project: bool = False,
 ) -> int:
     Adw.init()
@@ -5492,8 +5497,14 @@ def run(
     argv = ["clip-editor"]
     if new_project:
         argv.append("--new")
+    videos = list(open_videos or [])
     if open_video:
-        argv += ["--video", str(open_video)]
+        videos.append(open_video)
+    audios = list(open_audios or [])
     if open_audio:
-        argv += ["--audio", str(open_audio)]
+        audios.append(open_audio)
+    for path in videos:
+        argv += ["--video", str(path)]
+    for path in audios:
+        argv += ["--audio", str(path)]
     return int(EditorApp().run(argv))
