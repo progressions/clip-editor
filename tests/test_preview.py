@@ -299,6 +299,46 @@ class SharedGraphTest(unittest.TestCase):
         self.assertIn("slow", final_cmd)
 
 
+class TransformedSourceExportTest(unittest.TestCase):
+    def test_square_source_stays_square_when_positioned_in_portrait(self) -> None:
+        """X/Y must place the source layer, not stretch a portrait crop."""
+        video = Path("/tmp/square.mp4")
+        src = {
+            "has_video": True,
+            "has_audio": False,
+            "width": 1024,
+            "height": 1024,
+            "duration": 2.0,
+            "fps": 30.0,
+        }
+        clip = ClipInst(
+            start=0.0, in_s=0.0, out_s=1.0, media_id="square", transform_x=100.0
+        )
+        with mock.patch("clip_editor.export.probe", return_value=dict(src)), mock.patch(
+            "clip_editor.export.which_ffmpeg", return_value="ffmpeg"
+        ):
+            cmd, _ = build_cmd(
+                video,
+                Path("/tmp/out.mp4"),
+                audio=None,
+                aspect="3:4",
+                pan_x=0.5,
+                pan_y=0.5,
+                in_s=0.0,
+                out_s=None,
+                audio_follows_in=False,
+                audio_offset=0.0,
+                video_clips=[clip],
+                media=[MediaItem(id="square", path=video, kind="video")],
+                use_video_soundtrack=False,
+                profile=FINAL_PROFILE,
+                src=src,
+            )
+        filters = _filter_complex(cmd)
+        self.assertIn("scale=1440:1440:flags=lanczos", filters)
+        self.assertNotIn("crop=768:1024", filters)
+
+
 class CancelCleanupTest(unittest.TestCase):
     def test_cancel_removes_tmp(self) -> None:
         with tempfile.TemporaryDirectory() as td:
