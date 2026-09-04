@@ -27,6 +27,7 @@ from clip_editor.aspects import (
     cover_crop,
     dest_size,
 )
+from clip_editor.commands import parse_command
 from clip_editor.eagle import apply_omarchy_theme, theme_rgb
 from clip_editor.export import ExportCancelled, ExportError, default_out_path, run_export
 from clip_editor.preview import (
@@ -1922,7 +1923,7 @@ class EditorWindow(Adw.ApplicationWindow):
         command_box.append(Gtk.Label(label=":"))
         self.command_entry = Gtk.Entry()
         self.command_entry.set_hexpand(True)
-        self.command_entry.set_placeholder_text("command (rp = render preview)")
+        self.command_entry.set_placeholder_text("command (r916, r43, rp)")
         self.command_entry.connect("activate", self._on_command_activate)
         command_keys = Gtk.EventControllerKey()
         command_keys.connect("key-pressed", self._on_command_key_pressed)
@@ -2234,11 +2235,22 @@ class EditorWindow(Adw.ApplicationWindow):
     def _on_command_activate(self, *_args: object) -> None:
         command = self.command_entry.get_text().strip().lower().lstrip(":")
         self._hide_command_line()
-        if command == "rp":
+        parsed = parse_command(command)
+        if parsed is None:
+            if command:
+                self._set_status(f"Unknown command: :{command}")
+            return
+        if parsed.name == "render_preview":
             self._on_render_preview()
             return
-        if command:
-            self._set_status(f"Unknown command: :{command}")
+        if parsed.name == "aspect" and parsed.value:
+            if not self._guard_edit("aspect"):
+                return
+            button = self.aspect_buttons[parsed.value]
+            if button.get_active():
+                self._set_status(f"Aspect already {parsed.value}")
+            else:
+                button.set_active(True)
 
     def _on_render_preview(self, *_args: object) -> None:
         """Bake the current timeline preview without changing playback state."""
@@ -3750,6 +3762,9 @@ class EditorWindow(Adw.ApplicationWindow):
             return
         if not self._guard_edit("aspect"):
             return
+        self._set_aspect(name)
+
+    def _set_aspect(self, name: str) -> None:
         self.aspect = name
         w, h = dest_size(name, self.resolution)
         self.aspect_frame.set_ratio(w / h)

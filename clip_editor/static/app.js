@@ -1,5 +1,5 @@
 (() => {
-  const ASPECTS = ["9:16", "4:5", "1:1", "16:9"];
+  const ASPECTS = ["9:16", "3:4", "4:5", "1:1", "4:3", "16:9"];
 
   const $ = (id) => document.getElementById(id);
   const stage = $("stage");
