@@ -7,8 +7,10 @@ from dataclasses import dataclass
 # Medium (default) export pixel sizes. Always even (yuv420p).
 ASPECTS: dict[str, tuple[int, int]] = {
     "9:16": (1080, 1920),
+    "3:4": (1080, 1440),
     "4:5": (1080, 1350),
     "1:1": (1080, 1080),
+    "4:3": (1440, 1080),
     "16:9": (1920, 1080),
 }
 
