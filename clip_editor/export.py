@@ -814,6 +814,11 @@ def _build_cmd_many(
             except (TypeError, ValueError):
                 iw, ih = src_w, src_h
             this_crop = cover_crop(iw, ih, dw, dh, pan_x, pan_y) if iw >= 2 and ih >= 2 else crop
+            transformed = (
+                abs(tx) > 0.0001
+                or abs(ty) > 0.0001
+                or abs(clip_scale - 1.0) > 0.0001
+            )
             chain = []
             if _trim_needed(sinn, sdur, dur):
                 chain.append(f"trim=start={sinn:.6f}:duration={sdur:.6f}")
@@ -821,15 +826,6 @@ def _build_cmd_many(
                 chain.append(f"setpts=(PTS-STARTPTS)/{speed:.6f}")
             else:
                 chain.append("setpts=PTS-STARTPTS")
-            chain += [
-                this_crop.as_ffmpeg(),
-                f"scale={dw}:{dh}:flags=lanczos",
-            ]
-            transformed = (
-                abs(tx) > 0.0001
-                or abs(ty) > 0.0001
-                or abs(clip_scale - 1.0) > 0.0001
-            )
             if transformed:
                 placement = cover_source_placement(
                     iw, ih, dw, dh, pan_x, pan_y, tx, ty, clip_scale
@@ -837,7 +833,12 @@ def _build_cmd_many(
                 # Transform the full source layer, then crop it to the project
                 # frame by overlaying it.  Cropping first would turn X/Y into
                 # movement of a 9:16 raster and reveal a black margin.
-                chain += [f"scale={placement.w}:{placement.h}:flags=lanczos"]
+                chain.append(f"scale={placement.w}:{placement.h}:flags=lanczos")
+            else:
+                chain += [
+                    this_crop.as_ffmpeg(),
+                    f"scale={dw}:{dh}:flags=lanczos",
+                ]
             chain += [
                 f"fps={fps:.4f}",
                 "settb=AVTB",
