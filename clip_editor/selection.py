@@ -29,6 +29,36 @@ def next_video_selection(
     return clicked, {clicked}
 
 
+def move_video_selection(
+    *,
+    delta: int,
+    primary: int,
+    selected: set[int],
+    extend: bool,
+    n_clips: int,
+) -> tuple[int, set[int]]:
+    """Move the primary video selection one clip left or right.
+
+    Plain movement replaces the selection.  Shift movement retains the
+    existing selection and includes the clip reached by this movement.  At a
+    timeline edge nothing changes, including a multi-selection.
+    """
+    if n_clips <= 0 or not 0 <= primary < n_clips:
+        return -1, set()
+
+    destination = max(0, min(n_clips - 1, primary + int(delta)))
+    if destination == primary:
+        return primary, set(selected)
+
+    if extend:
+        current = {i for i in selected if 0 <= i < n_clips}
+        current.add(primary)
+        current.add(destination)
+        return destination, current
+
+    return destination, {destination}
+
+
 def prune_video_selection(
     selected: set[int], primary: int, n_clips: int
 ) -> tuple[int, set[int]]:
