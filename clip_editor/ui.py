@@ -403,9 +403,6 @@ class Timeline(Gtk.DrawingArea):
         click = Gtk.GestureClick()
         click.connect("pressed", self._on_pressed)
         self.add_controller(click)
-        keys = Gtk.EventControllerKey()
-        keys.connect("key-pressed", self._on_key_pressed)
-        self.add_controller(keys)
         drag = Gtk.GestureDrag()
         drag.connect("drag-begin", self._on_drag_begin)
         drag.connect("drag-update", self._on_drag_update)
@@ -848,26 +845,6 @@ class Timeline(Gtk.DrawingArea):
         self._ensure_video_clip_visible(self.sel_v)
         self.queue_draw()
         return True
-
-    def _on_key_pressed(
-        self, _controller: Gtk.EventControllerKey, keyval: int, _keycode: int, state: int
-    ) -> bool:
-        """Handle timeline-local Vim navigation after the timeline receives focus."""
-        mods = state & Gtk.accelerator_get_default_mod_mask()
-        ctrl = bool(mods & Gdk.ModifierType.CONTROL_MASK)
-        shift = bool(mods & Gdk.ModifierType.SHIFT_MASK)
-        extra = mods & ~(
-            Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK
-        )
-        if ctrl or extra:
-            return False
-        if keyval in (Gdk.KEY_h, Gdk.KEY_H):
-            self.move_video_selection(-1, extend=shift)
-            return True
-        if keyval in (Gdk.KEY_l, Gdk.KEY_L):
-            self.move_video_selection(1, extend=shift)
-            return True
-        return False
 
     def _ensure_video_clip_visible(self, index: int) -> None:
         """Scroll the horizontal timeline just enough to reveal a video clip."""
@@ -2196,6 +2173,18 @@ class EditorWindow(Adw.ApplicationWindow):
         self._set_status("Rendered preview — editing locked")
         return False
 
+    def _focus_accepts_text(self) -> bool:
+        """True when a text-editing widget owns the keyboard."""
+        focus = self.get_focus()
+        widget = focus
+        while widget is not None:
+            if isinstance(widget, (Gtk.Editable, Gtk.SpinButton)):
+                return True
+            if widget is self:
+                break
+            widget = widget.get_parent()
+        return False
+
     def _on_key_pressed(self, _c: Gtk.EventControllerKey, keyval: int, _code: int, state: int) -> bool:
         mods = state & Gtk.accelerator_get_default_mod_mask()
         ctrl = bool(mods & Gdk.ModifierType.CONTROL_MASK)
@@ -2213,7 +2202,7 @@ class EditorWindow(Adw.ApplicationWindow):
             self._on_redo()
             return True
         if (
-            self.get_focus() is self.timeline
+            not self._focus_accepts_text()
             and not ctrl
             and not extra
             and keyval in (Gdk.KEY_h, Gdk.KEY_H, Gdk.KEY_l, Gdk.KEY_L)
