@@ -38,6 +38,51 @@ class CropRect:
         return f"crop={self.w}:{self.h}:{self.x}:{self.y}"
 
 
+@dataclass(frozen=True, slots=True)
+class SourcePlacement:
+    """A cover-scaled source layer positioned inside an output frame."""
+
+    w: int
+    h: int
+    x: int
+    y: int
+
+
+def cover_source_placement(
+    src_w: int,
+    src_h: int,
+    dest_w: int,
+    dest_h: int,
+    pan_x: float = 0.5,
+    pan_y: float = 0.5,
+    transform_x: float = 0.0,
+    transform_y: float = 0.0,
+    scale: float = 1.0,
+) -> SourcePlacement:
+    """Place the full source over a destination without revealing its background.
+
+    ``transform_x`` and ``transform_y`` move the *source layer* in output
+    pixels.  They do not move an already cropped output frame.  Scale is a
+    cover multiplier, so values below 1 are treated as 1: a clip can zoom in
+    but cannot be zoomed out far enough to leave an empty edge.
+    """
+    if min(src_w, src_h, dest_w, dest_h) <= 0:
+        raise ValueError("source and destination dimensions must be positive")
+    pan_x = min(1.0, max(0.0, float(pan_x)))
+    pan_y = min(1.0, max(0.0, float(pan_y)))
+    cover = max(dest_w / src_w, dest_h / src_h)
+    factor = cover * max(1.0, float(scale))
+    w = max(2, even(round(src_w * factor)))
+    h = max(2, even(round(src_h * factor)))
+    # The initial position honors the project's crop pan. Clamp the translated
+    # layer to the frame so X/Y never uncover a black margin.
+    x = int(round((dest_w - w) * pan_x + float(transform_x)))
+    y = int(round((dest_h - h) * pan_y + float(transform_y)))
+    x = min(0, max(dest_w - w, x))
+    y = min(0, max(dest_h - h, y))
+    return SourcePlacement(w, h, x, y)
+
+
 def cover_crop(
     src_w: int,
     src_h: int,

@@ -235,32 +235,19 @@ class CoverPreview(Gtk.Widget):
         ih = int(p.get_intrinsic_height() or 0)
         if iw <= 0 or ih <= 0:
             return
-        src_a = iw / ih
-        dst_a = w / h
-        if src_a > dst_a:
-            scale = h / ih
-            sw, sh = iw * scale, float(h)
-            x = -(sw - w) * self.pan_x
-            y = 0.0
-        else:
-            scale = w / iw
-            sw, sh = float(w), ih * scale
-            x = 0.0
-            y = -(sh - h) * self.pan_y
         tx = self.transform_x * w / self.output_width
         ty = self.transform_y * h / self.output_height
-        snapshot.push_clip(Graphene.Rect().init(0, 0, w, h))
-        snapshot.save()
-        # First clip the normal cover-cropped frame, then transform that whole
-        # output canvas. This matches FFmpeg's crop -> scale -> overlay order.
-        snapshot.translate(Graphene.Point().init(w / 2.0 + tx, h / 2.0 + ty))
-        snapshot.scale(self.transform_scale, self.transform_scale)
-        snapshot.translate(Graphene.Point().init(-w / 2.0, -h / 2.0))
+        # Draw the full source as a layer and clip it to the project frame.
+        # X/Y therefore pan the source under the viewport, rather than moving
+        # a pre-cropped project-shaped raster and exposing the background.
+        cover = max(w / iw, h / ih)
+        factor = cover * max(1.0, self.transform_scale)
+        sw, sh = iw * factor, ih * factor
+        x = min(0.0, max(w - sw, (w - sw) * self.pan_x + tx))
+        y = min(0.0, max(h - sh, (h - sh) * self.pan_y + ty))
         snapshot.push_clip(Graphene.Rect().init(0, 0, w, h))
         snapshot.translate(Graphene.Point().init(x, y))
         p.snapshot(snapshot, sw, sh)
-        snapshot.pop()
-        snapshot.restore()
         snapshot.pop()
 
     def _overflow(self) -> tuple[float, float]:
@@ -274,9 +261,10 @@ class CoverPreview(Gtk.Widget):
             return 0.0, 0.0
         src_a = pw / ph
         dst_a = w / h
+        scale = max(1.0, self.transform_scale)
         if src_a > dst_a:
-            return pw * (h / ph) - w, 0.0
-        return 0.0, ph * (w / pw) - h
+            return pw * (h / ph) * scale - w, 0.0
+        return 0.0, ph * (w / pw) * scale - h
 
     def _drag_begin(self, *_args: object) -> None:
         if self.read_only:
@@ -1987,11 +1975,11 @@ class EditorWindow(Adw.ApplicationWindow):
         self.video_label = self._wrapping_label("none")
         right.append(self.video_label)
 
-        right.append(self._section("Transform selected clip"))
+        right.append(self._section("Position / scale selected clip"))
         transform = Gtk.Grid(column_spacing=8, row_spacing=6)
         self.transform_x_spin = Gtk.SpinButton.new_with_range(-4096, 4096, 1)
         self.transform_y_spin = Gtk.SpinButton.new_with_range(-4096, 4096, 1)
-        self.transform_scale_spin = Gtk.SpinButton.new_with_range(0.05, 4.0, 0.05)
+        self.transform_scale_spin = Gtk.SpinButton.new_with_range(1.0, 4.0, 0.05)
         self.transform_x_spin.set_digits(0)
         self.transform_y_spin.set_digits(0)
         self.transform_scale_spin.set_digits(2)
@@ -2006,6 +1994,15 @@ class EditorWindow(Adw.ApplicationWindow):
             transform.attach(Gtk.Label(label=label, xalign=0), 0, row_i, 1, 1)
             transform.attach(spin, 1, row_i, 1, 1)
             spin.connect("value-changed", self._on_transform_changed)
+        self.transform_x_spin.set_tooltip_text(
+            "Move the source clip left or right within the project frame."
+        )
+        self.transform_y_spin.set_tooltip_text(
+            "Move the source clip up or down within the project frame."
+        )
+        self.transform_scale_spin.set_tooltip_text(
+            "Zoom the source clip. 1.00 fills the project frame."
+        )
         self.btn_transform_reset = Gtk.Button(label="Reset")
         self.btn_transform_reset.connect("clicked", self._on_transform_reset)
         transform.attach(self.btn_transform_reset, 2, 0, 1, 3)
@@ -3059,7 +3056,7 @@ class EditorWindow(Adw.ApplicationWindow):
             return
         clip.transform_x = self.transform_x_spin.get_value()
         clip.transform_y = self.transform_y_spin.get_value()
-        clip.scale = max(0.05, self.transform_scale_spin.get_value())
+        clip.scale = max(1.0, self.transform_scale_spin.get_value())
         self._apply_timeline_frame(self.timeline.playhead, start_media=False)
         self._schedule_checkpoint()
         self._schedule_autosave()

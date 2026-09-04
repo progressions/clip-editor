@@ -9,7 +9,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
-from clip_editor.aspects import cover_crop, normalize_resolution
+from clip_editor.aspects import cover_crop, cover_source_placement, normalize_resolution
 from clip_editor.eagle import inbox_dir
 from clip_editor.preview import (
     FINAL_PROFILE,
@@ -831,9 +831,13 @@ def _build_cmd_many(
                 or abs(clip_scale - 1.0) > 0.0001
             )
             if transformed:
-                tw = max(2, int(round(dw * clip_scale / 2.0)) * 2)
-                th = max(2, int(round(dh * clip_scale / 2.0)) * 2)
-                chain.append(f"scale={tw}:{th}:flags=lanczos")
+                placement = cover_source_placement(
+                    iw, ih, dw, dh, pan_x, pan_y, tx, ty, clip_scale
+                )
+                # Transform the full source layer, then crop it to the project
+                # frame by overlaying it.  Cropping first would turn X/Y into
+                # movement of a 9:16 raster and reveal a black margin.
+                chain += [f"scale={placement.w}:{placement.h}:flags=lanczos"]
             chain += [
                 f"fps={fps:.4f}",
                 "settb=AVTB",
@@ -849,8 +853,8 @@ def _build_cmd_many(
             if transformed:
                 fg = f"vfg{i}"
                 bg = f"vbg{i}"
-                xexpr = f"(W-w)/2+{tx:.3f}"
-                yexpr = f"(H-h)/2+{ty:.3f}"
+                xexpr = str(placement.x)
+                yexpr = str(placement.y)
                 filters.append(f"{pad}{','.join(chain)}[{fg}]")
                 filters.append(
                     f"color=c=black:s={dw}x{dh}:r={fps:.4f}:d={sdur:.6f},"
