@@ -7,6 +7,12 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-09-04
+
+### Fixed
+
+- Preserve the source aspect ratio when a clip has X/Y position or Scale applied (PR #23). Rendered previews and exports now scale the full source layer before clipping it to the project viewport, preventing square clips from being squeezed into 3:4 or other project aspects.
+
 ## [0.9.0] — 2026-09-04
 
 ### Added
@@ -91,7 +97,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 - Initial packaged release of the native GTK clip editor for Buffer-safe H.264/AAC exports.
 
-[Unreleased]: https://github.com/progressions/clip-editor/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/progressions/clip-editor/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/progressions/clip-editor/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/progressions/clip-editor/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/progressions/clip-editor/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/progressions/clip-editor/compare/v0.6.0...v0.7.0
