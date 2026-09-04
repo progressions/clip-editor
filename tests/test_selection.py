@@ -6,6 +6,8 @@ import unittest
 
 from clip_editor.selection import (
     group_moved_starts,
+    move_video_selection,
+    move_timeline_track,
     next_video_selection,
     prune_video_selection,
 )
@@ -78,6 +80,77 @@ class PruneVideoSelectionTest(unittest.TestCase):
         primary, selected = prune_video_selection({5, 6}, 5, 2)
         self.assertEqual(primary, -1)
         self.assertEqual(selected, set())
+
+
+class MoveVideoSelectionTest(unittest.TestCase):
+    def test_plain_movement_replaces_selection(self) -> None:
+        primary, selected = move_video_selection(
+            delta=1, primary=1, selected={0, 1}, extend=False, n_clips=4
+        )
+        self.assertEqual(primary, 2)
+        self.assertEqual(selected, {2})
+
+
+    def test_shift_movement_extends_selection(self) -> None:
+        primary, selected = move_video_selection(
+            delta=1, primary=1, selected={1}, extend=True, n_clips=4
+        )
+        self.assertEqual(primary, 2)
+        self.assertEqual(selected, {1, 2})
+
+    def test_repeated_shift_movement_keeps_prior_selection(self) -> None:
+        primary, selected = move_video_selection(
+            delta=-1, primary=2, selected={1, 2, 3}, extend=True, n_clips=4
+        )
+        self.assertEqual(primary, 1)
+        self.assertEqual(selected, {1, 2, 3})
+
+    def test_repeated_shift_movement_adds_each_destination(self) -> None:
+        primary, selected = move_video_selection(
+            delta=1, primary=1, selected={1, 2}, extend=True, n_clips=4
+        )
+        self.assertEqual(primary, 2)
+        self.assertEqual(selected, {1, 2})
+        primary, selected = move_video_selection(
+            delta=1, primary=primary, selected=selected, extend=True, n_clips=4
+        )
+        self.assertEqual(primary, 3)
+        self.assertEqual(selected, {1, 2, 3})
+
+    def test_edge_movement_preserves_selection(self) -> None:
+        primary, selected = move_video_selection(
+            delta=-1, primary=0, selected={0, 1}, extend=False, n_clips=3
+        )
+        self.assertEqual(primary, 0)
+        self.assertEqual(selected, {0, 1})
+
+    def test_missing_primary_selects_nearest_timeline_edge(self) -> None:
+        primary, selected = move_video_selection(
+            delta=1, primary=-1, selected={0}, extend=False, n_clips=3
+        )
+        self.assertEqual(primary, 0)
+        self.assertEqual(selected, {0})
+        primary, selected = move_video_selection(
+            delta=-1, primary=-1, selected=set(), extend=False, n_clips=3
+        )
+        self.assertEqual(primary, 2)
+        self.assertEqual(selected, {2})
+
+
+class MoveTimelineTrackTest(unittest.TestCase):
+    def test_moves_down_in_visual_track_order(self) -> None:
+        self.assertEqual(move_timeline_track("video", 2, 1), ("video", 1))
+        self.assertEqual(move_timeline_track("video", 1, 1), ("audio", 1))
+        self.assertEqual(move_timeline_track("audio", 1, 1), ("audio", 2))
+
+    def test_moves_up_in_visual_track_order(self) -> None:
+        self.assertEqual(move_timeline_track("audio", 2, -1), ("audio", 1))
+        self.assertEqual(move_timeline_track("audio", 1, -1), ("video", 1))
+        self.assertEqual(move_timeline_track("video", 1, -1), ("video", 2))
+
+    def test_clamps_at_top_and_bottom(self) -> None:
+        self.assertEqual(move_timeline_track("video", 2, -1), ("video", 2))
+        self.assertEqual(move_timeline_track("audio", 2, 1), ("audio", 2))
 
 
 class GroupMovedStartsTest(unittest.TestCase):

@@ -3,6 +3,24 @@
 from __future__ import annotations
 
 
+TIMELINE_TRACKS: tuple[tuple[str, int], ...] = (
+    ("video", 2),
+    ("video", 1),
+    ("audio", 1),
+    ("audio", 2),
+)
+
+
+def move_timeline_track(kind: str, track: int, delta: int) -> tuple[str, int]:
+    """Move one lane through the fixed top-to-bottom timeline track order."""
+    try:
+        current = TIMELINE_TRACKS.index((kind, int(track)))
+    except ValueError:
+        current = TIMELINE_TRACKS.index(("video", 1))
+    destination = max(0, min(len(TIMELINE_TRACKS) - 1, current + int(delta)))
+    return TIMELINE_TRACKS[destination]
+
+
 def next_video_selection(
     *,
     clicked: int,
@@ -27,6 +45,39 @@ def next_video_selection(
         return clicked, current
 
     return clicked, {clicked}
+
+
+def move_video_selection(
+    *,
+    delta: int,
+    primary: int,
+    selected: set[int],
+    extend: bool,
+    n_clips: int,
+) -> tuple[int, set[int]]:
+    """Move the primary video selection one clip left or right.
+
+    Plain movement replaces the selection.  Shift movement retains the
+    existing selection and includes the clip reached by this movement.  At a
+    timeline edge nothing changes, including a multi-selection.
+    """
+    if n_clips <= 0:
+        return -1, set()
+    if not 0 <= primary < n_clips:
+        destination = n_clips - 1 if delta < 0 else 0
+        return destination, {destination}
+
+    destination = max(0, min(n_clips - 1, primary + int(delta)))
+    if destination == primary:
+        return primary, set(selected)
+
+    if extend:
+        current = {i for i in selected if 0 <= i < n_clips}
+        current.add(primary)
+        current.add(destination)
+        return destination, current
+
+    return destination, {destination}
 
 
 def prune_video_selection(
