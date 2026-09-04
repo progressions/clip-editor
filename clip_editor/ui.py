@@ -36,7 +36,6 @@ from clip_editor.preview import (
     cleanup_preview_cache,
     compiled_allows_action,
     compiled_playhead_seconds,
-    dirty_segments,
     has_touching_follower,
     mark_segments_green,
     playback_source,
@@ -1914,6 +1913,12 @@ class EditorWindow(Adw.ApplicationWindow):
         self.btn_play.set_tooltip_text("Play / pause (Space)")
         self.btn_play.connect("clicked", self._on_play)
         transport.append(self.btn_play)
+        self.btn_render_preview = Gtk.Button(label="Render Preview")
+        self.btn_render_preview.set_tooltip_text(
+            "Render the timeline preview without playing it (:rp)"
+        )
+        self.btn_render_preview.connect("clicked", self._on_render_preview)
+        transport.append(self.btn_render_preview)
         self.btn_split = Gtk.Button(label="Split")
         self.btn_split.set_tooltip_text("Split the selected clip at the playhead (T)")
         self.btn_split.connect("clicked", lambda *_: self._split_selected_clip())
@@ -1922,6 +1927,20 @@ class EditorWindow(Adw.ApplicationWindow):
         self.clock.add_css_class("dim-label")
         transport.append(self.clock)
         left.append(transport)
+        self.command_revealer = Gtk.Revealer()
+        self.command_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        command_box = Gtk.Box(spacing=8)
+        command_box.append(Gtk.Label(label=":"))
+        self.command_entry = Gtk.Entry()
+        self.command_entry.set_hexpand(True)
+        self.command_entry.set_placeholder_text("command (rp = render preview)")
+        self.command_entry.connect("activate", self._on_command_activate)
+        command_keys = Gtk.EventControllerKey()
+        command_keys.connect("key-pressed", self._on_command_key_pressed)
+        self.command_entry.add_controller(command_keys)
+        command_box.append(self.command_entry)
+        self.command_revealer.set_child(command_box)
+        left.append(self.command_revealer)
         self.timeline = Timeline()
         self.timeline.on_seek = self._on_timeline_seek
         self.timeline.on_video_move = self._on_video_move
@@ -1973,7 +1992,8 @@ class EditorWindow(Adw.ApplicationWindow):
         self.transition_hint = self._wrapping_label("")
         right.append(self.transition_hint)
         self.cache_hint = self._wrapping_label(
-            "Red bar = not previewed. Play (Space) renders it, then plays on this timeline."
+            "Green = rendered preview; red = raw timeline. Play (Space) starts immediately. "
+            "Render Preview (:rp) bakes transitions."
         )
         self.cache_hint.add_css_class("dim-label")
         right.append(self.cache_hint)
@@ -2196,7 +2216,42 @@ class EditorWindow(Adw.ApplicationWindow):
         self._set_status("Rendered preview — editing locked")
         return False
 
+    def _show_command_line(self) -> None:
+        self.command_entry.set_text("")
+        self.command_revealer.set_reveal_child(True)
+        self.command_entry.grab_focus()
+
+    def _hide_command_line(self) -> None:
+        self.command_revealer.set_reveal_child(False)
+        self.timeline.grab_focus()
+
+    def _on_command_key_pressed(
+        self, _controller: Gtk.EventControllerKey, keyval: int, _code: int, _state: int
+    ) -> bool:
+        if keyval == Gdk.KEY_Escape:
+            self._hide_command_line()
+            return True
+        return False
+
+    def _on_command_activate(self, *_args: object) -> None:
+        command = self.command_entry.get_text().strip().lower().lstrip(":")
+        self._hide_command_line()
+        if command == "rp":
+            self._on_render_preview()
+            return
+        if command:
+            self._set_status(f"Unknown command: :{command}")
+
+    def _on_render_preview(self, *_args: object) -> None:
+        """Bake the current timeline preview without changing playback state."""
+        if self._busy_rendering() or not self.video_path or not self.video_clips:
+            return
+        self._play_after_render = None
+        self._start_playthrough_render()
+
     def _on_key_pressed(self, _c: Gtk.EventControllerKey, keyval: int, _code: int, state: int) -> bool:
+        if self.command_entry.has_focus():
+            return False
         mods = state & Gtk.accelerator_get_default_mod_mask()
         ctrl = bool(mods & Gdk.ModifierType.CONTROL_MASK)
         shift = bool(mods & Gdk.ModifierType.SHIFT_MASK)
@@ -2211,6 +2266,9 @@ class EditorWindow(Adw.ApplicationWindow):
             return True
         if ctrl and not shift and keyval in (Gdk.KEY_y, Gdk.KEY_Y):
             self._on_redo()
+            return True
+        if keyval == Gdk.KEY_colon and not ctrl and not extra:
+            self._show_command_line()
             return True
         if (
             not ctrl
@@ -4354,7 +4412,8 @@ class EditorWindow(Adw.ApplicationWindow):
                 hit = c
         return hit
 
-    def _preview_is_current(self) -> bool:
+    def _cached_playback_available(self, timeline_t: float) -> bool:
+        """Whether this playhead position can safely use the baked proxy."""
         path = self._playthrough_path
         if path is None:
             return False
@@ -4363,9 +4422,7 @@ class EditorWindow(Adw.ApplicationWindow):
                 return False
         except OSError:
             return False
-        if dirty_segments(self._cache_segments):
-            return False
-        return self._playthrough_hash == self._current_render_fingerprint(kind="play")
+        return playback_source(timeline_t, self._cache_segments) == "cache"
 
     def _show_playthrough(self, timeline_t: float, *, start_media: bool) -> bool:
         """Play the baked timeline proxy at 1:1. Same Play control; no lock."""
@@ -4415,7 +4472,7 @@ class EditorWindow(Adw.ApplicationWindow):
         return True
 
     def _apply_timeline_frame(self, timeline_t: float, *, start_media: bool) -> None:
-        if not self._compiled_mode and self._preview_is_current():
+        if not self._compiled_mode and self._cached_playback_available(timeline_t):
             if self._show_playthrough(timeline_t, start_media=start_media):
                 return
         self._playthrough_playing = False
@@ -4729,10 +4786,6 @@ class EditorWindow(Adw.ApplicationWindow):
         if t >= end - 0.04:
             t = 0.0
         self._refresh_cache_bar()
-        if self.video_clips and not self._preview_is_current():
-            self._play_after_render = t
-            self._start_playthrough_render()
-            return
         self._begin_timeline_play(t)
 
     def _on_tick(self) -> bool:
@@ -4766,6 +4819,10 @@ class EditorWindow(Adw.ApplicationWindow):
             self.clock.set_text(f"{t:.2f} / {end:.2f}")
             if self._vmedia is not None:
                 self.preview.queue_draw()
+            if not self._cached_playback_available(t):
+                self._apply_timeline_frame(t, start_media=True)
+                self._start_preview_audio(t)
+                return True
             if t >= end - 0.02:
                 self._stop()
                 self._syncing_scrub = True
@@ -4779,6 +4836,10 @@ class EditorWindow(Adw.ApplicationWindow):
         self.timeline.set_playhead(t)
         self._syncing_scrub = False
         self.clock.set_text(f"{t:.2f} / {end:.2f}")
+        if self._cached_playback_available(t):
+            self._apply_timeline_frame(t, start_media=True)
+            self._start_preview_audio(t)
+            return True
         vdur = float((self.video_info or {}).get("duration") or 0)
         vclip = self._video_at(t)
         prev_v = getattr(self, "_video_play_clip", None)
@@ -4870,6 +4931,8 @@ class EditorWindow(Adw.ApplicationWindow):
             self.btn_preview_full.set_sensitive(has_video and not busy and not locked)
         if hasattr(self, "btn_preview_cancel"):
             self.btn_preview_cancel.set_sensitive(self._preview_rendering)
+        if hasattr(self, "btn_render_preview"):
+            self.btn_render_preview.set_sensitive(has_video and not busy and not locked)
         if hasattr(self, "btn_back_edit_preview"):
             self.btn_back_edit_preview.set_sensitive(
                 self._compiled_mode and not self._preview_rendering
@@ -5029,7 +5092,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self._set_status("Rendered preview — editing locked")
 
     def _start_playthrough_render(self) -> None:
-        """Bake a 1:1 timeline proxy, mark the bar green, then Play if requested."""
+        """Bake a 1:1 timeline proxy and mark its cache spans green."""
         if self._busy_rendering() or not self.video_path or not self.video_clips:
             self._play_after_render = None
             return
