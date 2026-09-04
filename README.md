@@ -71,6 +71,7 @@ update if you switch themes while the window is open.
 clip-editor                 # GTK window (installed package)
 clip-editor gui             # same
 clip-editor gui --video clip.mp4            # add video to the current project
+clip-editor gui --video a.mp4 --video b.mp4 # add several videos (repeatable)
 clip-editor gui --new --video clip.mp4      # new project with that video
 clip-editor gui --audio bed.m4a             # add audio; keep the current project
 clip-editor export --video in.mp4 --audio bed.mp3 --aspect 9:16
