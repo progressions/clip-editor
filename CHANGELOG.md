@@ -7,6 +7,13 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-09-03
+
+### Added
+
+- Keyboard-first timeline navigation ([#536](https://app.fizzy.do/6109848/cards/536) / PR #17): `h` / `l` select previous / next video clips, and Shift extends the selection.
+- `j` / `k` move a visible keyboard track cursor through V2, V1, A1, and A2.
+
 ## [0.7.0] — 2026-09-03
 
 ### Added
@@ -72,7 +79,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 - Initial packaged release of the native GTK clip editor for Buffer-safe H.264/AAC exports.
 
-[Unreleased]: https://github.com/progressions/clip-editor/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/progressions/clip-editor/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/progressions/clip-editor/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/progressions/clip-editor/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/progressions/clip-editor/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/progressions/clip-editor/compare/v0.4.0...v0.5.0
