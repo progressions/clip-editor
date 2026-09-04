@@ -43,8 +43,11 @@ def move_video_selection(
     existing selection and includes the clip reached by this movement.  At a
     timeline edge nothing changes, including a multi-selection.
     """
-    if n_clips <= 0 or not 0 <= primary < n_clips:
+    if n_clips <= 0:
         return -1, set()
+    if not 0 <= primary < n_clips:
+        destination = n_clips - 1 if delta < 0 else 0
+        return destination, {destination}
 
     destination = max(0, min(n_clips - 1, primary + int(delta)))
     if destination == primary:

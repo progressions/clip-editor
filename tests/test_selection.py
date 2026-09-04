@@ -122,12 +122,17 @@ class MoveVideoSelectionTest(unittest.TestCase):
         self.assertEqual(primary, 0)
         self.assertEqual(selected, {0, 1})
 
-    def test_invalid_primary_clears_selection(self) -> None:
+    def test_missing_primary_selects_nearest_timeline_edge(self) -> None:
         primary, selected = move_video_selection(
             delta=1, primary=-1, selected={0}, extend=False, n_clips=3
         )
-        self.assertEqual(primary, -1)
-        self.assertEqual(selected, set())
+        self.assertEqual(primary, 0)
+        self.assertEqual(selected, {0})
+        primary, selected = move_video_selection(
+            delta=-1, primary=-1, selected=set(), extend=False, n_clips=3
+        )
+        self.assertEqual(primary, 2)
+        self.assertEqual(selected, {2})
 
 
 class GroupMovedStartsTest(unittest.TestCase):
