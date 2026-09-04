@@ -76,6 +76,7 @@ from clip_editor.project import (
 )
 from clip_editor.selection import (
     group_moved_starts,
+    move_timeline_track,
     move_video_selection,
     next_video_selection,
     prune_video_selection,
@@ -358,6 +359,8 @@ class Timeline(Gtk.DrawingArea):
         self.sel_v = -1
         self.sel_a = -1
         self.sel_vs: set[int] = set()
+        self.nav_kind = "video"
+        self.nav_track = 1
         self.playhead = 0.0
         self.read_only = False
         # (t0, t1, green) spans for the Premiere-style cache bar (#532)
@@ -368,6 +371,7 @@ class Timeline(Gtk.DrawingArea):
         self.on_video_trim = None
         self.on_audio_trim = None
         self.on_track_change = None
+        self.on_navigation_track_change = None
         self.on_place = None
         self.on_select = None
         self._drag_mode = ""
@@ -397,6 +401,7 @@ class Timeline(Gtk.DrawingArea):
             "Shift+click adds a clip to the selection; drag moves the group. "
             "With the timeline focused, H/L move between video clips; Shift+H/L "
             "extends the selection. "
+            "J/K move the track cursor down/up. "
             "Drag the ruler or playhead to seek. T splits at the playhead. "
             "Del removes the selected clip (A-track too). Esc clears multi-select."
         )
@@ -846,6 +851,17 @@ class Timeline(Gtk.DrawingArea):
         self.queue_draw()
         return True
 
+    def move_navigation_track(self, delta: int) -> bool:
+        """Move the visible keyboard cursor through V2, V1, A1, and A2."""
+        kind, track = move_timeline_track(self.nav_kind, self.nav_track, delta)
+        if (kind, track) == (self.nav_kind, self.nav_track):
+            return False
+        self.nav_kind, self.nav_track = kind, track
+        if callable(self.on_navigation_track_change):
+            self.on_navigation_track_change(kind, track)
+        self.queue_draw()
+        return True
+
     def _ensure_video_clip_visible(self, index: int) -> None:
         """Scroll the horizontal timeline just enough to reveal a video clip."""
         if not 0 <= index < len(self.vclips):
@@ -897,6 +913,7 @@ class Timeline(Gtk.DrawingArea):
                 "Shift+click adds a clip to the selection; drag moves the group. "
                 "With the timeline focused, H/L move between video clips; Shift+H/L "
                 "extends the selection. Drag the ruler or playhead to seek. "
+                "J/K move the track cursor down/up. "
                 "T splits at the playhead. "
                 "Del removes the selected clip (A-track too). Esc clears multi-select."
             )
@@ -1486,6 +1503,11 @@ class Timeline(Gtk.DrawingArea):
             _round_rect(cr, left, lane_y, inner, self._LANE_H, 4)
             cr.set_source_rgb(*track)
             cr.fill()
+            if (kind, track_no) == (self.nav_kind, self.nav_track):
+                cr.set_source_rgb(*sel)
+                cr.set_line_width(2)
+                _round_rect(cr, left + 1, lane_y + 1, inner - 2, self._LANE_H - 2, 3)
+                cr.stroke()
 
         cr.set_source_rgb(*muted)
         cr.set_font_size(11)
@@ -1907,6 +1929,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.timeline.on_video_trim = self._on_video_trim
         self.timeline.on_audio_trim = self._on_audio_trim
         self.timeline.on_track_change = self._on_track_change
+        self.timeline.on_navigation_track_change = self._on_navigation_track_change
         self.timeline.on_place = self._place_clip
         self.timeline.on_select = self._on_clip_select
         self.timeline_scroll = Gtk.ScrolledWindow()
@@ -2196,6 +2219,14 @@ class EditorWindow(Adw.ApplicationWindow):
         ):
             delta = -1 if keyval in (Gdk.KEY_h, Gdk.KEY_H) else 1
             self.timeline.move_video_selection(delta, extend=shift)
+            return True
+        if (
+            not ctrl
+            and not extra
+            and keyval in (Gdk.KEY_j, Gdk.KEY_J, Gdk.KEY_k, Gdk.KEY_K)
+        ):
+            delta = 1 if keyval in (Gdk.KEY_j, Gdk.KEY_J) else -1
+            self.timeline.move_navigation_track(delta)
             return True
         if mods:
             return False
@@ -3767,6 +3798,10 @@ class EditorWindow(Adw.ApplicationWindow):
             return
         clips[index].track = max(1, min(2, int(track)))
         self._set_status(f"Moved clip to {kind[0].upper()}{clips[index].track}")
+
+    def _on_navigation_track_change(self, kind: str, track: int) -> None:
+        """Report the keyboard lane cursor without changing clip selection."""
+        self._set_status(f"Keyboard track: {kind[0].upper()}{track}")
 
     def _on_video_trim(self, index: int, in_s: float, out_s: float, done: bool) -> None:
         if not self._guard_edit("trim"):

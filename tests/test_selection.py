@@ -7,6 +7,7 @@ import unittest
 from clip_editor.selection import (
     group_moved_starts,
     move_video_selection,
+    move_timeline_track,
     next_video_selection,
     prune_video_selection,
 )
@@ -89,6 +90,7 @@ class MoveVideoSelectionTest(unittest.TestCase):
         self.assertEqual(primary, 2)
         self.assertEqual(selected, {2})
 
+
     def test_shift_movement_extends_selection(self) -> None:
         primary, selected = move_video_selection(
             delta=1, primary=1, selected={1}, extend=True, n_clips=4
@@ -133,6 +135,22 @@ class MoveVideoSelectionTest(unittest.TestCase):
         )
         self.assertEqual(primary, 2)
         self.assertEqual(selected, {2})
+
+
+class MoveTimelineTrackTest(unittest.TestCase):
+    def test_moves_down_in_visual_track_order(self) -> None:
+        self.assertEqual(move_timeline_track("video", 2, 1), ("video", 1))
+        self.assertEqual(move_timeline_track("video", 1, 1), ("audio", 1))
+        self.assertEqual(move_timeline_track("audio", 1, 1), ("audio", 2))
+
+    def test_moves_up_in_visual_track_order(self) -> None:
+        self.assertEqual(move_timeline_track("audio", 2, -1), ("audio", 1))
+        self.assertEqual(move_timeline_track("audio", 1, -1), ("video", 1))
+        self.assertEqual(move_timeline_track("video", 1, -1), ("video", 2))
+
+    def test_clamps_at_top_and_bottom(self) -> None:
+        self.assertEqual(move_timeline_track("video", 2, -1), ("video", 2))
+        self.assertEqual(move_timeline_track("audio", 2, 1), ("audio", 2))
 
 
 class GroupMovedStartsTest(unittest.TestCase):

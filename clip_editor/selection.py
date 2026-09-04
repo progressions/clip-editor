@@ -3,6 +3,24 @@
 from __future__ import annotations
 
 
+TIMELINE_TRACKS: tuple[tuple[str, int], ...] = (
+    ("video", 2),
+    ("video", 1),
+    ("audio", 1),
+    ("audio", 2),
+)
+
+
+def move_timeline_track(kind: str, track: int, delta: int) -> tuple[str, int]:
+    """Move one lane through the fixed top-to-bottom timeline track order."""
+    try:
+        current = TIMELINE_TRACKS.index((kind, int(track)))
+    except ValueError:
+        current = TIMELINE_TRACKS.index(("video", 1))
+    destination = max(0, min(len(TIMELINE_TRACKS) - 1, current + int(delta)))
+    return TIMELINE_TRACKS[destination]
+
+
 def next_video_selection(
     *,
     clicked: int,
