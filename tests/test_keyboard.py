@@ -19,6 +19,7 @@ class KeyboardOwnershipTest(unittest.TestCase):
             _show_command_line=Mock(), _split_selected_clip=Mock(),
             _delete_selected_clip=Mock(return_value=True),
             _guard_edit=Mock(return_value=True), _space_held=False,
+            keyboard_mode='', _exit_keyboard_mode=Mock(),
         )
 
     def key(self, win, key, modifiers=0):
