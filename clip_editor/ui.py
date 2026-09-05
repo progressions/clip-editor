@@ -2209,6 +2209,8 @@ class EditorWindow(Adw.ApplicationWindow):
         root.append(scroller)
         toolbar.set_content(root)
         self.set_content(toolbar)
+        self.keyboard_help = self._build_keyboard_help()
+        self.keyboard_help.set_parent(self.timeline)
         self.connect("close-request", self._on_close)
 
         # Hyprland+Nautilus prefers MOVE; COPY-only targets reject the drop.
@@ -2265,6 +2267,65 @@ class EditorWindow(Adw.ApplicationWindow):
         self.command_revealer.set_reveal_child(False)
         self.timeline.grab_focus()
 
+    def _build_keyboard_help(self) -> Gtk.Popover:
+        popover = Gtk.Popover()
+        popover.set_autohide(False)
+        popover.set_focusable(False)
+        popover.set_has_arrow(False)
+        popover.set_position(Gtk.PositionType.TOP)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        content.set_margin_top(16)
+        content.set_margin_bottom(16)
+        content.set_margin_start(18)
+        content.set_margin_end(18)
+
+        title = Gtk.Label(label="Keyboard shortcuts", xalign=0)
+        title.add_css_class("title-3")
+        content.append(title)
+
+        body = Gtk.Label(xalign=0)
+        body.set_wrap(True)
+        body.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        body.set_markup(
+            "<b>Timeline navigation</b>\n"
+            "h / l   select previous / next clip\n"
+            "Shift+h / Shift+l   extend selection\n"
+            "j / k   move between video and audio tracks\n"
+            "Space   play / pause\n"
+            ":   command line\n\n"
+            "<b>Keyboard editing</b>\n"
+            "m   move selected clips; h / l apply the active increment\n"
+            "r   ripple-reorder a clip or contiguous group\n"
+            "[ / ]   trim the selected clip's left / right edge\n"
+            "s   seek the playhead; h / l move by the active increment\n"
+            "t   split the selected clip at the playhead\n"
+            "Up / Down   change the active edit or seek increment\n\n"
+            "<b>Editing controls</b>\n"
+            "Ctrl+Z   undo     Ctrl+Shift+Z / Ctrl+Y   redo\n"
+            "Delete   remove the selected clip\n"
+            "Esc   exit the current mode, clear selection, or close help\n"
+            "?   show / hide this help\n\n"
+            "Move, trim, ripple, seek, and split target the active video or audio track."
+        )
+        body.set_selectable(False)
+        self.keyboard_help_body = body
+        content.append(body)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_min_content_width(520)
+        scroll.set_min_content_height(420)
+        scroll.set_child(content)
+        popover.set_child(scroll)
+        return popover
+
+    def _toggle_keyboard_help(self) -> None:
+        if self.keyboard_help.get_visible():
+            self.keyboard_help.popdown()
+        else:
+            self.keyboard_help.popup()
+
     def _on_command_key_pressed(
         self, _controller: Gtk.EventControllerKey, keyval: int, _code: int, _state: int
     ) -> bool:
@@ -2309,6 +2370,9 @@ class EditorWindow(Adw.ApplicationWindow):
         ctrl = bool(mods & Gdk.ModifierType.CONTROL_MASK)
         shift = bool(mods & Gdk.ModifierType.SHIFT_MASK)
         extra = mods & ~(Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK)
+        if not ctrl and not extra and keyval == Gdk.KEY_question:
+            self._toggle_keyboard_help()
+            return True
         if extra:
             return False
         if not mods and keyval == Gdk.KEY_m:
@@ -2322,6 +2386,10 @@ class EditorWindow(Adw.ApplicationWindow):
             return True
         if not mods and keyval in (Gdk.KEY_bracketleft, Gdk.KEY_bracketright):
             self._enter_keyboard_mode("trim-in" if keyval == Gdk.KEY_bracketleft else "trim-out")
+            return True
+        keyboard_help = getattr(self, "keyboard_help", None)
+        if keyboard_help is not None and keyboard_help.get_visible() and not mods and keyval == Gdk.KEY_Escape:
+            self._toggle_keyboard_help()
             return True
         if self.keyboard_mode and not mods and keyval == Gdk.KEY_Escape:
             self._exit_keyboard_mode()
