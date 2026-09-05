@@ -141,6 +141,13 @@ project history only from the timeline. Save and Open remain application-wide.
 The colon command entry owns typing until Enter or Esc returns focus to the
 timeline.
 
+`h/l` selects previous/next clips in time order on the active video or audio
+track. `Shift+H/L` extends the selection. `j/k` changes tracks through
+V2, V1, A1, A2 and selects the clip under the playhead, otherwise the nearest
+clip edge (ties prefer the earlier clip). Empty tracks clear selection.
+`Esc` clears selection. Source-soundtrack audio can be selected without
+detaching it; audio edits will make it independent of video as needed.
+
 Format: JSON, ``format: "clip-editor-project"``, ``version: 3``, suffix
 ``.clip.json``. Records video/audio paths (absolute plus relative to the
 project file), aspect, pan, in/out, Fit, cross-fade duration, and “audio follows
