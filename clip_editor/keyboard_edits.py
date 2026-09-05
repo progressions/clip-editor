@@ -2,8 +2,18 @@
 
 from .project import ClipInst
 from .ripple import follower_indices
+import math
 
 MOVE_INCREMENTS = (10.0, 1.0, 0.1, 'clip')
+SEEK_INCREMENTS = (10.0, 1.0, 0.1, 'frame', 'clip')
+
+
+def seek_frame(time: float, direction: int, fps: float) -> float:
+    """Next/previous timeline frame-grid point, including off-grid playheads."""
+    fps = fps if math.isfinite(fps) and fps >= 1 else 30.0
+    frame = (math.floor(time * fps + 1e-8) + 1 if direction > 0
+             else math.ceil(time * fps - 1e-8) - 1)
+    return max(0, frame / fps)
 
 
 def boundary_delta(clips: list[ClipInst], selected: set[int], primary: int,

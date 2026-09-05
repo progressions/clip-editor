@@ -168,6 +168,13 @@ track by the actual duration change, preserving gaps and other tracks. Trimming
 uses source footage without changing speed, and respects source limits and a
 minimum timeline duration of 0.05s. These rules apply to video and audio.
 
+`s` enters seek mode. `h/l` moves the playhead by the selected increment;
+Up/Down chooses 10s, 1s, 0.1s, frame grid, or clip edges. Seeking never edits
+clips. `t` splits the selected video or audio clip at the playhead and selects
+the right piece. The playhead must be inside the clip away from its boundaries.
+Splitting preserves playback speed and source alignment; source-soundtrack
+audio becomes independent only when it is split.
+
 `r` enters ripple reorder: `h/l` inserts the selected clip or contiguous group
 before/after its neighbor on the same track. Unequal durations reflow correctly.
 Only touching clips can be reordered this way; gaps, overlaps, selections on

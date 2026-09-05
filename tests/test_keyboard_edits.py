@@ -1,6 +1,8 @@
 import unittest
 from clip_editor.project import ClipInst
-from clip_editor.keyboard_edits import boundary_delta, move_clips, reorder_clips, trim_clip
+from clip_editor.keyboard_edits import (
+    boundary_delta, move_clips, reorder_clips, seek_frame, trim_clip,
+)
 
 
 class MoveClipsTest(unittest.TestCase):
@@ -94,4 +96,12 @@ class ReorderClipsTest(unittest.TestCase):
                 reorder_clips(clips, {0}, 0, 1)
         clips[1].track = 2
         with self.assertRaisesRegex(ValueError, 'one track'):
-            reorder_clips(clips, {0, 1}, 0, 1)
+                reorder_clips(clips, {0, 1}, 0, 1)
+
+
+class SeekFrameTest(unittest.TestCase):
+    def test_frame_step_uses_valid_source_fps_and_clamps(self):
+        self.assertAlmostEqual(seek_frame(1.0, 1, 24), 25 / 24)
+        self.assertAlmostEqual(seek_frame(1.0, -1, 24), 23 / 24)
+        self.assertEqual(seek_frame(-1, -1, 24), 0)
+        self.assertAlmostEqual(seek_frame(1.0, 1, 0), 31 / 30)

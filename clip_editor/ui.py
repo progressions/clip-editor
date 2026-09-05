@@ -29,7 +29,8 @@ from clip_editor.aspects import (
 )
 from clip_editor.commands import parse_command
 from clip_editor.keyboard_edits import (
-    MOVE_INCREMENTS, boundary_delta, move_clips, reorder_clips, trim_clip,
+    MOVE_INCREMENTS, SEEK_INCREMENTS, boundary_delta, move_clips, reorder_clips,
+    seek_frame, trim_clip,
 )
 from clip_editor.eagle import apply_omarchy_theme, theme_rgb
 from clip_editor.export import ExportCancelled, ExportError, default_out_path, run_export
@@ -1846,7 +1847,8 @@ class EditorWindow(Adw.ApplicationWindow):
         self.sel_kind = ""
         self.keyboard_mode = ""
         self.keyboard_increment = 1.0
-        self.keyboard_increments = {"move": 1.0, "trim-in": .1, "trim-out": .1, "ripple": "clip"}
+        self.keyboard_increments = {"move": 1.0, "trim-in": .1, "trim-out": .1,
+                                    "ripple": "clip", "seek": .1}
         self._clip_playing = False
         self._audio_pending = False
         self.project_path: Path | None = None
@@ -2315,6 +2317,9 @@ class EditorWindow(Adw.ApplicationWindow):
         if not mods and keyval == Gdk.KEY_r:
             self._enter_keyboard_mode("ripple")
             return True
+        if not mods and keyval == Gdk.KEY_s:
+            self._enter_keyboard_mode("seek")
+            return True
         if not mods and keyval in (Gdk.KEY_bracketleft, Gdk.KEY_bracketright):
             self._enter_keyboard_mode("trim-in" if keyval == Gdk.KEY_bracketleft else "trim-out")
             return True
@@ -2402,9 +2407,9 @@ class EditorWindow(Adw.ApplicationWindow):
         return kind, clips, primary, {i for i in selected or {primary} if 0 <= i < len(clips)}
 
     def _enter_keyboard_mode(self, mode: str) -> None:
-        if self.exporting or not self._guard_edit("move"):
+        if self.exporting or not self._guard_edit("seek" if mode == "seek" else "move"):
             return
-        if not self._keyboard_target()[0]:
+        if mode != "seek" and not self._keyboard_target()[0]:
             self._set_status("Select a clip on the active track")
             return
         self._stop()
@@ -2421,7 +2426,7 @@ class EditorWindow(Adw.ApplicationWindow):
 
     def _show_keyboard_mode(self) -> None:
         kind, clips, primary, selected = self._keyboard_target()
-        increment = ("clip starts" if self.keyboard_increment == "clip"
+        increment = (str(self.keyboard_increment) if isinstance(self.keyboard_increment, str)
                      else f"{self.keyboard_increment:g}s")
         target = f"{len(selected)} selected"
         if self.keyboard_mode == "ripple":
@@ -2430,6 +2435,13 @@ class EditorWindow(Adw.ApplicationWindow):
             clip = clips[primary]
             edge = "left" if self.keyboard_mode == "trim-in" else "right (ripple)"
             target = f"primary clip {edge} edge · duration {clip.timeline_len():.2f}s"
+        if self.keyboard_mode == "seek":
+            kind = self.timeline.nav_kind
+            target = f"playhead {self.timeline.playhead:.3f}s"
+            if self.keyboard_increment == "frame":
+                increment = f"1 frame ({self._keyboard_fps():g} fps grid)"
+            elif self.keyboard_increment == "clip":
+                increment = "clip edges"
         self.keyboard_hint.set_text(
             f"{self.keyboard_mode.upper()} · {kind[:1].upper()}{self.timeline.nav_track} · "
             f"{target} · {increment} · h/l earlier/later · ↑/↓ increment · Esc exits")
@@ -2438,16 +2450,24 @@ class EditorWindow(Adw.ApplicationWindow):
         ladder = MOVE_INCREMENTS[:3] if self.keyboard_mode.startswith("trim") else MOVE_INCREMENTS
         if self.keyboard_mode == "ripple":
             ladder = ("clip",)
+        elif self.keyboard_mode == "seek":
+            ladder = SEEK_INCREMENTS
         index = ladder.index(self.keyboard_increment)
         self.keyboard_increment = ladder[
             max(0, min(len(ladder) - 1, index + direction))
         ]
         self._show_keyboard_mode()
 
-    def _apply_keyboard_clips(self, kind: str, clips: list[ClipInst]) -> None:
+    def _apply_keyboard_clips(self, kind: str, clips: list[ClipInst], *,
+                              primary: int | None = None, selected: set[int] | None = None) -> None:
         self._flush_checkpoint()
         self._checkpoint()
         self._stop()
+        if primary is not None:
+            if kind == "video":
+                self.sel_v, self.sel_vs = primary, set(selected or {primary})
+            else:
+                self.sel_a, self.sel_as = primary, set(selected or {primary})
         if kind == "video":
             self.video_clips = clips
             clip = clips[self.sel_v]
@@ -2474,6 +2494,9 @@ class EditorWindow(Adw.ApplicationWindow):
         self._apply_timeline_frame(self.timeline.playhead, start_media=False)
 
     def _nudge_keyboard(self, direction: int) -> None:
+        if self.keyboard_mode == "seek":
+            self._seek_keyboard(direction)
+            return
         if self.exporting or not self._guard_edit("move"):
             return
         kind, clips, primary, selected = self._keyboard_target()
@@ -2500,6 +2523,29 @@ class EditorWindow(Adw.ApplicationWindow):
             self._set_status("Clip or timeline boundary")
             return
         self._apply_keyboard_clips(kind, changed)
+        self._show_keyboard_mode()
+
+    def _keyboard_fps(self) -> float:
+        # A timeline grid, not source-frame stepping: stable across selection
+        # and applicable to audio-only tracks as well.
+        info = ((self.media_info.get(self.video_clips[0].media_id) or {})
+                if self.video_clips else {})
+        fps = float(info.get("fps") or 30)
+        return fps if 1 <= fps <= 1000 else 30.0
+
+    def _seek_keyboard(self, direction: int) -> None:
+        time = self._timeline_now()
+        if self.keyboard_increment == "frame":
+            target = seek_frame(time, direction, self._keyboard_fps())
+        elif self.keyboard_increment == "clip":
+            edges = [edge for _, start, end in self.timeline._navigation_clips()
+                     for edge in (start, end) if (edge - time) * direction > 1e-8]
+            target = (min(edges) if direction > 0 else max(edges)) if edges else time
+        else:
+            target = time + direction * self.keyboard_increment
+        target = max(0, min(self._program_end(), target))
+        self.timeline.set_playhead(target)
+        self._on_timeline_seek(target)
         self._show_keyboard_mode()
 
     def _snapshot_key(self, proj: Project | None = None) -> tuple:
@@ -4335,65 +4381,26 @@ class EditorWindow(Adw.ApplicationWindow):
             return False
         if not self._guard_edit("split"):
             return True
-        kind = self._selected_clip_kind()
+        kind, originals, idx, selected = self._keyboard_target()
         t = self._timeline_now()
-        if kind == "video":
-            idx = self.sel_v
-            if not 0 <= idx < len(self.video_clips):
-                return False
-            src_dur = float((self.video_info or {}).get("duration") or 0)
-            right = self.video_clips[idx].split_at(t, src_dur)
-            if right is None:
-                self._set_status("Playhead is not on the selected clip")
-                return False
-            self.video_clips.insert(idx + 1, right)
-            remapped = {
-                (i + 1 if i > idx else i) for i in self.sel_vs if i != idx
-            }
-            remapped.add(idx + 1)
-            self.sel_v = idx + 1
-            self.sel_vs = remapped
-            self.sel_kind = "video"
-            self.video_start = right.start
-            self._loading = True
-            try:
-                self.in_spin.set_value(right.in_s)
-                self.out_spin.set_value(right.out_s)
-            finally:
-                self._loading = False
-            self._set_status(f"Split video at {t:.2f}s")
-        elif kind == "audio":
-            idx = self.sel_a
-            if not 0 <= idx < len(self.audio_clips):
-                return False
-            src_dur = float((self.audio_info or {}).get("duration") or 0)
-            right = self.audio_clips[idx].split_at(t, src_dur)
-            if right is None:
-                self._set_status("Playhead is not on the selected clip")
-                return False
-            self.audio_clips.insert(idx + 1, right)
-            self.sel_a = idx + 1
-            self.sel_kind = "audio"
-            self.audio_start = right.start
-            self.audio_in = right.in_s
-            self.audio_out = right.out_s
-            if self.follow_in.get_active():
-                self.follow_in.set_active(False)
-            self._set_status(f"Split audio at {t:.2f}s")
-        else:
-            self._set_status("Select a clip to split")
+        if not kind:
+            self._set_status("Select a clip on the active track to split")
             return False
-        self._sync_timeline_clips()
+        clips = [c.copy() for c in originals]
+        duration = self._media_dur(clips[idx].media_id) or clips[idx].out_s
+        right = clips[idx].split_at(t, duration)
+        if right is None:
+            self._set_status("Playhead must be inside the selected clip, away from its edges")
+            return False
+        clips.insert(idx + 1, right)
+        remapped = {(i + 1 if i > idx else i) for i in selected if i != idx}
+        remapped.add(idx + 1)
+        was_playing = self.playing
+        self._apply_keyboard_clips(kind, clips, primary=idx + 1, selected=remapped)
+        self._set_status(f"Split {kind} at {t:.3f}s")
         self.clock.set_text(f"{t:.2f} / {self._program_end():.2f}")
-        if self.playing:
-            self._video_play_clip = None
-            self._audio_play_clip = None
-            self._apply_timeline_frame(t, start_media=True)
-            self._start_preview_audio(t)
-        else:
-            self._apply_timeline_frame(t, start_media=False)
-        self._checkpoint()
-        self._schedule_autosave()
+        if was_playing:
+            self._on_play()
         return True
 
     def _on_timeline_seek(self, value: float) -> None:
