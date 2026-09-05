@@ -134,6 +134,13 @@ file.
 
 ## Project files
 
+Timeline shortcuts run only while the timeline has keyboard focus (click it
+or reach it with Tab). Text fields, inspector controls, menus, and dialogs keep
+their native keys, including text undo. Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y edit the
+project history only from the timeline. Save and Open remain application-wide.
+The colon command entry owns typing until Enter or Esc returns focus to the
+timeline.
+
 Format: JSON, ``format: "clip-editor-project"``, ``version: 3``, suffix
 ``.clip.json``. Records video/audio paths (absolute plus relative to the
 project file), aspect, pan, in/out, Fit, cross-fade duration, and “audio follows

@@ -2260,7 +2260,9 @@ class EditorWindow(Adw.ApplicationWindow):
         self._start_playthrough_render()
 
     def _on_key_pressed(self, _c: Gtk.EventControllerKey, keyval: int, _code: int, state: int) -> bool:
-        if self.command_entry.has_focus():
+        # Timeline is a leaf widget: exact ownership also excludes inspector
+        # entries, buttons, popovers, dialogs, and the colon command entry.
+        if self.get_focus() is not self.timeline:
             return False
         mods = state & Gtk.accelerator_get_default_mod_mask()
         ctrl = bool(mods & Gdk.ModifierType.CONTROL_MASK)
@@ -5479,8 +5481,8 @@ class EditorApp(Adw.Application):
         self.set_accels_for_action("win.save", ["<Control>s"])
         self.set_accels_for_action("win.save-as", ["<Control><Shift>s"])
         self.set_accels_for_action("win.open-project", ["<Control>o"])
-        self.set_accels_for_action("win.undo", ["<Control>z"])
-        self.set_accels_for_action("win.redo", ["<Control><Shift>z", "<Control>y"])
+        # Timeline undo/redo is dispatched by its focus-scoped key handler.
+        # Application accelerators would bypass it and steal native text undo.
 
     def _ensure_window(self) -> EditorWindow:
         apply_omarchy_theme()
