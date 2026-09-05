@@ -104,6 +104,34 @@ class KeyboardEditingTest(unittest.TestCase):
         self.assertEqual(self.win.audio_clips, [])
         self.assertTrue(self.win.use_video_soundtrack)
 
+    def test_seek_mode_moves_playhead_without_editing_clips(self):
+        before = [c.copy() for c in self.win.video_clips]
+        self.key(Gdk.KEY_s)
+        self.assertEqual(self.win.keyboard_mode, 'seek')
+        self.key(Gdk.KEY_l)
+        self.assertAlmostEqual(self.win.timeline.playhead, .1)
+        self.key(Gdk.KEY_Down)
+        self.key(Gdk.KEY_l)
+        self.assertAlmostEqual(self.win.timeline.playhead, 4 / 30)
+        self.key(Gdk.KEY_Down)
+        self.key(Gdk.KEY_l)
+        self.assertAlmostEqual(self.win.timeline.playhead, 5)
+        self.assertEqual(self.win.video_clips, before)
+        self.assertEqual(len(self.win._history), 1)
+
+    def test_split_uses_playback_speed_and_selects_right_piece(self):
+        self.win.video_clips[0].speed = 2
+        self.win.timeline.nav_kind = 'video'
+        self.win.timeline.nav_track = 1
+        self.win.timeline.set_playhead(2)
+        self.key(Gdk.KEY_t)
+        left, right = self.win.video_clips[:2]
+        self.assertAlmostEqual(left.out_s, 4)
+        self.assertAlmostEqual(right.in_s, 4)
+        self.assertAlmostEqual(right.start, -2)
+        self.assertEqual(self.win.sel_v, 1)
+        self.assertEqual(len(self.win._history), 2)
+
     def test_audio_reorder_and_undo(self):
         self.key(Gdk.KEY_j)
         self.key(Gdk.KEY_r)

@@ -153,7 +153,7 @@ class ClipInst:
     ) -> ClipInst | None:
         """Trim this instance to the left of ``timeline_t``; return the right piece.
 
-        Same source file, same ``start``. None if the playhead is not far
+        Same source file and playback speed. None if the playhead is not far
         enough inside the used range. The outgoing transition moves to the
         right piece; the new internal cut is hard.
         """
@@ -164,13 +164,14 @@ class ClipInst:
                 out = src_dur
             out = min(out, src_dur)
         t0 = float(self.start) + inn
-        t1 = float(self.start) + out
+        speed = self.playback_speed()
+        t1 = t0 + (out - inn) / speed
         t = float(timeline_t)
         if t <= t0 + min_len or t >= t1 - min_len:
             return None
-        src_cut = t - float(self.start)
+        src_cut = inn + (t - t0) * speed
         right = ClipInst(
-            start=self.start,
+            start=t - src_cut,
             in_s=src_cut,
             out_s=out,
             media_id=self.media_id,
