@@ -72,6 +72,21 @@ class KeyboardEditingTest(unittest.TestCase):
         self.key(Gdk.KEY_m)
         self.key(Gdk.KEY_j)
         self.assertEqual(self.win.keyboard_mode, '')
+
+    def test_increment_ladder_and_boundary_move(self):
+        self.key(Gdk.KEY_m)
+        self.key(Gdk.KEY_Up)
+        self.assertEqual(self.win.keyboard_increment, 10)
+        self.key(Gdk.KEY_Down)
+        self.key(Gdk.KEY_Down)
+        self.assertEqual(self.win.keyboard_increment, .1)
+        self.key(Gdk.KEY_Down)
+        self.assertEqual(self.win.keyboard_increment, 'clip')
+        self.key(Gdk.KEY_l)
+        self.assertEqual(self.win.video_clips[0].start, 5)
+        self.key(Gdk.KEY_Escape)
+        self.key(Gdk.KEY_m)
+        self.assertEqual(self.win.keyboard_increment, 'clip')
         self.key(Gdk.KEY_m)
         self.win.command_entry.grab_focus()
         # Focus controller leave is delivered by GTK's focus transition.

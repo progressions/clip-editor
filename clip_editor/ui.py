@@ -28,7 +28,7 @@ from clip_editor.aspects import (
     dest_size,
 )
 from clip_editor.commands import parse_command
-from clip_editor.keyboard_edits import move_clips
+from clip_editor.keyboard_edits import MOVE_INCREMENTS, boundary_delta, move_clips
 from clip_editor.eagle import apply_omarchy_theme, theme_rgb
 from clip_editor.export import ExportCancelled, ExportError, default_out_path, run_export
 from clip_editor.preview import (
@@ -2312,6 +2312,9 @@ class EditorWindow(Adw.ApplicationWindow):
         if self.keyboard_mode and not mods and keyval == Gdk.KEY_Escape:
             self._exit_keyboard_mode()
             return True
+        if self.keyboard_mode and not mods and keyval in (Gdk.KEY_Up, Gdk.KEY_Down):
+            self._change_keyboard_increment(-1 if keyval == Gdk.KEY_Up else 1)
+            return True
         if self.keyboard_mode and not mods and keyval in (Gdk.KEY_h, Gdk.KEY_l):
             self._nudge_keyboard(-1 if keyval == Gdk.KEY_h else 1)
             return True
@@ -2405,10 +2408,19 @@ class EditorWindow(Adw.ApplicationWindow):
 
     def _show_keyboard_mode(self) -> None:
         kind, _clips, _primary, selected = self._keyboard_target()
+        increment = ("clip starts" if self.keyboard_increment == "clip"
+                     else f"{self.keyboard_increment:g}s")
         self.keyboard_hint.set_text(
             f"{self.keyboard_mode.upper()} · {kind[:1].upper()}{self.timeline.nav_track} · "
-            f"{len(selected)} selected · {self.keyboard_increment:g}s · h/l earlier/later · Esc exits"
+            f"{len(selected)} selected · {increment} · h/l earlier/later · ↑/↓ increment · Esc exits"
         )
+
+    def _change_keyboard_increment(self, direction: int) -> None:
+        index = MOVE_INCREMENTS.index(self.keyboard_increment)
+        self.keyboard_increment = MOVE_INCREMENTS[
+            max(0, min(len(MOVE_INCREMENTS) - 1, index + direction))
+        ]
+        self._show_keyboard_mode()
 
     def _apply_keyboard_clips(self, kind: str, clips: list[ClipInst]) -> None:
         self._flush_checkpoint()
@@ -2442,12 +2454,14 @@ class EditorWindow(Adw.ApplicationWindow):
     def _nudge_keyboard(self, direction: int) -> None:
         if self.exporting or not self._guard_edit("move"):
             return
-        kind, clips, _primary, selected = self._keyboard_target()
+        kind, clips, primary, selected = self._keyboard_target()
         if not kind:
             self._exit_keyboard_mode()
             self._set_status("Select a clip on the active track")
             return
-        changed = move_clips(clips, selected, direction * self.keyboard_increment)
+        delta = (boundary_delta(clips, selected, primary, direction)
+                 if self.keyboard_increment == "clip" else direction * self.keyboard_increment)
+        changed = move_clips(clips, selected, delta)
         if changed == clips:
             self._set_status("Timeline boundary")
             return

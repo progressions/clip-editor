@@ -155,6 +155,11 @@ undo reverses an edit. Changing track, selecting with the mouse, leaving timelin
 focus, or restoring history exits the mode. The first actual edit of mirrored
 source audio makes independent audio clips without changing the video.
 
+In move mode, `Up/Down` chooses 10s, 1s, 0.1s, or neighboring clip starts.
+The choice lasts for the session. Clip stepping uses the primary selected
+clip as its anchor and ignores selected clips and other lanes. A boundary step
+that would push another selected clip before zero leaves the group in place.
+
 Format: JSON, ``format: "clip-editor-project"``, ``version: 3``, suffix
 ``.clip.json``. Records video/audio paths (absolute plus relative to the
 project file), aspect, pan, in/out, Fit, cross-fade duration, and “audio follows
