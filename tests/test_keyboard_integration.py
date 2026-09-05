@@ -103,3 +103,16 @@ class KeyboardEditingTest(unittest.TestCase):
         self.win._on_undo()
         self.assertEqual(self.win.audio_clips, [])
         self.assertTrue(self.win.use_video_soundtrack)
+
+    def test_audio_reorder_and_undo(self):
+        self.key(Gdk.KEY_j)
+        self.key(Gdk.KEY_r)
+        self.key(Gdk.KEY_l)
+        self.assertEqual([c.start for c in self.win.audio_clips], [5, 0])
+        self.assertEqual(self.win.timeline.audio_kind, 'replace')
+        self.assertEqual([c.start for c in self.win.timeline.aclips], [5, 0])
+        self.assertEqual([c.start for c in self.win.video_clips], [0, 5])
+        self.assertEqual(len(self.win._history), 2)
+        self.win._on_undo()
+        self.assertEqual(self.win.audio_clips, [])
+        self.assertTrue(self.win.use_video_soundtrack)
