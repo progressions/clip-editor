@@ -2433,6 +2433,9 @@ class EditorWindow(Adw.ApplicationWindow):
             finally:
                 self._loading = False
             self._bind_audio(clips[self.sel_a].media_id)
+        # The editor now owns a replacement list, so refresh the Timeline's
+        # shallow list and switch source soundtrack mode to independent audio.
+        self._sync_timeline_clips()
         self._refresh_fit()
         self._checkpoint()
         self._schedule_autosave()
