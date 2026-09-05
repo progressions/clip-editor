@@ -11,6 +11,32 @@ TIMELINE_TRACKS: tuple[tuple[str, int], ...] = (
 )
 
 
+def move_track_selection(*, order: list[int], primary: int,
+                         selected: set[int], delta: int,
+                         extend: bool) -> tuple[int, set[int]]:
+    """Navigate chronological indices in one lane, independent of media type."""
+    if not order:
+        return -1, set()
+    position = order.index(primary) if primary in order else -1
+    destination, result = move_video_selection(
+        delta=delta, primary=position,
+        selected={i for i, index in enumerate(order) if index in selected},
+        extend=extend, n_clips=len(order),
+    )
+    return order[destination], {order[i] for i in result}
+
+
+def nearest_clip(times: list[tuple[int, float, float]], time: float) -> int:
+    """Containing clip, else nearest edge; ties prefer earlier starts/index."""
+    if not times:
+        return -1
+    def distance(row):
+        index, start, end = row
+        return (0 if start <= time < end else 1,
+                max(start - time, time - end, 0), start, index)
+    return min(times, key=distance)[0]
+
+
 def move_timeline_track(kind: str, track: int, delta: int) -> tuple[str, int]:
     """Move one lane through the fixed top-to-bottom timeline track order."""
     try:
