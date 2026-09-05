@@ -8,6 +8,8 @@ from clip_editor.selection import (
     group_moved_starts,
     move_video_selection,
     move_timeline_track,
+    move_track_selection,
+    nearest_clip,
     next_video_selection,
     prune_video_selection,
 )
@@ -158,6 +160,26 @@ class GroupMovedStartsTest(unittest.TestCase):
         starts = {0: 1.0, 2: 4.0, 3: 7.5}
         moved = group_moved_starts(starts, anchor=2, new_anchor_start=5.5)
         self.assertEqual(moved, {0: 2.5, 2: 5.5, 3: 9.0})
+
+
+class TrackSelectionTest(unittest.TestCase):
+    def test_chronological_order_and_track_filter(self):
+        self.assertEqual(move_track_selection(
+            order=[3, 0, 2], primary=3, selected={3}, delta=1, extend=True),
+            (0, {0, 3}))
+        self.assertEqual(move_track_selection(
+            order=[3, 0, 2], primary=0, selected={0, 3}, delta=1, extend=False),
+            (2, {2}))
+        self.assertEqual(move_track_selection(
+            order=[], primary=0, selected={0}, delta=1, extend=True), (-1, set()))
+
+    def test_track_entry_prefers_containment_then_nearest_edge(self):
+        times = [(2, 0, 2), (0, 4, 7), (1, 7, 9)]
+        self.assertEqual(nearest_clip(times, 5), 0)
+        self.assertEqual(nearest_clip(times, 7), 1)
+        self.assertEqual(nearest_clip(times, 3), 2)
+        self.assertEqual(nearest_clip(times, 20), 1)
+        self.assertEqual(nearest_clip([], 5), -1)
 
 
 if __name__ == "__main__":

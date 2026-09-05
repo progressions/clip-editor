@@ -10,7 +10,7 @@ from clip_editor.ui import EditorApp, EditorWindow, Gdk, Gtk
 class KeyboardOwnershipTest(unittest.TestCase):
     def make_window(self, timeline_focus=True):
         timeline = SimpleNamespace(
-            move_video_selection=Mock(), move_navigation_track=Mock(),
+            move_clip_selection=Mock(), move_navigation_track=Mock(),
         )
         return SimpleNamespace(
             timeline=timeline,
@@ -19,6 +19,7 @@ class KeyboardOwnershipTest(unittest.TestCase):
             _show_command_line=Mock(), _split_selected_clip=Mock(),
             _delete_selected_clip=Mock(return_value=True),
             _guard_edit=Mock(return_value=True), _space_held=False,
+            keyboard_mode='', _exit_keyboard_mode=Mock(),
         )
 
     def key(self, win, key, modifiers=0):
@@ -35,12 +36,12 @@ class KeyboardOwnershipTest(unittest.TestCase):
         win._on_undo.assert_not_called()
         win._on_redo.assert_not_called()
         win._guard_edit.assert_not_called()
-        win.timeline.move_video_selection.assert_not_called()
+        win.timeline.move_clip_selection.assert_not_called()
 
     def test_timeline_dispatch_and_rendered_preview_guard(self):
         win = self.make_window()
         self.assertTrue(self.key(win, Gdk.KEY_l))
-        win.timeline.move_video_selection.assert_called_once_with(1, extend=False)
+        win.timeline.move_clip_selection.assert_called_once_with(1, extend=False)
         self.key(win, Gdk.KEY_z, Gdk.ModifierType.CONTROL_MASK)
         win._on_undo.assert_called_once()
         win._guard_edit.return_value = False

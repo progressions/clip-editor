@@ -141,6 +141,47 @@ project history only from the timeline. Save and Open remain application-wide.
 The colon command entry owns typing until Enter or Esc returns focus to the
 timeline.
 
+`h/l` selects previous/next clips in time order on the active video or audio
+track. `Shift+H/L` extends the selection. `j/k` changes tracks through
+V2, V1, A1, A2 and selects the clip under the playhead, otherwise the nearest
+clip edge (ties prefer the earlier clip). Empty tracks clear selection.
+`Esc` clears selection. Source-soundtrack audio can be selected without
+detaching it; audio edits will make it independent of video as needed.
+
+`m` enters move mode: `h/l` nudges selected video or audio clips by one second.
+Groups preserve internal timing and clamp together at timeline zero. The visible
+mode indicator shows the target and increment. `Esc` keeps edits and selection;
+undo reverses an edit. Changing track, selecting with the mouse, leaving timeline
+focus, or restoring history exits the mode. The first actual edit of mirrored
+source audio makes independent audio clips without changing the video.
+
+In move mode, `Up/Down` chooses 10s, 1s, 0.1s, or neighboring clip starts.
+The choice lasts for the session. Clip stepping uses the primary selected
+clip as its anchor and ignores selected clips and other lanes. A boundary step
+that would push another selected clip before zero leaves the group in place.
+
+`[` / `]` enters left/right edge trim on the primary selected clip (even with
+a multi-selection). `h/l` moves that edge earlier/later; `Up/Down` selects
+10s, 1s, or 0.1s. Trim starts at 0.1s and each mode remembers its own increment.
+Left trim keeps the right edge fixed. Right trim ripples later clips on the same
+track by the actual duration change, preserving gaps and other tracks. Trimming
+uses source footage without changing speed, and respects source limits and a
+minimum timeline duration of 0.05s. These rules apply to video and audio.
+
+`s` enters seek mode. `h/l` moves the playhead by the selected increment;
+Up/Down chooses 10s, 1s, 0.1s, frame grid, or clip edges. Seeking never edits
+clips. `t` splits the selected video or audio clip at the playhead and selects
+the right piece. The playhead must be inside the clip away from its boundaries.
+Splitting preserves playback speed and source alignment; source-soundtrack
+audio becomes independent only when it is split.
+
+`r` enters ripple reorder: `h/l` inserts the selected clip or contiguous group
+before/after its neighbor on the same track. Unequal durations reflow correctly.
+Only touching clips can be reordered this way; gaps, overlaps, selections on
+multiple tracks, or non-contiguous selections produce a message without editing.
+Other tracks and clips outside the affected span keep their timing. This mode
+uses clip steps only, and one undo restores the complete reorder.
+
 Format: JSON, ``format: "clip-editor-project"``, ``version: 3``, suffix
 ``.clip.json``. Records video/audio paths (absolute plus relative to the
 project file), aspect, pan, in/out, Fit, cross-fade duration, and “audio follows
