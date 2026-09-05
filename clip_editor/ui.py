@@ -3762,8 +3762,10 @@ class EditorWindow(Adw.ApplicationWindow):
                 if 0 <= self.sel_v < len(self.video_clips)
                 else self.video_clips[0]
             )
-            if 0 <= self.sel_a < len(self.audio_clips):
-                self.audio_clips[self.sel_a].start = vs.start
+            # Video selection clears the visible audio selection, but Follow In
+            # still targets the first audio clip when no audio clip is active.
+            audio_index = self.sel_a if 0 <= self.sel_a < len(self.audio_clips) else 0
+            self.audio_clips[audio_index].start = vs.start
             self.audio_start = vs.start
         self._refresh_fit()
 
@@ -3855,9 +3857,10 @@ class EditorWindow(Adw.ApplicationWindow):
         if index == self.sel_v:
             self.video_start = self.video_clips[index].start
             # Follow-in tracks the primary clip only (not every group member).
-            if self.follow_in.get_active() and 0 <= self.sel_a < len(self.audio_clips):
-                self.audio_clips[self.sel_a].start = self.video_clips[index].start
-                self.audio_start = self.audio_clips[self.sel_a].start
+            if self.follow_in.get_active() and self.audio_clips:
+                audio_index = self.sel_a if 0 <= self.sel_a < len(self.audio_clips) else 0
+                self.audio_clips[audio_index].start = self.video_clips[index].start
+                self.audio_start = self.audio_clips[audio_index].start
         if not done:
             return
         self._sync_timeline_clips()
