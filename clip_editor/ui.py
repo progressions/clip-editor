@@ -2467,6 +2467,7 @@ class EditorWindow(Adw.ApplicationWindow):
             finally:
                 self._loading = False
             self._bind_audio(clips[self.sel_a].media_id)
+        self._sync_timeline_clips()
         self._refresh_fit()
         self._checkpoint()
         self._schedule_autosave()
