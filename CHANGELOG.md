@@ -7,6 +7,15 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-09-05
+
+### Added
+
+- Keyboard clip movement across video and audio tracks ([#541](https://app.fizzy.do/6109848/cards/541), [#542](https://app.fizzy.do/6109848/cards/542)): `m` enters move mode with 10s, 1s, 0.1s, and visible clip-boundary increments. Up/Down changes granularity while `j`/`k` remain track navigation.
+- Keyboard ripple reorder ([#543](https://app.fizzy.do/6109848/cards/543)): `r` enters reorder mode; `h`/`l` moves a selected clip or contiguous group across a touching neighbor on the active track, preserving unequal durations and other tracks.
+- Keyboard clip-edge trimming ([#547](https://app.fizzy.do/6109848/cards/547)): `[` and `]` enter left/right trim modes. Right-edge edits ripple following clips on the same track by the actual duration change, with source bounds, playback speed, gaps, and undo preserved.
+- Keyboard seek and split workflow ([#548](https://app.fizzy.do/6109848/cards/548)): `s` enters seek mode with time, frame-grid, and clip-edge increments; `t` splits the selected video or audio clip at the playhead while preserving source alignment and speed. Mirrored source audio becomes independent only when split.
+
 ## [0.9.1] — 2026-09-04
 
 ### Fixed
@@ -97,7 +106,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 - Initial packaged release of the native GTK clip editor for Buffer-safe H.264/AAC exports.
 
-[Unreleased]: https://github.com/progressions/clip-editor/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/progressions/clip-editor/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/progressions/clip-editor/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/progressions/clip-editor/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/progressions/clip-editor/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/progressions/clip-editor/compare/v0.7.0...v0.8.0

@@ -1,6 +1,6 @@
 # Maintainer: Isaac Priestley <progressions@gmail.com>
 pkgname=clip-editor
-pkgver=0.9.1
+pkgver=0.10.0
 pkgrel=1
 pkgdesc="Native GTK clip editor for social video exports"
 arch=('any')
