@@ -1,6 +1,6 @@
 import unittest
 from clip_editor.project import ClipInst
-from clip_editor.keyboard_edits import boundary_delta, move_clips
+from clip_editor.keyboard_edits import boundary_delta, move_clips, reorder_clips, trim_clip
 
 
 class MoveClipsTest(unittest.TestCase):
@@ -32,3 +32,66 @@ class MoveClipsTest(unittest.TestCase):
         clips = [ClipInst(start=1, out_s=2), ClipInst(start=5, out_s=2),
                  ClipInst(start=2, out_s=2)]
         self.assertEqual(boundary_delta(clips, {0, 1}, 1, -1), 0)
+
+
+class TrimClipTest(unittest.TestCase):
+    def test_right_trim_ripples_actual_duration_and_preserves_gaps_other_tracks(self):
+        clips = [ClipInst(out_s=8, speed=2), ClipInst(start=6, out_s=3),
+                 ClipInst(start=4, out_s=2, track=2)]
+        shorter = trim_clip(clips, 0, 'out', -1, 10)
+        self.assertEqual(shorter[0].out_s, 6)
+        self.assertEqual(shorter[1].start, 5)
+        self.assertEqual(shorter[2], clips[2])
+        longer = trim_clip(clips, 0, 'out', 10, 10)
+        self.assertEqual(longer[0].out_s, 10)
+        self.assertEqual(longer[1].start, 7)
+        self.assertEqual(clips[0].out_s, 8)
+
+    def test_left_trim_keeps_right_edge_fixed_at_non_unit_speed(self):
+        clips = [ClipInst(start=1, in_s=2, out_s=10, speed=2)]
+        shorter = trim_clip(clips, 0, 'in', 1, 10)[0]
+        self.assertEqual(shorter.used_times(), (4, 7))
+        self.assertEqual(shorter.in_s, 4)
+        longer = trim_clip(clips, 0, 'in', -10, 10)[0]
+        self.assertEqual(longer.used_times(), (2, 7))
+        self.assertEqual(longer.in_s, 0)
+
+    def test_minimum_duration_and_timeline_zero(self):
+        clip = ClipInst(start=-1, in_s=2, out_s=5, speed=.5)
+        extended = trim_clip([clip], 0, 'in', -10, 10)[0]
+        self.assertAlmostEqual(extended.used_times()[0], 0)
+        self.assertAlmostEqual(extended.used_times()[1], 7)
+        for edge in ('in', 'out'):
+            trimmed = trim_clip([clip], 0, edge, 100 if edge == 'in' else -100, 10)[0]
+            self.assertAlmostEqual(trimmed.timeline_len(), .05)
+
+
+class ReorderClipsTest(unittest.TestCase):
+    def test_unequal_clips_swap_symmetrically_preserving_other_tracks(self):
+        clips = [ClipInst(out_s=2), ClipInst(start=2, out_s=5),
+                 ClipInst(start=7, out_s=3), ClipInst(start=10, out_s=2),
+                 ClipInst(start=7, out_s=5, track=2)]
+        moved = reorder_clips(clips, {2}, 2, -1)
+        self.assertEqual([c.start for c in moved], [0, 5, 2, 10, 7])
+        self.assertEqual(reorder_clips(moved, {2}, 2, 1), clips)
+        self.assertEqual(reorder_clips(clips, {0}, 0, -1), clips)
+
+    def test_group_reorder_respects_trimmed_starts_and_speed(self):
+        clips = [ClipInst(start=-2, in_s=2, out_s=6, speed=2),
+                 ClipInst(start=2, out_s=3), ClipInst(start=5, out_s=1)]
+        moved = reorder_clips(clips, {1, 2}, 1, -1)
+        self.assertEqual([c.used_times()[0] for c in moved], [4, 0, 3])
+        self.assertEqual([c.timeline_len() for c in moved], [2, 3, 1])
+
+    def test_invalid_groups_gaps_and_overlaps_are_explicit_no_edits(self):
+        clips = [ClipInst(out_s=2), ClipInst(start=2, out_s=2),
+                 ClipInst(start=4, out_s=2)]
+        with self.assertRaisesRegex(ValueError, 'contiguous'):
+            reorder_clips(clips, {0, 2}, 0, 1)
+        for start in (1, 3):
+            clips[1].start = start
+            with self.assertRaisesRegex(ValueError, 'touching'):
+                reorder_clips(clips, {0}, 0, 1)
+        clips[1].track = 2
+        with self.assertRaisesRegex(ValueError, 'one track'):
+            reorder_clips(clips, {0, 1}, 0, 1)
