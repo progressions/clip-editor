@@ -82,3 +82,17 @@ class KeyboardEditingTest(unittest.TestCase):
         self.win.command_entry.grab_focus()
         # Focus controller leave is delivered by GTK's focus transition.
         self.assertEqual(self.win.keyboard_mode, '')
+
+    def test_move_granularity_ladder_and_clip_boundary(self):
+        self.key(Gdk.KEY_m)
+        self.assertIn('1s', self.win.keyboard_hint.get_text())
+        self.key(Gdk.KEY_Up)
+        self.assertIn('10s', self.win.keyboard_hint.get_text())
+        self.key(Gdk.KEY_Down)
+        self.key(Gdk.KEY_Down)
+        self.assertIn('0.1s', self.win.keyboard_hint.get_text())
+        self.key(Gdk.KEY_Down)
+        self.assertIn('clip boundary', self.win.keyboard_hint.get_text())
+        self.key(Gdk.KEY_l)
+        self.assertEqual(self.win.video_clips[0].start, 5)
+        self.assertEqual(self.win.timeline.vclips[0].start, 5)

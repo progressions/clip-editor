@@ -1,6 +1,6 @@
 import unittest
 from clip_editor.project import ClipInst
-from clip_editor.keyboard_edits import move_clips
+from clip_editor.keyboard_edits import clip_boundary_delta, move_clips
 
 
 class MoveClipsTest(unittest.TestCase):
@@ -19,3 +19,18 @@ class MoveClipsTest(unittest.TestCase):
             result = move_clips([clip], {0}, 1)[0]
             self.assertEqual(result.used_times(), (4, 6))
             self.assertEqual(result.speed, 2)
+
+    def test_clip_boundary_delta_uses_visible_starts_and_excludes_group(self):
+        clips = [ClipInst(start=10), ClipInst(start=0, in_s=2), ClipInst(start=5)]
+        self.assertEqual(clip_boundary_delta(clips, 0, {0}, -1), -5)
+        self.assertEqual(clip_boundary_delta(clips, 1, {0, 1}, 1), 3)
+        self.assertIsNone(clip_boundary_delta(clips, 1, {0, 1}, -1))
+        self.assertIsNone(clip_boundary_delta(clips, 0, {0, 1, 2}, 1))
+
+    def test_clip_boundary_delta_ignores_other_tracks(self):
+        clips = [
+            ClipInst(start=10, track=1),
+            ClipInst(start=15, track=2),
+            ClipInst(start=20, track=1),
+        ]
+        self.assertEqual(clip_boundary_delta(clips, 0, {0}, 1), 10)
