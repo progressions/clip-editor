@@ -62,3 +62,32 @@ def trim_clip(clips: list[ClipInst], primary: int, edge: str, delta: float,
         for i in followers:
             result[i].start += change
     return result
+
+
+def reorder_clips(clips: list[ClipInst], selected: set[int], primary: int,
+                  direction: int) -> list[ClipInst]:
+    """Swap a touching selected block with its neighbor on the same lane."""
+    result = [c.copy() for c in clips]
+    lane = clips[primary].track
+    order = sorted((i for i, c in enumerate(clips) if c.track == lane),
+                   key=lambda i: (clips[i].used_times()[0], i))
+    if any(i not in order for i in selected):
+        raise ValueError('Ripple reorder requires a selection on one track')
+    positions = sorted(order.index(i) for i in selected)
+    if not positions or positions != list(range(positions[0], positions[-1] + 1)):
+        raise ValueError('Ripple reorder requires a contiguous selection')
+    first, last = positions[0], positions[-1]
+    neighbor = first - 1 if direction < 0 else last + 1
+    if not 0 <= neighbor < len(order):
+        return result
+    affected = order[min(first, neighbor):max(last, neighbor) + 1]
+    for before, after in zip(affected, affected[1:]):
+        if abs(clips[before].used_times()[1] - clips[after].used_times()[0]) > 1e-6:
+            raise ValueError('Ripple reorder requires touching clips (no gap or overlap)')
+    block = order[first:last + 1]
+    reordered = block + [order[neighbor]] if direction < 0 else [order[neighbor]] + block
+    time = clips[affected[0]].used_times()[0]
+    for index in reordered:
+        result[index].start = time - result[index].in_s
+        time += result[index].timeline_len()
+    return result

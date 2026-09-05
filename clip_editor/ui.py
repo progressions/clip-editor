@@ -28,7 +28,9 @@ from clip_editor.aspects import (
     dest_size,
 )
 from clip_editor.commands import parse_command
-from clip_editor.keyboard_edits import MOVE_INCREMENTS, boundary_delta, move_clips, trim_clip
+from clip_editor.keyboard_edits import (
+    MOVE_INCREMENTS, boundary_delta, move_clips, reorder_clips, trim_clip,
+)
 from clip_editor.eagle import apply_omarchy_theme, theme_rgb
 from clip_editor.export import ExportCancelled, ExportError, default_out_path, run_export
 from clip_editor.preview import (
@@ -1844,7 +1846,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.sel_kind = ""
         self.keyboard_mode = ""
         self.keyboard_increment = 1.0
-        self.keyboard_increments = {"move": 1.0, "trim-in": .1, "trim-out": .1}
+        self.keyboard_increments = {"move": 1.0, "trim-in": .1, "trim-out": .1, "ripple": "clip"}
         self._clip_playing = False
         self._audio_pending = False
         self.project_path: Path | None = None
@@ -2310,6 +2312,9 @@ class EditorWindow(Adw.ApplicationWindow):
         if not mods and keyval == Gdk.KEY_m:
             self._enter_keyboard_mode("move")
             return True
+        if not mods and keyval == Gdk.KEY_r:
+            self._enter_keyboard_mode("ripple")
+            return True
         if not mods and keyval in (Gdk.KEY_bracketleft, Gdk.KEY_bracketright):
             self._enter_keyboard_mode("trim-in" if keyval == Gdk.KEY_bracketleft else "trim-out")
             return True
@@ -2419,6 +2424,8 @@ class EditorWindow(Adw.ApplicationWindow):
         increment = ("clip starts" if self.keyboard_increment == "clip"
                      else f"{self.keyboard_increment:g}s")
         target = f"{len(selected)} selected"
+        if self.keyboard_mode == "ripple":
+            target += " · h inserts before previous / l inserts after next"
         if self.keyboard_mode.startswith("trim") and primary >= 0:
             clip = clips[primary]
             edge = "left" if self.keyboard_mode == "trim-in" else "right (ripple)"
@@ -2429,6 +2436,8 @@ class EditorWindow(Adw.ApplicationWindow):
 
     def _change_keyboard_increment(self, direction: int) -> None:
         ladder = MOVE_INCREMENTS[:3] if self.keyboard_mode.startswith("trim") else MOVE_INCREMENTS
+        if self.keyboard_mode == "ripple":
+            ladder = ("clip",)
         index = ladder.index(self.keyboard_increment)
         self.keyboard_increment = ladder[
             max(0, min(len(ladder) - 1, index + direction))
@@ -2474,7 +2483,13 @@ class EditorWindow(Adw.ApplicationWindow):
             return
         delta = (boundary_delta(clips, selected, primary, direction)
                  if self.keyboard_increment == "clip" else direction * self.keyboard_increment)
-        if self.keyboard_mode.startswith("trim"):
+        if self.keyboard_mode == "ripple":
+            try:
+                changed = reorder_clips(clips, selected, primary, direction)
+            except ValueError as error:
+                self._set_status(str(error))
+                return
+        elif self.keyboard_mode.startswith("trim"):
             clip = clips[primary]
             duration = self._media_dur(clip.media_id) or clip.out_s
             changed = trim_clip(clips, primary, self.keyboard_mode.removeprefix("trim-"),
