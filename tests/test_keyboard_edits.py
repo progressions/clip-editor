@@ -26,3 +26,11 @@ class MoveClipsTest(unittest.TestCase):
         self.assertEqual(clip_boundary_delta(clips, 1, {0, 1}, 1), 3)
         self.assertIsNone(clip_boundary_delta(clips, 1, {0, 1}, -1))
         self.assertIsNone(clip_boundary_delta(clips, 0, {0, 1, 2}, 1))
+
+    def test_clip_boundary_delta_ignores_other_tracks(self):
+        clips = [
+            ClipInst(start=10, track=1),
+            ClipInst(start=15, track=2),
+            ClipInst(start=20, track=1),
+        ]
+        self.assertEqual(clip_boundary_delta(clips, 0, {0}, 1), 10)

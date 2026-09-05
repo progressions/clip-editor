@@ -22,8 +22,13 @@ def clip_boundary_delta(
     if not 0 <= primary < len(clips) or direction not in (-1, 1):
         return None
     selected = {i for i in selected if 0 <= i < len(clips)}
+    active_track = clips[primary].track
     ordered = sorted(
-        ((i, clips[i].used_times()[0]) for i in range(len(clips))),
+        (
+            (i, clips[i].used_times()[0])
+            for i in range(len(clips))
+            if clips[i].track == active_track
+        ),
         key=lambda row: (row[1], row[0]),
     )
     position = next((n for n, (i, _start) in enumerate(ordered) if i == primary), -1)
