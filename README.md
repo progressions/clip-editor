@@ -155,6 +155,26 @@ undo reverses an edit. Changing track, selecting with the mouse, leaving timelin
 focus, or restoring history exits the mode. The first actual edit of mirrored
 source audio makes independent audio clips without changing the video.
 
+In move mode, `Up/Down` chooses 10s, 1s, 0.1s, or neighboring clip starts.
+The choice lasts for the session. Clip stepping uses the primary selected
+clip as its anchor and ignores selected clips and other lanes. A boundary step
+that would push another selected clip before zero leaves the group in place.
+
+`[` / `]` enters left/right edge trim on the primary selected clip (even with
+a multi-selection). `h/l` moves that edge earlier/later; `Up/Down` selects
+10s, 1s, or 0.1s. Trim starts at 0.1s and each mode remembers its own increment.
+Left trim keeps the right edge fixed. Right trim ripples later clips on the same
+track by the actual duration change, preserving gaps and other tracks. Trimming
+uses source footage without changing speed, and respects source limits and a
+minimum timeline duration of 0.05s. These rules apply to video and audio.
+
+`r` enters ripple reorder: `h/l` inserts the selected clip or contiguous group
+before/after its neighbor on the same track. Unequal durations reflow correctly.
+Only touching clips can be reordered this way; gaps, overlaps, selections on
+multiple tracks, or non-contiguous selections produce a message without editing.
+Other tracks and clips outside the affected span keep their timing. This mode
+uses clip steps only, and one undo restores the complete reorder.
+
 Format: JSON, ``format: "clip-editor-project"``, ``version: 3``, suffix
 ``.clip.json``. Records video/audio paths (absolute plus relative to the
 project file), aspect, pan, in/out, Fit, cross-fade duration, and “audio follows
