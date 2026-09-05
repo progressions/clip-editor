@@ -91,3 +91,15 @@ class KeyboardEditingTest(unittest.TestCase):
         self.win.command_entry.grab_focus()
         # Focus controller leave is delivered by GTK's focus transition.
         self.assertEqual(self.win.keyboard_mode, '')
+
+    def test_right_trim_on_audio_ripples_and_undo_restores_everything(self):
+        self.key(Gdk.KEY_j)
+        self.key(Gdk.KEY_bracketright)
+        self.key(Gdk.KEY_h)
+        self.assertAlmostEqual(self.win.audio_clips[0].out_s, 4.9)
+        self.assertAlmostEqual(self.win.audio_clips[1].start, 4.9)
+        self.assertEqual(self.win.video_clips[1].start, 5)
+        self.assertEqual(len(self.win._history), 2)
+        self.win._on_undo()
+        self.assertEqual(self.win.audio_clips, [])
+        self.assertTrue(self.win.use_video_soundtrack)
