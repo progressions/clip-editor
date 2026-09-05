@@ -144,3 +144,21 @@ class KeyboardEditingTest(unittest.TestCase):
         self.win._on_undo()
         self.assertEqual(self.win.audio_clips, [])
         self.assertTrue(self.win.use_video_soundtrack)
+
+    def test_question_opens_and_closes_help_without_changing_mode_or_history(self):
+        before = [c.copy() for c in self.win.video_clips]
+        self.key(Gdk.KEY_m)
+        history_len = len(self.win._history)
+        self.key(Gdk.KEY_question)
+        self.assertTrue(self.win.keyboard_help.get_visible())
+        self.assertEqual(self.win.keyboard_mode, 'move')
+        self.assertEqual(self.win.video_clips, before)
+        self.assertEqual(len(self.win._history), history_len)
+        self.assertIn('Timeline navigation', self.win.keyboard_help_body.get_text())
+        self.key(Gdk.KEY_Escape)
+        self.assertFalse(self.win.keyboard_help.get_visible())
+        self.assertEqual(self.win.keyboard_mode, 'move')
+        self.key(Gdk.KEY_question)
+        self.assertTrue(self.win.keyboard_help.get_visible())
+        self.key(Gdk.KEY_question)
+        self.assertFalse(self.win.keyboard_help.get_visible())
