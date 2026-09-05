@@ -148,6 +148,13 @@ clip edge (ties prefer the earlier clip). Empty tracks clear selection.
 `Esc` clears selection. Source-soundtrack audio can be selected without
 detaching it; audio edits will make it independent of video as needed.
 
+`m` enters move mode: `h/l` nudges selected video or audio clips by one second.
+Groups preserve internal timing and clamp together at timeline zero. The visible
+mode indicator shows the target and increment. `Esc` keeps edits and selection;
+undo reverses an edit. Changing track, selecting with the mouse, leaving timeline
+focus, or restoring history exits the mode. The first actual edit of mirrored
+source audio makes independent audio clips without changing the video.
+
 Format: JSON, ``format: "clip-editor-project"``, ``version: 3``, suffix
 ``.clip.json``. Records video/audio paths (absolute plus relative to the
 project file), aspect, pan, in/out, Fit, cross-fade duration, and “audio follows

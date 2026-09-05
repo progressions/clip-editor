@@ -28,6 +28,7 @@ from clip_editor.aspects import (
     dest_size,
 )
 from clip_editor.commands import parse_command
+from clip_editor.keyboard_edits import move_clips
 from clip_editor.eagle import apply_omarchy_theme, theme_rgb
 from clip_editor.export import ExportCancelled, ExportError, default_out_path, run_export
 from clip_editor.preview import (
@@ -1841,6 +1842,8 @@ class EditorWindow(Adw.ApplicationWindow):
         self.sel_vs: set[int] = set()
         self.sel_as: set[int] = set()
         self.sel_kind = ""
+        self.keyboard_mode = ""
+        self.keyboard_increment = 1.0
         self._clip_playing = False
         self._audio_pending = False
         self.project_path: Path | None = None
@@ -1944,6 +1947,9 @@ class EditorWindow(Adw.ApplicationWindow):
         self.clock.add_css_class("dim-label")
         transport.append(self.clock)
         left.append(transport)
+        self.keyboard_hint = Gtk.Label(xalign=0)
+        self.keyboard_hint.set_wrap(True)
+        left.append(self.keyboard_hint)
         self.command_revealer = Gtk.Revealer()
         self.command_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
         command_box = Gtk.Box(spacing=8)
@@ -1959,6 +1965,9 @@ class EditorWindow(Adw.ApplicationWindow):
         self.command_revealer.set_child(command_box)
         left.append(self.command_revealer)
         self.timeline = Timeline()
+        focus = Gtk.EventControllerFocus()
+        focus.connect("leave", lambda *_: self._exit_keyboard_mode())
+        self.timeline.add_controller(focus)
         self.timeline.on_seek = self._on_timeline_seek
         self.timeline.on_video_move = self._on_video_move
         self.timeline.on_audio_move = self._on_audio_move
@@ -2297,6 +2306,17 @@ class EditorWindow(Adw.ApplicationWindow):
         extra = mods & ~(Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK)
         if extra:
             return False
+        if not mods and keyval == Gdk.KEY_m:
+            self._enter_keyboard_mode("move")
+            return True
+        if self.keyboard_mode and not mods and keyval == Gdk.KEY_Escape:
+            self._exit_keyboard_mode()
+            return True
+        if self.keyboard_mode and not mods and keyval in (Gdk.KEY_h, Gdk.KEY_l):
+            self._nudge_keyboard(-1 if keyval == Gdk.KEY_h else 1)
+            return True
+        if self.keyboard_mode and not ctrl and keyval in (Gdk.KEY_H, Gdk.KEY_L):
+            return True
         if ctrl and keyval in (Gdk.KEY_z, Gdk.KEY_Z):
             if shift:
                 self._on_redo()
@@ -2323,6 +2343,7 @@ class EditorWindow(Adw.ApplicationWindow):
             and keyval in (Gdk.KEY_j, Gdk.KEY_J, Gdk.KEY_k, Gdk.KEY_K)
         ):
             delta = 1 if keyval in (Gdk.KEY_j, Gdk.KEY_J) else -1
+            self._exit_keyboard_mode()
             self.timeline.move_navigation_track(delta)
             return True
         if mods:
@@ -2354,6 +2375,87 @@ class EditorWindow(Adw.ApplicationWindow):
         if keyval in (Gdk.KEY_space, Gdk.KEY_KP_Space):
             self._space_held = False
         return False
+
+    def _keyboard_target(self) -> tuple[str, list[ClipInst], int, set[int]]:
+        kind = self._selected_clip_kind()
+        clips = self.video_clips if kind == "video" else (
+            self.timeline.aclips if self.timeline.audio_kind == "source" else self.audio_clips
+        )
+        primary = self.sel_v if kind == "video" else self.sel_a
+        selected = self.sel_vs if kind == "video" else self.sel_as
+        if (not kind or not 0 <= primary < len(clips)
+                or kind != self.timeline.nav_kind
+                or clips[primary].track != self.timeline.nav_track):
+            return "", [], -1, set()
+        return kind, clips, primary, {i for i in selected or {primary} if 0 <= i < len(clips)}
+
+    def _enter_keyboard_mode(self, mode: str) -> None:
+        if self.exporting or not self._guard_edit("move"):
+            return
+        if not self._keyboard_target()[0]:
+            self._set_status("Select a clip on the active track")
+            return
+        self._stop()
+        self.keyboard_mode = mode
+        self._show_keyboard_mode()
+
+    def _exit_keyboard_mode(self) -> None:
+        self.keyboard_mode = ""
+        self.keyboard_hint.set_text("")
+
+    def _show_keyboard_mode(self) -> None:
+        kind, _clips, _primary, selected = self._keyboard_target()
+        self.keyboard_hint.set_text(
+            f"{self.keyboard_mode.upper()} · {kind[:1].upper()}{self.timeline.nav_track} · "
+            f"{len(selected)} selected · {self.keyboard_increment:g}s · h/l earlier/later · Esc exits"
+        )
+
+    def _apply_keyboard_clips(self, kind: str, clips: list[ClipInst]) -> None:
+        self._flush_checkpoint()
+        self._checkpoint()
+        self._stop()
+        if kind == "video":
+            self.video_clips = clips
+            clip = clips[self.sel_v]
+            self._loading = True
+            try:
+                self.in_spin.set_value(clip.in_s)
+                self.out_spin.set_value(clip.out_s)
+            finally:
+                self._loading = False
+        else:
+            # Detach mirrored soundtrack only when an edit actually changes it.
+            self.audio_clips = clips
+            self.use_video_soundtrack = False
+            self._loading = True
+            try:
+                self.follow_in.set_active(False)
+            finally:
+                self._loading = False
+            self._bind_audio(clips[self.sel_a].media_id)
+        # The editor now owns a replacement list, so refresh the Timeline's
+        # shallow list and switch source soundtrack mode to independent audio.
+        self._sync_timeline_clips()
+        self._refresh_fit()
+        self._checkpoint()
+        self._schedule_autosave()
+        self.timeline._ensure_clip_visible(kind, self.sel_v if kind == "video" else self.sel_a)
+        self._apply_timeline_frame(self.timeline.playhead, start_media=False)
+
+    def _nudge_keyboard(self, direction: int) -> None:
+        if self.exporting or not self._guard_edit("move"):
+            return
+        kind, clips, _primary, selected = self._keyboard_target()
+        if not kind:
+            self._exit_keyboard_mode()
+            self._set_status("Select a clip on the active track")
+            return
+        changed = move_clips(clips, selected, direction * self.keyboard_increment)
+        if changed == clips:
+            self._set_status("Timeline boundary")
+            return
+        self._apply_keyboard_clips(kind, changed)
+        self._show_keyboard_mode()
 
     def _snapshot_key(self, proj: Project | None = None) -> tuple:
         p = proj if proj is not None else self._current_project()
@@ -2617,6 +2719,7 @@ class EditorWindow(Adw.ApplicationWindow):
                     pass
 
     def _apply_project(self, proj: Project) -> None:
+        self._exit_keyboard_mode()
         was_loading = self._loading
         self._loading = True
         self._abandon_preview_render()
@@ -2655,7 +2758,9 @@ class EditorWindow(Adw.ApplicationWindow):
             self.audio_out = proj.audio_out
             self.video_clips = [c.copy() for c in proj.video_clips]
             self.audio_clips = [c.copy() for c in proj.audio_clips]
-            if self.video_path and not self.video_clips:
+            # Modern projects own explicit clip lists, including empty lists.
+            # Never recreate deleted/detached clips from a stale bound path.
+            if not proj.media and proj.video and self.video_path and not self.video_clips:
                 dur = float((self.video_info or {}).get("duration") or 0)
                 vid = next((m.id for m in self.media if m.kind == "video"), "")
                 self.video_clips = [
@@ -2666,7 +2771,7 @@ class EditorWindow(Adw.ApplicationWindow):
                         media_id=vid,
                     )
                 ]
-            if self.audio_path and not self.audio_clips:
+            if not proj.media and proj.audio and self.audio_path and not self.audio_clips:
                 dur = float((self.audio_info or {}).get("duration") or 0)
                 aud = next((m.id for m in self.media if m.kind == "audio"), "")
                 self.audio_clips = [
@@ -2989,7 +3094,8 @@ class EditorWindow(Adw.ApplicationWindow):
 
     def _bind_audio(self, mid: str) -> None:
         item = self._media_by_id(mid)
-        if item is None or item.kind != "audio":
+        if item is None or (item.kind != "audio" and not
+                            (self.media_info.get(mid) or {}).get("has_audio")):
             return
         self.audio_path = item.path
         self.audio_info = self.media_info.get(mid)
@@ -3014,7 +3120,8 @@ class EditorWindow(Adw.ApplicationWindow):
         bound_a = False
         if 0 <= self.sel_a < len(self.audio_clips):
             item = self._clip_item(self.audio_clips[self.sel_a], "audio")
-            if item is not None and item.kind == "audio":
+            if item is not None and (item.kind == "audio" or
+                                    (self.media_info.get(item.id) or {}).get("has_audio")):
                 self._bind_audio(item.id)
                 bound_a = True
         if not bound_a:
@@ -3957,6 +4064,7 @@ class EditorWindow(Adw.ApplicationWindow):
     ) -> None:
         if not self._guard_edit("select_rebind"):
             return
+        self._exit_keyboard_mode()
         if index < 0:
             self.sel_v, self.sel_vs = -1, set()
             self.sel_a, self.sel_as = -1, set()
