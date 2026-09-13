@@ -51,12 +51,15 @@ def _dur_for(c: ClipInst, src_dur: float | dict[str, float]) -> float:
 def _flatten_clips(
     clips: list[ClipInst], src_dur: float | dict[str, float]
 ) -> list[tuple]:
-    """Return timeline/source bounds, media id, transform, transition, speed.
+    """Return timeline/source bounds, media id, transform, transition, speed, fades.
 
-    Row: ``(t0, t1, sinn, sout, mid, tx, ty, scale, transition, transition_s, speed)``.
+    Row: ``(t0, t1, sinn, sout, mid, tx, ty, scale, transition, transition_s,
+    speed, fade_in_s, fade_out_s)``.
     ``t1 - t0`` is timeline length ``(sout - sinn) / speed``. Later clips
     overwrite earlier ones on overlap, matching playback.
     """
+    from clip_editor.project import clamp_clip_fades, normalize_fade_s
+
     segs: list[tuple] = []
     for c in clips:
         dur = _dur_for(c, src_dur)
@@ -88,12 +91,19 @@ def _flatten_clips(
             continue
         mid = c.media_id or ""
         ttype, tdur = normalize_transition(c.transition, c.transition_s)
+        fade_in_s, fade_out_s = clamp_clip_fades(
+            normalize_fade_s(c.fade_in_s),
+            normalize_fade_s(c.fade_out_s),
+            timeline_len,
+        )
         nxt: list[tuple] = []
         for row in segs:
             st0, st1, sinn, sout, smid, sx, sy, scale = row[:8]
             st_type = row[8] if len(row) > 8 else TRANSITION_NONE
             st_dur = row[9] if len(row) > 9 else 0.0
             st_speed = float(row[10]) if len(row) > 10 else 1.0
+            st_fi = float(row[11]) if len(row) > 11 else 0.0
+            st_fo = float(row[12]) if len(row) > 12 else 0.0
             if st1 <= t0 + 0.001 or st0 >= t1 - 0.001:
                 nxt.append(
                     (
@@ -108,6 +118,8 @@ def _flatten_clips(
                         st_type,
                         st_dur,
                         st_speed,
+                        st_fi,
+                        st_fo,
                     )
                 )
                 continue
@@ -115,6 +127,7 @@ def _flatten_clips(
             if st0 < t0 - 0.001:
                 keep_tl = t0 - st0
                 keep_src = keep_tl * st_speed
+                # Truncated end: drop fade-out on the left remnant.
                 nxt.append(
                     (
                         st0,
@@ -128,11 +141,14 @@ def _flatten_clips(
                         st_type,
                         st_dur,
                         st_speed,
+                        st_fi,
+                        0.0,
                     )
                 )
             if st1 > t1 + 0.001:
                 skip_tl = t1 - st0
                 skip_src = skip_tl * st_speed
+                # Truncated start: drop fade-in on the right remnant.
                 nxt.append(
                     (
                         t1,
@@ -146,6 +162,8 @@ def _flatten_clips(
                         st_type,
                         st_dur,
                         st_speed,
+                        0.0,
+                        st_fo,
                     )
                 )
         nxt.append(
@@ -161,6 +179,8 @@ def _flatten_clips(
                 ttype,
                 tdur,
                 speed,
+                fade_in_s,
+                fade_out_s,
             )
         )
         segs = nxt
@@ -244,7 +264,15 @@ def build_cmd(
         abs(float(c.transform_x)) > 0.0001
         or abs(float(c.transform_y)) > 0.0001
         or abs(float(c.scale) - 1.0) > 0.0001
+        or float(getattr(c, "fade_in_s", 0.0) or 0.0) > 0.0
+        or float(getattr(c, "fade_out_s", 0.0) or 0.0) > 0.0
         for c in (video_clips or [])
+    ):
+        many = True
+    if any(
+        float(getattr(c, "fade_in_s", 0.0) or 0.0) > 0.0
+        or float(getattr(c, "fade_out_s", 0.0) or 0.0) > 0.0
+        for c in (audio_clips or [])
     ):
         many = True
     vmids = {c.media_id for c in (video_clips or []) if c.media_id}
@@ -385,7 +413,11 @@ def build_cmd(
 
 
 def _timeline_parts(flat: list[tuple], out_dur: float) -> list[tuple]:
-    """Build gap/seg parts. Seg: ``(seg, sinn, source_len, mid, tx, ty, scale, ttype, tdur, speed)``."""
+    """Build gap/seg parts.
+
+    Seg: ``(seg, sinn, source_len, mid, tx, ty, scale, ttype, tdur, speed,
+    fade_in_s, fade_out_s)``.
+    """
     parts: list[tuple] = []
     t = 0.0
     for row in flat:
@@ -402,17 +434,86 @@ def _timeline_parts(flat: list[tuple], out_dur: float) -> list[tuple]:
         ttype = row[8] if len(row) > 8 else TRANSITION_NONE
         tdur = float(row[9]) if len(row) > 9 else 0.0
         speed = normalize_speed(row[10] if len(row) > 10 else 1.0)
+        fade_in_s = float(row[11]) if len(row) > 11 else 0.0
+        fade_out_s = float(row[12]) if len(row) > 12 else 0.0
         source_len = max(0.0, sout - sinn)
         # Prefer source_len from bounds; fall back to timeline*speed if needed.
         if source_len <= 0.04:
             source_len = max(0.0, (t1 - t0) * speed)
-        parts.append(("seg", sinn, source_len, mid, *transform, ttype, tdur, speed))
+        parts.append(
+            (
+                "seg",
+                sinn,
+                source_len,
+                mid,
+                *transform,
+                ttype,
+                tdur,
+                speed,
+                fade_in_s,
+                fade_out_s,
+            )
+        )
         t = t1
     if out_dur > t + 0.02:
         parts.append(("gap", out_dur - t))
     if not parts:
         parts.append(("gap", max(out_dur, 0.05)))
     return parts
+
+
+def _part_fades(part: tuple) -> tuple[float, float]:
+    if part[0] != "seg":
+        return 0.0, 0.0
+    fi = float(part[10]) if len(part) > 10 else 0.0
+    fo = float(part[11]) if len(part) > 11 else 0.0
+    return max(0.0, fi), max(0.0, fo)
+
+
+def _append_clip_fades(
+    chain: list[str],
+    *,
+    kind: str,
+    timeline_dur: float,
+    fade_in_s: float,
+    fade_out_s: float,
+) -> None:
+    """Append ffmpeg fade/afade filters for one prepared segment (#567).
+
+    Video fades go through rgb24 with an explicit black so the frame reaches
+    true black (yuv420p studio-range fades can look like dark gray).
+    """
+    from clip_editor.project import clamp_clip_fades
+
+    fi, fo = clamp_clip_fades(fade_in_s, fade_out_s, timeline_dur)
+    if fi <= 0.0 and fo <= 0.0:
+        return
+    if kind == "video":
+        # Fade in full-range RGB so c=black is display black, then back to yuv420p.
+        chain.append("format=rgb24")
+        if fi > 0.0:
+            chain.append(f"fade=t=in:st=0:d={fi:.6f}:c=black")
+        if fo > 0.0:
+            st = max(0.0, timeline_dur - fo)
+            # Cover through the end so the fade completes (not almost-black).
+            d = max(fo, timeline_dur - st + 1e-3)
+            chain.append(f"fade=t=out:st={st:.6f}:d={d:.6f}:c=black")
+            # Force the final ~1 frame solid black — ffmpeg fade can leave the
+            # last sample slightly above 0 depending on fps/rounding.
+            hold = max(0.04, 1.0 / 25.0)
+            t0 = max(0.0, timeline_dur - hold)
+            chain.append(
+                "drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill:"
+                f"enable='gte(t\\,{t0:.6f})'"
+            )
+        chain.append("format=yuv420p")
+    else:
+        if fi > 0.0:
+            chain.append(f"afade=t=in:st=0:d={fi:.6f}")
+        if fo > 0.0:
+            st = max(0.0, timeline_dur - fo)
+            d = max(fo, timeline_dur - st + 1e-3)
+            chain.append(f"afade=t=out:st={st:.6f}:d={d:.6f}")
 
 
 def _xfade_name(transition: str) -> str | None:
@@ -845,6 +946,8 @@ def _build_cmd_many(
                 "setsar=1",
                 "format=yuv420p",
             ]
+            fade_in_s, fade_out_s = _part_fades(part)
+            tl_dur = _part_duration(part)
             if v_idx_count[ii] > 1:
                 k = v_split_at[ii]
                 v_split_at[ii] = k + 1
@@ -854,19 +957,42 @@ def _build_cmd_many(
             if transformed:
                 fg = f"vfg{i}"
                 bg = f"vbg{i}"
+                pre = f"vpre{i}"
                 xexpr = str(placement.x)
                 yexpr = str(placement.y)
                 filters.append(f"{pad}{','.join(chain)}[{fg}]")
                 filters.append(
-                    f"color=c=black:s={dw}x{dh}:r={fps:.4f}:d={sdur:.6f},"
+                    f"color=c=black:s={dw}x{dh}:r={fps:.4f}:d={tl_dur:.6f},"
                     f"format=yuv420p[{bg}]"
                 )
+                # Compose first, then fade the full frame to black (#567).
                 filters.append(
                     f"[{bg}][{fg}]overlay=x={xexpr}:y={yexpr}:"
                     f"shortest=1:eof_action=pass,fps={fps:.4f},"
-                    f"settb=AVTB,setpts=PTS-STARTPTS[{lab}]"
+                    f"settb=AVTB,setpts=PTS-STARTPTS[{pre}]"
                 )
+                fade_chain: list[str] = []
+                _append_clip_fades(
+                    fade_chain,
+                    kind="video",
+                    timeline_dur=tl_dur,
+                    fade_in_s=fade_in_s,
+                    fade_out_s=fade_out_s,
+                )
+                if fade_chain:
+                    filters.append(f"[{pre}]{','.join(fade_chain)}[{lab}]")
+                else:
+                    filters.append(f"[{pre}]null[{lab}]")
             else:
+                # Intra-clip fades on the finished frame before join (#567).
+                # Outgoing #487 xfade still applies at the cut afterward.
+                _append_clip_fades(
+                    chain,
+                    kind="video",
+                    timeline_dur=tl_dur,
+                    fade_in_s=fade_in_s,
+                    fade_out_s=fade_out_s,
+                )
                 filters.append(f"{pad}{','.join(chain)}[{lab}]")
         v_labs.append(f"[{lab}]")
     video_duration = out_dur
@@ -924,6 +1050,14 @@ def _build_cmd_many(
                         *atempo_chain(speed),
                         "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo",
                     ]
+                    fade_in_s, fade_out_s = _part_fades(part)
+                    _append_clip_fades(
+                        achain,
+                        kind="audio",
+                        timeline_dur=_part_duration(part),
+                        fade_in_s=fade_in_s,
+                        fade_out_s=fade_out_s,
+                    )
                     filters.append(f"{pad}{','.join(achain)}[{lab}]")
                 a_labs.append(f"[{lab}]")
             if len(a_labs) > 1:
