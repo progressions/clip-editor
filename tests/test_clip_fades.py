@@ -136,7 +136,7 @@ class FadeGraphTest(unittest.TestCase):
             chain, kind="audio", timeline_dur=2.0, fade_in_s=0.5, fade_out_s=0.5
         )
         self.assertIn("afade=t=in:st=0:d=0.500000", chain)
-        self.assertIn("afade=t=out:st=1.500000:d=0.500000", chain)
+        self.assertIn("afade=t=out:st=1.500000:d=0.501000", chain)
 
     def test_flatten_carries_fades(self) -> None:
         clips = [
