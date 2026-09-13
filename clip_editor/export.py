@@ -495,16 +495,24 @@ def _append_clip_fades(
             chain.append(f"fade=t=in:st=0:d={fi:.6f}:c=black")
         if fo > 0.0:
             st = max(0.0, timeline_dur - fo)
-            # Exact remaining duration so the final frame is fully black.
-            d = max(fo, timeline_dur - st)
+            # Cover through the end so the fade completes (not almost-black).
+            d = max(fo, timeline_dur - st + 1e-3)
             chain.append(f"fade=t=out:st={st:.6f}:d={d:.6f}:c=black")
+            # Force the final ~1 frame solid black — ffmpeg fade can leave the
+            # last sample slightly above 0 depending on fps/rounding.
+            hold = max(0.04, 1.0 / 25.0)
+            t0 = max(0.0, timeline_dur - hold)
+            chain.append(
+                "drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill:"
+                f"enable='gte(t\\,{t0:.6f})'"
+            )
         chain.append("format=yuv420p")
     else:
         if fi > 0.0:
             chain.append(f"afade=t=in:st=0:d={fi:.6f}")
         if fo > 0.0:
             st = max(0.0, timeline_dur - fo)
-            d = max(fo, timeline_dur - st)
+            d = max(fo, timeline_dur - st + 1e-3)
             chain.append(f"afade=t=out:st={st:.6f}:d={d:.6f}")
 
 
