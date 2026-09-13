@@ -478,24 +478,34 @@ def _append_clip_fades(
     fade_in_s: float,
     fade_out_s: float,
 ) -> None:
-    """Append ffmpeg fade/afade filters for one prepared segment (#567)."""
+    """Append ffmpeg fade/afade filters for one prepared segment (#567).
+
+    Video fades go through rgb24 with an explicit black so the frame reaches
+    true black (yuv420p studio-range fades can look like dark gray).
+    """
     from clip_editor.project import clamp_clip_fades
 
     fi, fo = clamp_clip_fades(fade_in_s, fade_out_s, timeline_dur)
     if fi <= 0.0 and fo <= 0.0:
         return
     if kind == "video":
+        # Fade in full-range RGB so c=black is display black, then back to yuv420p.
+        chain.append("format=rgb24")
         if fi > 0.0:
-            chain.append(f"fade=t=in:st=0:d={fi:.6f}")
+            chain.append(f"fade=t=in:st=0:d={fi:.6f}:c=black")
         if fo > 0.0:
             st = max(0.0, timeline_dur - fo)
-            chain.append(f"fade=t=out:st={st:.6f}:d={fo:.6f}")
+            # Exact remaining duration so the final frame is fully black.
+            d = max(fo, timeline_dur - st)
+            chain.append(f"fade=t=out:st={st:.6f}:d={d:.6f}:c=black")
+        chain.append("format=yuv420p")
     else:
         if fi > 0.0:
             chain.append(f"afade=t=in:st=0:d={fi:.6f}")
         if fo > 0.0:
             st = max(0.0, timeline_dur - fo)
-            chain.append(f"afade=t=out:st={st:.6f}:d={fo:.6f}")
+            d = max(fo, timeline_dur - st)
+            chain.append(f"afade=t=out:st={st:.6f}:d={d:.6f}")
 
 
 def _xfade_name(transition: str) -> str | None:
@@ -930,15 +940,6 @@ def _build_cmd_many(
             ]
             fade_in_s, fade_out_s = _part_fades(part)
             tl_dur = _part_duration(part)
-            # Intra-clip fades before join (#567). Outgoing #487 xfade still
-            # applies at the cut afterward — do not bake fade into the join.
-            _append_clip_fades(
-                chain,
-                kind="video",
-                timeline_dur=tl_dur,
-                fade_in_s=fade_in_s,
-                fade_out_s=fade_out_s,
-            )
             if v_idx_count[ii] > 1:
                 k = v_split_at[ii]
                 v_split_at[ii] = k + 1
@@ -948,6 +949,7 @@ def _build_cmd_many(
             if transformed:
                 fg = f"vfg{i}"
                 bg = f"vbg{i}"
+                pre = f"vpre{i}"
                 xexpr = str(placement.x)
                 yexpr = str(placement.y)
                 filters.append(f"{pad}{','.join(chain)}[{fg}]")
@@ -955,12 +957,34 @@ def _build_cmd_many(
                     f"color=c=black:s={dw}x{dh}:r={fps:.4f}:d={tl_dur:.6f},"
                     f"format=yuv420p[{bg}]"
                 )
+                # Compose first, then fade the full frame to black (#567).
                 filters.append(
                     f"[{bg}][{fg}]overlay=x={xexpr}:y={yexpr}:"
                     f"shortest=1:eof_action=pass,fps={fps:.4f},"
-                    f"settb=AVTB,setpts=PTS-STARTPTS[{lab}]"
+                    f"settb=AVTB,setpts=PTS-STARTPTS[{pre}]"
                 )
+                fade_chain: list[str] = []
+                _append_clip_fades(
+                    fade_chain,
+                    kind="video",
+                    timeline_dur=tl_dur,
+                    fade_in_s=fade_in_s,
+                    fade_out_s=fade_out_s,
+                )
+                if fade_chain:
+                    filters.append(f"[{pre}]{','.join(fade_chain)}[{lab}]")
+                else:
+                    filters.append(f"[{pre}]null[{lab}]")
             else:
+                # Intra-clip fades on the finished frame before join (#567).
+                # Outgoing #487 xfade still applies at the cut afterward.
+                _append_clip_fades(
+                    chain,
+                    kind="video",
+                    timeline_dur=tl_dur,
+                    fade_in_s=fade_in_s,
+                    fade_out_s=fade_out_s,
+                )
                 filters.append(f"{pad}{','.join(chain)}[{lab}]")
         v_labs.append(f"[{lab}]")
     video_duration = out_dur
