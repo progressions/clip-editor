@@ -7,6 +7,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- Clip fade in / fade out with set duration ([#567](https://app.fizzy.do/6109848/cards/567)): per-clip opacity/gain fades (0.1–3.0s), timeline markers, inspector toggles, FFmpeg `fade`/`afade` in preview and export. Distinct from per-cut Dissolve / White flash (#487). Project format version 7.
+
 ## [0.10.0] — 2026-09-05
 
 ### Added

@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 FORMAT = "clip-editor-project"
-VERSION = 6
+VERSION = 7
 SUFFIX = ".clip.json"
 STATE_DIR = Path.home() / ".local" / "state" / "clip-editor"
 AUTOSAVE_PATH = STATE_DIR / "autosave.clip.json"
@@ -27,6 +27,12 @@ DEFAULT_TRANSITION_S = {
     TRANSITION_DISSOLVE: 0.5,
     TRANSITION_WHITE_FLASH: 0.25,
 }
+# Intra-clip fade in/out (#567). 0 = off. Default when enabling a toggle.
+DEFAULT_FADE_S = 0.5
+MIN_FADE_S = 0.1
+MAX_FADE_S = 3.0
+# Same middle floor as #487 transition clamps.
+FADE_MIN_MIDDLE_S = 0.05
 
 
 class ProjectError(RuntimeError):
@@ -90,6 +96,57 @@ def normalize_speed(value: object, default: float = DEFAULT_SPEED) -> float:
     return max(MIN_SPEED, min(MAX_SPEED, speed))
 
 
+def normalize_fade_s(value: object) -> float:
+    """Return 0 (off) or a clamped fade duration in seconds."""
+    try:
+        dur = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if dur <= 0.0 or dur != dur:  # NaN
+        return 0.0
+    return max(MIN_FADE_S, min(MAX_FADE_S, dur))
+
+
+def clamp_clip_fades(
+    fade_in_s: float,
+    fade_out_s: float,
+    timeline_len: float,
+    *,
+    min_middle: float = FADE_MIN_MIDDLE_S,
+) -> tuple[float, float]:
+    """Clamp fade-in/out so they fit in *timeline_len* with a usable middle.
+
+    Returns effective ``(fade_in_s, fade_out_s)``; either may be 0 (off).
+    """
+    fi = normalize_fade_s(fade_in_s)
+    fo = normalize_fade_s(fade_out_s)
+    tl = max(0.0, float(timeline_len or 0.0))
+    if fi <= 0.0 and fo <= 0.0:
+        return 0.0, 0.0
+    avail = max(0.0, tl - max(0.0, float(min_middle)))
+    if avail <= 0.0:
+        return 0.0, 0.0
+    if fi + fo <= avail + 1e-9:
+        return fi, fo
+    total = fi + fo
+    if total <= 0.0:
+        return 0.0, 0.0
+    scale = avail / total
+    fi = fi * scale
+    fo = fo * scale
+    # Drop tiny remnants below the practical minimum.
+    if 0.0 < fi < MIN_FADE_S:
+        fo = min(fo + fi, avail) if fo > 0 else 0.0
+        fi = 0.0
+    if 0.0 < fo < MIN_FADE_S:
+        fi = min(fi + fo, avail) if fi > 0 else 0.0
+        fo = 0.0
+    return (
+        normalize_fade_s(fi) if fi > 0 else 0.0,
+        normalize_fade_s(fo) if fo > 0 else 0.0,
+    )
+
+
 @dataclass
 class ClipInst:
     """One instance of a bin item on the timeline."""
@@ -107,6 +164,9 @@ class ClipInst:
     transition_s: float = 0.0
     # Timeline rate vs source (2.0 = twice as fast → half the timeline length).
     speed: float = DEFAULT_SPEED
+    # Intra-clip fades (#567). 0 = off. Durations are timeline seconds.
+    fade_in_s: float = 0.0
+    fade_out_s: float = 0.0
 
     def used(self) -> tuple[float, float]:
         inn = max(0.0, float(self.in_s))
@@ -133,6 +193,12 @@ class ClipInst:
         t0 = float(self.start) + inn
         return t0, t0 + self.timeline_len(src_dur)
 
+    def effective_fades(self, src_dur: float = 0.0) -> tuple[float, float]:
+        """Return clamped ``(fade_in_s, fade_out_s)`` for this clip's timeline length."""
+        return clamp_clip_fades(
+            self.fade_in_s, self.fade_out_s, self.timeline_len(src_dur)
+        )
+
     def copy(self) -> ClipInst:
         return ClipInst(
             start=self.start,
@@ -146,6 +212,8 @@ class ClipInst:
             transition=self.transition,
             transition_s=self.transition_s,
             speed=self.playback_speed(),
+            fade_in_s=normalize_fade_s(self.fade_in_s),
+            fade_out_s=normalize_fade_s(self.fade_out_s),
         )
 
     def split_at(
@@ -155,7 +223,8 @@ class ClipInst:
 
         Same source file and playback speed. None if the playhead is not far
         enough inside the used range. The outgoing transition moves to the
-        right piece; the new internal cut is hard.
+        right piece; the new internal cut is hard. Fade-in stays on the left;
+        fade-out moves to the right (#567).
         """
         inn = max(0.0, float(self.in_s))
         out = float(self.out_s) if self.out_s > inn else inn
@@ -182,10 +251,14 @@ class ClipInst:
             transition=self.transition,
             transition_s=self.transition_s,
             speed=self.playback_speed(),
+            fade_in_s=0.0,
+            fade_out_s=normalize_fade_s(self.fade_out_s),
         )
         self.out_s = src_cut
         self.transition = TRANSITION_NONE
         self.transition_s = 0.0
+        self.fade_out_s = 0.0
+        # fade_in_s stays on the left piece.
         return right
 
 
@@ -208,6 +281,12 @@ def clip_to_dict(c: ClipInst) -> dict:
     speed = c.playback_speed()
     if abs(speed - DEFAULT_SPEED) > 0.0001:
         d["speed"] = speed
+    fi = normalize_fade_s(c.fade_in_s)
+    fo = normalize_fade_s(c.fade_out_s)
+    if fi > 0.0:
+        d["fade_in_s"] = fi
+    if fo > 0.0:
+        d["fade_out_s"] = fo
     return d
 
 
@@ -227,6 +306,8 @@ def clip_from_dict(data: object) -> ClipInst | None:
     mid = str(data.get("media_id") or "")
     ttype, tdur = normalize_transition(data.get("transition"), data.get("transition_s"))
     speed = normalize_speed(data.get("speed", DEFAULT_SPEED))
+    fade_in_s = normalize_fade_s(data.get("fade_in_s"))
+    fade_out_s = normalize_fade_s(data.get("fade_out_s"))
     return ClipInst(
         start=start,
         in_s=inn,
@@ -239,6 +320,8 @@ def clip_from_dict(data: object) -> ClipInst | None:
         transition=ttype,
         transition_s=tdur,
         speed=speed,
+        fade_in_s=fade_in_s,
+        fade_out_s=fade_out_s,
     )
 
 

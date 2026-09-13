@@ -59,7 +59,10 @@ from clip_editor.ripple import (
 )
 from clip_editor.project import (
     DEFAULT_SPEED,
+    DEFAULT_FADE_S,
     DEFAULT_TRANSITION_S,
+    MAX_FADE_S,
+    MIN_FADE_S,
     MAX_SPEED,
     MIN_SPEED,
     TRANSITION_DISSOLVE,
@@ -70,8 +73,10 @@ from clip_editor.project import (
     Project,
     ProjectError,
     clear_autosave,
+    clamp_clip_fades,
     media_load_errors,
     next_media_id,
+    normalize_fade_s,
     normalize_speed,
     normalize_transition,
     read_autosave,
@@ -1486,6 +1491,43 @@ class Timeline(Gtk.DrawingArea):
             cr.line_to(x, y + h)
         cr.stroke()
 
+    def _draw_fade_markers(
+        self,
+        cr,  # noqa: ANN001
+        clip: ClipInst,
+        t0: float,
+        t1: float,
+        x0: float,
+        x1: float,
+        y: float,
+        h: float,
+        src_dur: float,
+        color: tuple[float, float, float],
+    ) -> None:
+        """Small wedges at clip start/end when fade in/out is set (#567)."""
+        tl = max(0.0, t1 - t0)
+        fi, fo = clamp_clip_fades(clip.fade_in_s, clip.fade_out_s, tl)
+        if fi <= 0.0 and fo <= 0.0:
+            return
+        width = max(1.0, float(self.get_width() or 1))
+        cr.set_source_rgba(color[0], color[1], color[2], 0.85)
+        if fi > 0.0:
+            fx = self._t_to_x(t0 + fi, width)
+            # Rising wedge from left edge.
+            cr.move_to(x0, y + h)
+            cr.line_to(min(fx, x1), y)
+            cr.line_to(min(fx, x1), y + h)
+            cr.close_path()
+            cr.fill()
+        if fo > 0.0:
+            fx = self._t_to_x(t1 - fo, width)
+            # Falling wedge to right edge.
+            cr.move_to(max(fx, x0), y)
+            cr.line_to(x1, y + h)
+            cr.line_to(max(fx, x0), y + h)
+            cr.close_path()
+            cr.fill()
+
     def _draw(self, _area: Gtk.DrawingArea, cr, width: int, height: int) -> None:  # noqa: ANN001
         bg = theme_rgb("dark_background", (0.04, 0.05, 0.08))
         track = theme_rgb("lighter_background", (0.12, 0.14, 0.22))
@@ -1578,6 +1620,7 @@ class Timeline(Gtk.DrawingArea):
                 cr.line_to(mx - 4, mid_y + 5)
                 cr.close_path()
                 cr.fill()
+            self._draw_fade_markers(cr, c, t0, t1, x0, x1, clip_lane_y + clip_y, clip_h, d, fg)
 
         color = green if self.audio_kind != "source" else muted
         for i, c in enumerate(self.aclips):
@@ -1603,6 +1646,7 @@ class Timeline(Gtk.DrawingArea):
                 cr.set_line_width(3.0 if i == self.sel_a else 2.0)
                 cr.rectangle(x0, clip_lane_y + clip_y, max(3.0, x1 - x0), clip_h)
                 cr.stroke()
+            self._draw_fade_markers(cr, c, t0, t1, x0, x1, clip_lane_y + clip_y, clip_h, d, fg)
 
         if self._drop_hover is not None:
             kind, t, track_no = self._drop_hover
@@ -2000,6 +2044,40 @@ class EditorWindow(Adw.ApplicationWindow):
         self.btn_open_video.connect("clicked", lambda *_: self._pick("video"))
         row.append(self.btn_open_video)
         right.append(row)
+
+        right.append(self._section("Fade on this clip"))
+        fade_in_row = Gtk.Box(spacing=8)
+        self.fade_in_check = Gtk.CheckButton(label="Fade in")
+        self.fade_in_check.set_tooltip_text(
+            "Opacity/gain 0→1 at the start of this clip (not a cut transition)"
+        )
+        self.fade_in_check.connect("toggled", self._on_fade_changed)
+        fade_in_row.append(self.fade_in_check)
+        self.fade_in_spin = Gtk.SpinButton.new_with_range(MIN_FADE_S, MAX_FADE_S, 0.05)
+        self.fade_in_spin.set_digits(2)
+        self.fade_in_spin.set_value(DEFAULT_FADE_S)
+        self.fade_in_spin.set_tooltip_text(f"{MIN_FADE_S}–{MAX_FADE_S} seconds")
+        self.fade_in_spin.connect("value-changed", self._on_fade_changed)
+        fade_in_row.append(self.fade_in_spin)
+        fade_in_row.append(Gtk.Label(label="seconds"))
+        right.append(fade_in_row)
+        fade_out_row = Gtk.Box(spacing=8)
+        self.fade_out_check = Gtk.CheckButton(label="Fade out")
+        self.fade_out_check.set_tooltip_text(
+            "Opacity/gain 1→0 at the end of this clip (not a cut transition)"
+        )
+        self.fade_out_check.connect("toggled", self._on_fade_changed)
+        fade_out_row.append(self.fade_out_check)
+        self.fade_out_spin = Gtk.SpinButton.new_with_range(MIN_FADE_S, MAX_FADE_S, 0.05)
+        self.fade_out_spin.set_digits(2)
+        self.fade_out_spin.set_value(DEFAULT_FADE_S)
+        self.fade_out_spin.set_tooltip_text(f"{MIN_FADE_S}–{MAX_FADE_S} seconds")
+        self.fade_out_spin.connect("value-changed", self._on_fade_changed)
+        fade_out_row.append(self.fade_out_spin)
+        fade_out_row.append(Gtk.Label(label="seconds"))
+        right.append(fade_out_row)
+        self.fade_hint = self._wrapping_label("")
+        right.append(self.fade_hint)
 
         right.append(self._section("Transition after this clip"))
         self.transition_type = Gtk.DropDown.new_from_strings(
@@ -2576,13 +2654,20 @@ class EditorWindow(Adw.ApplicationWindow):
                     int(c.track),
                     c.transition,
                     round(float(c.transition_s), 3),
+                    round(float(c.fade_in_s), 3),
+                    round(float(c.fade_out_s), 3),
                 )
                 for c in p.video_clips
             ),
             tuple(
                 (
-                    round(c.start, 3), round(c.in_s, 3), round(c.out_s, 3),
-                    c.media_id, int(c.track),
+                    round(c.start, 3),
+                    round(c.in_s, 3),
+                    round(c.out_s, 3),
+                    c.media_id,
+                    int(c.track),
+                    round(float(c.fade_in_s), 3),
+                    round(float(c.fade_out_s), 3),
                 )
                 for c in p.audio_clips
             ),
@@ -3022,6 +3107,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.timeline.set_read_only(False)
         self.preview.set_blank(False)
         self._sync_transition_controls()
+        self._sync_fade_controls()
         self._sync_compiled_preview_controls()
         self._refresh_media()
 
@@ -3449,6 +3535,7 @@ class EditorWindow(Adw.ApplicationWindow):
                 return
             self._sync_transform_controls()
             self._sync_transition_controls()
+            self._sync_fade_controls()
             self._sync_compiled_preview_controls()
             return
         vname = self.video_path.name if self.video_path else ""
@@ -3523,6 +3610,7 @@ class EditorWindow(Adw.ApplicationWindow):
         )
         self._sync_transform_controls()
         self._sync_transition_controls()
+        self._sync_fade_controls()
         self._sync_compiled_preview_controls()
         self._mark_compiled_stale_if_needed()
         self._refresh_media()
@@ -3740,6 +3828,7 @@ class EditorWindow(Adw.ApplicationWindow):
             return
         if not self._guard_edit("transition"):
             self._sync_transition_controls()
+            self._sync_fade_controls()
             return
         indices = self._selected_video_indices()
         if not indices:
@@ -3773,6 +3862,110 @@ class EditorWindow(Adw.ApplicationWindow):
                 TRANSITION_WHITE_FLASH: "White flash",
             }.get(applied_type, applied_type)
             self._set_status(f"Transition → {label} on {n} clips")
+        self._sync_timeline_clips()
+        self._schedule_autosave()
+        self._schedule_checkpoint()
+
+    def _selected_fade_clips(self) -> list[ClipInst]:
+        """Clips that fade controls edit: multi video selection, else primary video or audio."""
+        v_indices = self._selected_video_indices()
+        if v_indices:
+            return [self.video_clips[i] for i in v_indices]
+        if 0 <= self.sel_a < len(self.audio_clips):
+            return [self.audio_clips[self.sel_a]]
+        return []
+
+    def _sync_fade_controls(self) -> None:
+        clips = self._selected_fade_clips()
+        clip = clips[0] if clips else None
+        enabled = bool(clips) and not self.exporting and not self._editing_locked()
+        was_loading = self._loading
+        self._loading = True
+        try:
+            if clip is None:
+                self.fade_in_check.set_active(False)
+                self.fade_out_check.set_active(False)
+                self.fade_in_spin.set_value(DEFAULT_FADE_S)
+                self.fade_out_spin.set_value(DEFAULT_FADE_S)
+                self.fade_hint.set_text("Select a clip")
+            else:
+                fi = normalize_fade_s(clip.fade_in_s)
+                fo = normalize_fade_s(clip.fade_out_s)
+                self.fade_in_check.set_active(fi > 0.0)
+                self.fade_out_check.set_active(fo > 0.0)
+                self.fade_in_spin.set_value(fi if fi > 0.0 else DEFAULT_FADE_S)
+                self.fade_out_spin.set_value(fo if fo > 0.0 else DEFAULT_FADE_S)
+                durs = self._src_durs()
+                src = float(durs.get(clip.media_id) or 0.0)
+                dur = clip.timeline_len(src)
+                efi, efo = clamp_clip_fades(fi, fo, dur)
+                if self._editing_locked():
+                    self.fade_hint.set_text("Rendered preview — editing locked")
+                elif len(clips) > 1:
+                    self.fade_hint.set_text(f"{len(clips)} clips selected")
+                elif (fi > 0 and abs(efi - fi) > 0.01) or (fo > 0 and abs(efo - fo) > 0.01):
+                    parts = []
+                    if efi > 0:
+                        parts.append(f"in {efi:.2f}s")
+                    if efo > 0:
+                        parts.append(f"out {efo:.2f}s")
+                    self.fade_hint.set_text(
+                        "Clamped to " + " / ".join(parts) if parts else "Clamped off (clip too short)"
+                    )
+                else:
+                    self.fade_hint.set_text("")
+            self.fade_in_check.set_sensitive(enabled)
+            self.fade_out_check.set_sensitive(enabled)
+            self.fade_in_spin.set_sensitive(enabled and self.fade_in_check.get_active())
+            self.fade_out_spin.set_sensitive(enabled and self.fade_out_check.get_active())
+        finally:
+            self._loading = was_loading
+
+    def _on_fade_changed(self, *_args: object) -> None:
+        if self._loading:
+            return
+        if not self._guard_edit("fade"):
+            self._sync_fade_controls()
+            return
+        clips = self._selected_fade_clips()
+        if not clips:
+            return
+        want_in = bool(self.fade_in_check.get_active())
+        want_out = bool(self.fade_out_check.get_active())
+        raw_in = float(self.fade_in_spin.get_value()) if want_in else 0.0
+        raw_out = float(self.fade_out_spin.get_value()) if want_out else 0.0
+        if want_in and raw_in <= 0.0:
+            raw_in = DEFAULT_FADE_S
+        if want_out and raw_out <= 0.0:
+            raw_out = DEFAULT_FADE_S
+        durs = self._src_durs()
+        for clip in clips:
+            src = float(durs.get(clip.media_id) or 0.0)
+            dur = clip.timeline_len(src)
+            fi, fo = clamp_clip_fades(
+                normalize_fade_s(raw_in) if want_in else 0.0,
+                normalize_fade_s(raw_out) if want_out else 0.0,
+                dur,
+            )
+            clip.fade_in_s = fi
+            clip.fade_out_s = fo
+        was_loading = self._loading
+        self._loading = True
+        try:
+            self.fade_in_spin.set_sensitive(want_in and not self.exporting)
+            self.fade_out_spin.set_sensitive(want_out and not self.exporting)
+            # Reflect clamps back into the spins when a single clip is selected.
+            if len(clips) == 1:
+                clip = clips[0]
+                if clip.fade_in_s > 0:
+                    self.fade_in_spin.set_value(clip.fade_in_s)
+                if clip.fade_out_s > 0:
+                    self.fade_out_spin.set_value(clip.fade_out_s)
+                self.fade_in_check.set_active(clip.fade_in_s > 0)
+                self.fade_out_check.set_active(clip.fade_out_s > 0)
+        finally:
+            self._loading = was_loading
+        self._sync_fade_controls()
         self._sync_timeline_clips()
         self._schedule_autosave()
         self._schedule_checkpoint()
@@ -4211,6 +4404,7 @@ class EditorWindow(Adw.ApplicationWindow):
                     self._bind_audio(item.id)
         self._sync_transform_controls()
         self._sync_transition_controls()
+        self._sync_fade_controls()
 
     def _place_clip(self, kind: str, t: float, media_id: str = "", track: int = 1) -> None:
         if not self._guard_edit("media_place"):
@@ -5262,6 +5456,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self._apply_timeline_frame(t, start_media=False)
         self._sync_transform_controls()
         self._sync_transition_controls()
+        self._sync_fade_controls()
         self._sync_compiled_preview_controls()
         self._set_status(status)
 
@@ -5299,6 +5494,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.clock.set_text(f"0.00 / {self._compiled_duration:.2f}")
         self._sync_transform_controls()
         self._sync_transition_controls()
+        self._sync_fade_controls()
         self._sync_compiled_preview_controls()
         self._set_status("Rendered preview — editing locked")
 
