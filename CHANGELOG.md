@@ -7,6 +7,12 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.12.1] — 2026-10-01
+
+### Fixed
+
+- Timeline Fit uses edited clip endpoints across video and audio tracks, including trims, placement, and playback speed. Full-source ghost outlines no longer enlarge the view.
+
 ## [0.12.0] — 2026-10-01
 
 ### Added
