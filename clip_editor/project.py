@@ -9,12 +9,13 @@ works, so a folder of media + ``name.clip.json`` can move together.
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
 FORMAT = "clip-editor-project"
-VERSION = 7
+VERSION = 8
 SUFFIX = ".clip.json"
 STATE_DIR = Path.home() / ".local" / "state" / "clip-editor"
 AUTOSAVE_PATH = STATE_DIR / "autosave.clip.json"
@@ -147,6 +148,20 @@ def clamp_clip_fades(
     )
 
 
+def normalize_volume(value: object = 1.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    return max(0.0, min(2.0, number)) if math.isfinite(number) else 1.0
+
+
+def normalize_track_volumes(value: object) -> dict[int, float]:
+    data = value if isinstance(value, dict) else {}
+    return {track: normalize_volume(data.get(track, data.get(str(track), 1.0)))
+            for track in (1, 2)}
+
+
 @dataclass
 class ClipInst:
     """One instance of a bin item on the timeline."""
@@ -167,6 +182,7 @@ class ClipInst:
     # Intra-clip fades (#567). 0 = off. Durations are timeline seconds.
     fade_in_s: float = 0.0
     fade_out_s: float = 0.0
+    volume: float = 1.0
 
     def used(self) -> tuple[float, float]:
         inn = max(0.0, float(self.in_s))
@@ -208,6 +224,7 @@ class ClipInst:
             transform_x=self.transform_x,
             transform_y=self.transform_y,
             scale=self.scale,
+            volume=self.volume,
             track=self.track,
             transition=self.transition,
             transition_s=self.transition_s,
@@ -247,6 +264,7 @@ class ClipInst:
             transform_x=self.transform_x,
             transform_y=self.transform_y,
             scale=self.scale,
+            volume=self.volume,
             track=self.track,
             transition=self.transition,
             transition_s=self.transition_s,
@@ -264,6 +282,8 @@ class ClipInst:
 
 def clip_to_dict(c: ClipInst) -> dict:
     d = {"start": float(c.start), "in_s": float(c.in_s), "out_s": float(c.out_s)}
+    if normalize_volume(c.volume) != 1.0:
+        d["volume"] = normalize_volume(c.volume)
     if c.media_id:
         d["media_id"] = c.media_id
     if abs(float(c.transform_x)) > 0.0001:
@@ -322,6 +342,7 @@ def clip_from_dict(data: object) -> ClipInst | None:
         speed=speed,
         fade_in_s=fade_in_s,
         fade_out_s=fade_out_s,
+        volume=normalize_volume(data.get("volume", 1.0)),
     )
 
 
@@ -394,6 +415,7 @@ class Project:
     media: list[MediaItem] = field(default_factory=list)
     video_clips: list[ClipInst] = field(default_factory=list)
     audio_clips: list[ClipInst] = field(default_factory=list)
+    audio_track_volumes: dict[int, float] = field(default_factory=lambda: {1: 1.0, 2: 1.0})
     path: Path | None = None
 
 
@@ -569,6 +591,7 @@ def to_dict(proj: Project) -> dict:
         "media": media_rows,
         "video_clips": [clip_to_dict(c) for c in proj.video_clips],
         "audio_clips": [clip_to_dict(c) for c in proj.audio_clips],
+        "audio_track_volumes": normalize_track_volumes(proj.audio_track_volumes),
         "video": str(video) if video else None,
         "video_rel": _rel(video, origin),
         "audio": str(audio) if audio else None,
@@ -634,6 +657,7 @@ def from_dict(data: dict, *, origin: Path | None = None) -> Project:
             else float(data.get("audio_out"))
         ),
         audio_follows_in=bool(data.get("audio_follows_in") or False),
+        audio_track_volumes=normalize_track_volumes(data.get("audio_track_volumes")),
         audio_fit=bool(data.get("audio_fit") or False),
         use_video_soundtrack=(
             True

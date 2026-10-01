@@ -54,7 +54,7 @@ def _flatten_clips(
     """Return timeline/source bounds, media id, transform, transition, speed, fades.
 
     Row: ``(t0, t1, sinn, sout, mid, tx, ty, scale, transition, transition_s,
-    speed, fade_in_s, fade_out_s)``.
+    speed, fade_in_s, fade_out_s, volume)``.
     ``t1 - t0`` is timeline length ``(sout - sinn) / speed``. Later clips
     overwrite earlier ones on overlap, matching playback.
     """
@@ -104,6 +104,7 @@ def _flatten_clips(
             st_speed = float(row[10]) if len(row) > 10 else 1.0
             st_fi = float(row[11]) if len(row) > 11 else 0.0
             st_fo = float(row[12]) if len(row) > 12 else 0.0
+            st_volume = float(row[13]) if len(row) > 13 else 1.0
             if st1 <= t0 + 0.001 or st0 >= t1 - 0.001:
                 nxt.append(
                     (
@@ -120,6 +121,7 @@ def _flatten_clips(
                         st_speed,
                         st_fi,
                         st_fo,
+                        st_volume,
                     )
                 )
                 continue
@@ -143,6 +145,7 @@ def _flatten_clips(
                         st_speed,
                         st_fi,
                         0.0,
+                        st_volume,
                     )
                 )
             if st1 > t1 + 0.001:
@@ -164,6 +167,7 @@ def _flatten_clips(
                         st_speed,
                         0.0,
                         st_fo,
+                        st_volume,
                     )
                 )
         nxt.append(
@@ -181,6 +185,7 @@ def _flatten_clips(
                 speed,
                 fade_in_s,
                 fade_out_s,
+                float(c.volume),
             )
         )
         segs = nxt
@@ -261,7 +266,8 @@ def build_cmd(
         audio_clips is not None and len(audio_clips) > 1
     )
     if any(
-        abs(float(c.transform_x)) > 0.0001
+        abs(float(c.volume) - 1.0) > 0.0001
+        or abs(float(c.transform_x)) > 0.0001
         or abs(float(c.transform_y)) > 0.0001
         or abs(float(c.scale) - 1.0) > 0.0001
         or float(getattr(c, "fade_in_s", 0.0) or 0.0) > 0.0
@@ -270,7 +276,8 @@ def build_cmd(
     ):
         many = True
     if any(
-        float(getattr(c, "fade_in_s", 0.0) or 0.0) > 0.0
+        abs(float(c.volume) - 1.0) > 0.0001
+        or float(getattr(c, "fade_in_s", 0.0) or 0.0) > 0.0
         or float(getattr(c, "fade_out_s", 0.0) or 0.0) > 0.0
         for c in (audio_clips or [])
     ):
@@ -416,7 +423,7 @@ def _timeline_parts(flat: list[tuple], out_dur: float) -> list[tuple]:
     """Build gap/seg parts.
 
     Seg: ``(seg, sinn, source_len, mid, tx, ty, scale, ttype, tdur, speed,
-    fade_in_s, fade_out_s)``.
+    fade_in_s, fade_out_s, volume)``.
     """
     parts: list[tuple] = []
     t = 0.0
@@ -452,6 +459,7 @@ def _timeline_parts(flat: list[tuple], out_dur: float) -> list[tuple]:
                 speed,
                 fade_in_s,
                 fade_out_s,
+                float(row[13]) if len(row) > 13 else 1.0,
             )
         )
         t = t1
@@ -1048,6 +1056,7 @@ def _build_cmd_many(
                         f"atrim=start={sinn + off:.6f}:duration={sdur:.6f}",
                         "asetpts=PTS-STARTPTS",
                         *atempo_chain(speed),
+                        f"volume={float(part[12]) if len(part) > 12 else 1.0:.6f}",
                         "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo",
                     ]
                     fade_in_s, fade_out_s = _part_fades(part)
@@ -1096,8 +1105,7 @@ def _build_cmd_many(
         else:
             filters.append(
                 "".join(track_outputs)
-                + f"amix=inputs={len(track_outputs)}:duration=longest:normalize=0,"
-                + f"volume={1.0 / len(track_outputs):.6f}[a]"
+                + f"amix=inputs={len(track_outputs)}:duration=longest:normalize=0[a]"
             )
 
     out_dur = max(0.05, video_duration)

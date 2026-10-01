@@ -1,6 +1,6 @@
 # Clip editor
 
-Local Ginger tool: open a video, optionally replace its audio, cover-crop to a
+Local Ginger tool: open a video, mix two audio layers, cover-crop to a
 social aspect, export one Buffer-safe H.264/AAC MP4.
 
 Not a kdenlive clone. No titles or codec menus.
@@ -210,3 +210,23 @@ window is resized or the timeline changes. These controls change only the view;
 clip timings, trims, and export settings are unaffected. While dragging the
 playhead or ruler, hold the pointer near either visible edge to scroll and seek
 into the hidden portion of the timeline, including back to 0:00.
+
+
+### Mixing audio layers
+
+**Add audio** places a file on the free audio layer, A1 or A2. If the video has
+its own soundtrack, adding audio keeps that soundtrack as editable clips on A1
+and places the new audio on A2. Both layers play together. Once both layers are
+occupied, new files stay in the media bin; drag them to a lane and time to place
+them. Overlapping clips on the same lane still use the most recently placed clip.
+
+Under **Audio mix**, select a clip and set **Selected clip %**, or adjust
+**A1 volume %** and **A2 volume %** for every clip on that layer. Values range
+from 0 (mute) through 100 (original level) to 200. Clip and track volumes multiply:
+a 50% clip on a 50% track plays at 25%. Layers are added without automatically
+turning either one down; lower their volumes to balance the mix.
+
+Volumes apply to playback, rendered previews, and exports, and are saved with
+the project and undo history. Changing volume during playback resumes at the
+current position with the updated mix. Projects saved by this version use format
+8; older projects load with all volumes at 100%.

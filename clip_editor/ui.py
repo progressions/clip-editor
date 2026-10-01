@@ -78,6 +78,8 @@ from clip_editor.project import (
     next_media_id,
     normalize_fade_s,
     normalize_speed,
+    normalize_volume,
+    normalize_track_volumes,
     normalize_transition,
     read_autosave,
     read_project,
@@ -1981,6 +1983,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.audio_out: float | None = None
         self.video_clips: list[ClipInst] = []
         self.audio_clips: list[ClipInst] = []
+        self.audio_track_volumes = {1: 1.0, 2: 1.0}
         self.sel_v = -1
         self.sel_a = -1
         self.sel_vs: set[int] = set()
@@ -2288,7 +2291,7 @@ class EditorWindow(Adw.ApplicationWindow):
 
         right.append(self._section("Audio"))
         row = Gtk.Box(spacing=8)
-        self.btn_open_audio = Gtk.Button(label="Open audio")
+        self.btn_open_audio = Gtk.Button(label="Add audio")
         self.btn_open_audio.connect("clicked", lambda *_: self._pick("audio"))
         row.append(self.btn_open_audio)
         self.btn_fit = Gtk.Button(label="Fit")
@@ -2308,6 +2311,19 @@ class EditorWindow(Adw.ApplicationWindow):
         self.follow_in = Gtk.CheckButton(label="Audio follows video in-point")
         self.follow_in.connect("toggled", self._on_follow_in)
         right.append(self.follow_in)
+
+        right.append(self._section("Audio mix"))
+        self.audio_volume_spins = {}
+        for key, label in (("clip", "Selected clip %"), (1, "A1 volume %"), (2, "A2 volume %")):
+            row = Gtk.Box(spacing=8)
+            row.append(Gtk.Label(label=label, xalign=0))
+            spin = Gtk.SpinButton.new_with_range(0, 200, 1)
+            spin.set_value(100)
+            spin.set_tooltip_text("0 = mute; 100 = original level. Clip and track volumes multiply.")
+            spin.connect("value-changed", self._on_audio_volume_changed, key)
+            self.audio_volume_spins[key] = spin
+            row.append(spin)
+            right.append(row)
 
         right.append(self._section("Aspect"))
         aspects = Gtk.Box(spacing=6)
@@ -2775,6 +2791,7 @@ class EditorWindow(Adw.ApplicationWindow):
                     round(float(c.transition_s), 3),
                     round(float(c.fade_in_s), 3),
                     round(float(c.fade_out_s), 3),
+                    round(float(c.volume), 4),
                 )
                 for c in p.video_clips
             ),
@@ -2787,10 +2804,12 @@ class EditorWindow(Adw.ApplicationWindow):
                     int(c.track),
                     round(float(c.fade_in_s), 3),
                     round(float(c.fade_out_s), 3),
+                    round(float(c.volume), 4),
                 )
                 for c in p.audio_clips
             ),
             tuple((m.id, m.kind, str(m.path)) for m in p.media),
+            tuple(sorted(p.audio_track_volumes.items())),
             bool(p.audio_follows_in),
             bool(p.audio_fit),
             bool(p.use_video_soundtrack),
@@ -2908,6 +2927,7 @@ class EditorWindow(Adw.ApplicationWindow):
             media=[m.copy() for m in self.media],
             video_clips=[c.copy() for c in self.video_clips],
             audio_clips=[c.copy() for c in self.audio_clips],
+            audio_track_volumes=dict(self.audio_track_volumes),
             audio_follows_in=self.follow_in.get_active(),
             audio_fit=self.audio_fit,
             use_video_soundtrack=self.use_video_soundtrack,
@@ -3054,6 +3074,7 @@ class EditorWindow(Adw.ApplicationWindow):
             self.audio_out = proj.audio_out
             self.video_clips = [c.copy() for c in proj.video_clips]
             self.audio_clips = [c.copy() for c in proj.audio_clips]
+            self.audio_track_volumes = normalize_track_volumes(proj.audio_track_volumes)
             # Modern projects own explicit clip lists, including empty lists.
             # Never recreate deleted/detached clips from a stale bound path.
             if not proj.media and proj.video and self.video_path and not self.video_clips:
@@ -3212,6 +3233,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.audio_out = None
         self.video_clips = []
         self.audio_clips = []
+        self.audio_track_volumes = {1: 1.0, 2: 1.0}
         self.sel_v = -1
         self.sel_a = -1
         self.sel_vs: set[int] = set()
@@ -3226,6 +3248,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.timeline.set_read_only(False)
         self.preview.set_blank(False)
         self._sync_transition_controls()
+        self._sync_audio_volume_controls()
         self._sync_fade_controls()
         self._sync_compiled_preview_controls()
         self._refresh_media()
@@ -3591,6 +3614,76 @@ class EditorWindow(Adw.ApplicationWindow):
                     if 0 <= i < len(self.audio_clips)]
         return []
 
+    def _volume_target_clips(self) -> list[ClipInst]:
+        if self.sel_kind == "audio" and not self.audio_clips and self.use_video_soundtrack:
+            return [self.video_clips[i] for i in sorted(self.sel_as or {self.sel_a})
+                    if 0 <= i < len(self.video_clips)]
+        return self._speed_target_clips()
+
+    def _sync_audio_volume_controls(self) -> None:
+        if not hasattr(self, "audio_volume_spins"):
+            return
+        loading = self._loading
+        self._loading = True
+        try:
+            clips = self._volume_target_clips()
+            locked = self._busy_rendering() or self._editing_locked()
+            self.audio_volume_spins["clip"].set_value(clips[0].volume * 100 if clips else 100)
+            self.audio_volume_spins["clip"].set_sensitive(bool(clips) and not locked)
+            for track in (1, 2):
+                self.audio_volume_spins[track].set_value(self.audio_track_volumes[track] * 100)
+                self.audio_volume_spins[track].set_sensitive(not locked)
+        finally:
+            self._loading = loading
+
+    def _on_audio_volume_changed(self, spin, key) -> None:
+        if self._loading:
+            return
+        if self._busy_rendering() or not self._guard_edit("audio_volume"):
+            self._sync_audio_volume_controls()
+            return
+        volume = normalize_volume(spin.get_value() / 100)
+        if key == "clip":
+            for clip in self._volume_target_clips():
+                clip.volume = volume
+        else:
+            self.audio_track_volumes[key] = volume
+        was_playing = self.playing
+        playhead = self._timeline_now() if was_playing else self.timeline.playhead
+        self._stop()
+        self._sync_timeline_clips()
+        self._checkpoint()
+        self._schedule_autosave()
+        if was_playing:
+            self._begin_timeline_play(playhead)
+
+    def _render_clips(self, kind: str) -> list[ClipInst]:
+        # Bake gains into copies at the rendering/cache boundary, never into
+        # editable clips. The implicit video soundtrack uses A1's gain.
+        clips = self.audio_clips if kind == "audio" else self.video_clips
+        result = [c.copy() for c in clips]
+        for clip in result:
+            track = clip.track if kind == "audio" else 1
+            clip.volume *= self.audio_track_volumes[track]
+        return result
+
+    def _preserve_video_soundtrack(self) -> None:
+        if self.audio_clips or not self.use_video_soundtrack:
+            return
+        for source in sorted(self.video_clips, key=lambda c: c.track):
+            item = self._clip_item(source, "video")
+            if item is None or not (self.media_info.get(item.id) or {}).get("has_audio"):
+                continue
+            audio = self._media_for_path(item.path, "audio")
+            if audio is None:
+                audio = MediaItem(next_media_id(self.media), item.path, "audio")
+                self.media.append(audio)
+                self.media_info[audio.id] = dict(self.media_info[item.id])
+            clip = source.copy()
+            clip.media_id = audio.id
+            clip.track = 1
+            self.audio_clips.append(clip)
+
     def _sync_speed_controls(self) -> None:
         clips = self._speed_target_clips()
         enabled = bool(clips) and not self.exporting and not self._editing_locked()
@@ -3662,6 +3755,7 @@ class EditorWindow(Adw.ApplicationWindow):
                 return
             self._sync_transform_controls()
             self._sync_transition_controls()
+            self._sync_audio_volume_controls()
             self._sync_fade_controls()
             self._sync_compiled_preview_controls()
             return
@@ -3737,6 +3831,7 @@ class EditorWindow(Adw.ApplicationWindow):
         )
         self._sync_transform_controls()
         self._sync_transition_controls()
+        self._sync_audio_volume_controls()
         self._sync_fade_controls()
         self._sync_compiled_preview_controls()
         self._mark_compiled_stale_if_needed()
@@ -3748,8 +3843,8 @@ class EditorWindow(Adw.ApplicationWindow):
             self.timeline.set_cache_spans([])
             return
         self._cache_segments = build_timeline_segments(
-            video_clips=self.video_clips,
-            audio_clips=self.audio_clips,
+            video_clips=self._render_clips("video"),
+            audio_clips=self._render_clips("audio"),
             src_durs=self._src_durs(),
             aspect=self.aspect,
             pan_x=self.preview.pan_x,
@@ -3955,6 +4050,7 @@ class EditorWindow(Adw.ApplicationWindow):
             return
         if not self._guard_edit("transition"):
             self._sync_transition_controls()
+            self._sync_audio_volume_controls()
             self._sync_fade_controls()
             return
         indices = self._selected_video_indices()
@@ -4052,6 +4148,7 @@ class EditorWindow(Adw.ApplicationWindow):
         if self._loading:
             return
         if not self._guard_edit("fade"):
+            self._sync_audio_volume_controls()
             self._sync_fade_controls()
             return
         clips = self._selected_fade_clips()
@@ -4092,6 +4189,7 @@ class EditorWindow(Adw.ApplicationWindow):
                 self.fade_out_check.set_active(clip.fade_out_s > 0)
         finally:
             self._loading = was_loading
+        self._sync_audio_volume_controls()
         self._sync_fade_controls()
         self._sync_timeline_clips()
         self._schedule_autosave()
@@ -4239,7 +4337,7 @@ class EditorWindow(Adw.ApplicationWindow):
                 except (ProbeError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
                     pass
         if place is None:
-            place = not self.video_clips if kind == "video" else not self.audio_clips
+            place = not self.video_clips if kind == "video" else True
         if place:
             if kind == "video" and not self.video_clips:
                 self.preview.pan_x = 0.5
@@ -4531,13 +4629,25 @@ class EditorWindow(Adw.ApplicationWindow):
                     self._bind_audio(item.id)
         self._sync_transform_controls()
         self._sync_transition_controls()
+        self._sync_audio_volume_controls()
         self._sync_fade_controls()
 
-    def _place_clip(self, kind: str, t: float, media_id: str = "", track: int = 1) -> None:
+    def _place_clip(self, kind: str, t: float, media_id: str = "", track: int | None = None) -> None:
         if not self._guard_edit("media_place"):
             return
         t = max(0.0, float(t))
-        track = max(1, min(2, int(track)))
+        if kind == "audio":
+            self._preserve_video_soundtrack()
+            if track is None:
+                used = {c.track for c in self.audio_clips}
+                track = next((n for n in (1, 2) if n not in used), None)
+                if track is None:
+                    self._refresh_media()
+                    self._checkpoint()
+                    self._schedule_autosave()
+                    self._set_status("Both audio layers are occupied. Added to media; drag it to the desired lane and time.")
+                    return
+        track = max(1, min(2, int(track or 1)))
         if kind == "video":
             item = self._media_by_id(media_id) or next(
                 (m for m in self.media if m.kind == "video"), None
@@ -4576,6 +4686,7 @@ class EditorWindow(Adw.ApplicationWindow):
             )
             self.use_video_soundtrack = False
             self.sel_a = len(self.audio_clips) - 1
+            self.sel_as = {self.sel_a}
             self.sel_vs = set()
             self.sel_kind = "audio"
             self._bind_audio(item.id)
@@ -4812,10 +4923,10 @@ class EditorWindow(Adw.ApplicationWindow):
                 hits[max(1, min(2, int(c.track))) - 1] = c
         return hits[0], hits[1]
 
-    def _preview_audio_specs(self, timeline_t: float) -> list[tuple[Path, float, float]]:
-        """Active (path, source start, remaining) entries for preview audio."""
+    def _preview_audio_specs(self, timeline_t: float) -> list[tuple[Path, float, float, float]]:
+        """Active (path, source start, remaining, effective gain) entries."""
         if self.audio_clips:
-            specs: list[tuple[Path, float, float]] = []
+            specs: list[tuple[Path, float, float, float]] = []
             for ac in self._audio_tracks_at(timeline_t):
                 if ac is None:
                     continue
@@ -4825,7 +4936,8 @@ class EditorWindow(Adw.ApplicationWindow):
                 adur = self._media_dur(item.id)
                 start = self._source_time(ac, timeline_t, adur)
                 _t0, end = self._clip_span(ac, adur)
-                specs.append((item.path, start, max(0.05, end - timeline_t)))
+                specs.append((item.path, start, max(0.05, end - timeline_t),
+                              ac.volume * self.audio_track_volumes[ac.track]))
             return specs
         if not self.use_video_soundtrack:
             return []
@@ -4843,7 +4955,7 @@ class EditorWindow(Adw.ApplicationWindow):
         start = self._source_time(vc, timeline_t, vdur)
         run = self._run_end(self.video_clips, self._src_durs(), timeline_t)
         remaining = max(0.05, (run if run is not None else timeline_t) - timeline_t)
-        return [(path, start, remaining)]
+        return [(path, start, remaining, vc.volume * self.audio_track_volumes[1])]
 
     def _stop_preview_audio(self) -> None:
         proc = self._preview_proc
@@ -4883,6 +4995,8 @@ class EditorWindow(Adw.ApplicationWindow):
             return False
         if prev is nxt:
             return True
+        if abs(prev.volume - nxt.volume) > 0.0001:
+            return False
         if (prev.media_id or "") != (nxt.media_id or ""):
             return False
         if abs(float(prev.start) - float(nxt.start)) > JOIN_EPS:
@@ -5050,17 +5164,12 @@ class EditorWindow(Adw.ApplicationWindow):
         if self._playthrough_playing and self._playthrough_path is not None:
             start = max(0.0, float(timeline_t))
             remaining = max(0.05, self._program_end() - start)
-            specs: list[tuple[Path, float, float]] = [
-                (self._playthrough_path, start, remaining)
+            specs: list[tuple[Path, float, float, float]] = [
+                (self._playthrough_path, start, remaining, 1.0)
             ]
         else:
             specs = self._preview_audio_specs(timeline_t)
-        # Gain and routing follow the specs playing at timeline_t, not every clip
-        # in the project: a clip on A1 at 0-5s and one on A2 at 10-15s never
-        # overlap, so halving both would preview quieter than the export, which
-        # mixes only genuinely overlapping segments.
         overlapping = len(specs) > 1
-        preview_gain = 1.0 / len(specs) if overlapping else 1.0
         if not specs:
             if begins is not None and timeline_t < begins - 0.02:
                 self._audio_pending = True
@@ -5076,17 +5185,14 @@ class EditorWindow(Adw.ApplicationWindow):
         # FFmpeg mixes overlapping A1/A2 clips, then pipes PCM to ffplay.
         if overlapping and shutil.which("ffplay"):
             mix_cmd = [which_ffmpeg(), "-hide_banner", "-loglevel", "error"]
-            for path, start, remaining in specs:
+            for path, start, remaining, gain in specs:
                 mix_cmd += ["-ss", f"{start:.3f}", "-t", f"{remaining:.3f}", "-i", str(path)]
-            pads = "".join(f"[{i}:a]" for i in range(len(specs)))
-            if len(specs) > 1:
-                audio_filter = (
-                    pads
-                    + f"amix=inputs={len(specs)}:duration=shortest:normalize=0,"
-                    + f"volume={preview_gain:.6f}[a]"
-                )
-            else:
-                audio_filter = f"[0:a]volume={preview_gain:.6f}[a]"
+            chains = [f"[{i}:a]volume={gain:.6f}[mix{i}]"
+                      for i, (_path, _start, _remaining, gain) in enumerate(specs)]
+            pads = "".join(f"[mix{i}]" for i in range(len(specs)))
+            audio_filter = ";".join(chains + [
+                pads + f"amix=inputs={len(specs)}:duration=longest:normalize=0[a]"
+            ])
             mix_cmd += [
                 "-filter_complex",
                 audio_filter,
@@ -5109,13 +5215,13 @@ class EditorWindow(Adw.ApplicationWindow):
             logf.close()
             return
         else:
-            path, start, remaining = specs[0]
+            path, start, remaining, preview_gain = specs[0]
             # mpv first: --hr-seek hits the playhead. ffplay -ss is keyframe-only.
             if shutil.which("mpv"):
                 cmd = [
                     "mpv", "--no-video", "--force-window=no", "--no-terminal",
                     "--audio-display=no", "--no-resume-playback", "--hr-seek=always",
-                    f"--volume={preview_gain * 100.0:.1f}",
+                    "--volume=100", f"--af=volume={preview_gain:.6f}",
                     f"--start={start:.3f}", f"--length={remaining:.3f}", str(path),
                 ]
             elif shutil.which("ffplay"):
@@ -5143,6 +5249,7 @@ class EditorWindow(Adw.ApplicationWindow):
             logf.close()
             self._set_status("Could not start preview audio")
             return
+        logf.close()
         if mix_proc is not None and mix_proc.stdout is not None:
             mix_proc.stdout.close()
         if self._playthrough_playing:
@@ -5444,14 +5551,15 @@ class EditorWindow(Adw.ApplicationWindow):
             audio_follows_in=self.follow_in.get_active(),
             use_video_soundtrack=self.use_video_soundtrack,
             audio_offset=0.0,
-            video_clips=self.video_clips,
-            audio_clips=self.audio_clips,
+            video_clips=self._render_clips("video"),
+            audio_clips=self._render_clips("audio"),
             media=self.media,
             kind=kind,
             window=window,
         )
 
     def _sync_compiled_preview_controls(self) -> None:
+        self._sync_audio_volume_controls()
         busy = self._busy_rendering()
         locked = self._editing_locked()
         has_video = bool(self.video_clips) and bool(self.video_path)
@@ -5587,6 +5695,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self._apply_timeline_frame(t, start_media=False)
         self._sync_transform_controls()
         self._sync_transition_controls()
+        self._sync_audio_volume_controls()
         self._sync_fade_controls()
         self._sync_compiled_preview_controls()
         self._set_status(status)
@@ -5625,6 +5734,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.clock.set_text(f"0.00 / {self._compiled_duration:.2f}")
         self._sync_transform_controls()
         self._sync_transition_controls()
+        self._sync_audio_volume_controls()
         self._sync_fade_controls()
         self._sync_compiled_preview_controls()
         self._set_status("Rendered preview — editing locked")
@@ -5656,8 +5766,8 @@ class EditorWindow(Adw.ApplicationWindow):
         pan_x, pan_y = self.preview.pan_x, self.preview.pan_y
         follows = self.follow_in.get_active()
         use_soundtrack = self.use_video_soundtrack
-        v_clips = [c.copy() for c in self.video_clips]
-        a_clips = [c.copy() for c in self.audio_clips]
+        v_clips = self._render_clips("video")
+        a_clips = self._render_clips("audio")
         media = [m.copy() for m in self.media]
         if a_clips:
             item = self._clip_item(a_clips[0], "audio")
@@ -5757,8 +5867,8 @@ class EditorWindow(Adw.ApplicationWindow):
             return
         src_durs = self._src_durs()
         window: tuple[float, float] | None = None
-        v_clips = [c.copy() for c in self.video_clips]
-        a_clips = [c.copy() for c in self.audio_clips]
+        v_clips = self._render_clips("video")
+        a_clips = self._render_clips("audio")
         if kind == "cut":
             if self.sel_kind != "video" or not 0 <= self.sel_v < len(self.video_clips):
                 self._set_status("Select a video clip with a following cut")
@@ -5929,8 +6039,8 @@ class EditorWindow(Adw.ApplicationWindow):
         a_start = self.audio_start
         a_in = self.audio_in
         a_out = self.audio_out
-        v_clips = [c.copy() for c in self.video_clips]
-        a_clips = [c.copy() for c in self.audio_clips]
+        v_clips = self._render_clips("video")
+        a_clips = self._render_clips("audio")
         media = [m.copy() for m in self.media]
         if a_clips:
             item = self._clip_item(a_clips[0], "audio")
