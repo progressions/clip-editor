@@ -599,9 +599,11 @@ class Timeline(Gtk.DrawingArea):
                      - self._PAD_RIGHT - self._TRAIL_PX)
         current_px = max(1.0, self._desired_width() - self._GUTTER
                          - self._PAD_RIGHT - self._TRAIL_PX)
+        current_zoom = (current_px / fit_px if self._view_zoom is None
+                        else self._view_zoom)
         previous_width = self._desired_width()
-        self._view_zoom = max(1.0, min(max(256.0, current_px / fit_px),
-                                       current_px / fit_px * factor))
+        self._view_zoom = max(1 / 256, min(max(256.0, current_zoom),
+                                         current_zoom * factor))
         if self._desired_width() == previous_width:
             self._zoom_anchor = None
         self._sync_canvas()
@@ -644,7 +646,10 @@ class Timeline(Gtk.DrawingArea):
         if content <= 0.04:
             return self._TRAIL_MIN_S
         content_px = max(1.0, inner - trail_px)
-        return content * inner / content_px
+        # The canvas stays at least viewport-wide. Below Fit, extend its time
+        # range instead of stretching the clips back to fill that width.
+        zoom = min(1.0, self._view_zoom) if self._view_zoom is not None else 1.0
+        return content * inner / content_px / zoom
 
     def _clip_src_dur(self, c: ClipInst, lane: str = "v") -> float:
         if c.media_id and c.media_id in self.src_durs:

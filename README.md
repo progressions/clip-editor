@@ -202,7 +202,8 @@ subject into frame, Export.
 ### Timeline zoom
 
 Use **−** and **+** above the timeline to zoom out or in around the visible
-center. **Fit** uses the edited video and audio clip endpoints (including trims,
+center. Zoom out continues past the point where all clips fit, leaving more
+empty timeline space after them. **Fit** uses the edited video and audio clip endpoints (including trims,
 playback speed, and gaps), rather than the full source-file lengths, and
 returns the horizontal scroll to the start. Fit continues to adapt when the
 window is resized or the timeline changes. These controls change only the view;
