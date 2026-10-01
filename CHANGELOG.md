@@ -7,6 +7,12 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.12.2] — 2026-10-01
+
+### Fixed
+
+- Timeline zoom-out continues below Fit, shrinking clips and showing more empty time after them. Repeated clicks preserve the selected scale, and Fit restores the full-project view (PR #41).
+
 ## [0.12.1] — 2026-10-01
 
 ### Fixed
@@ -128,7 +134,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 - Initial packaged release of the native GTK clip editor for Buffer-safe H.264/AAC exports.
 
-[Unreleased]: https://github.com/progressions/clip-editor/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/progressions/clip-editor/compare/v0.12.2...HEAD
+[0.12.2]: https://github.com/progressions/clip-editor/compare/v0.12.1...v0.12.2
+[0.12.1]: https://github.com/progressions/clip-editor/compare/v0.12.0...v0.12.1
+[0.12.0]: https://github.com/progressions/clip-editor/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/progressions/clip-editor/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/progressions/clip-editor/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/progressions/clip-editor/compare/v0.9.0...v0.9.1
