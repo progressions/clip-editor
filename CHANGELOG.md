@@ -7,6 +7,16 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-10-01
+
+### Added
+
+- Timeline −, +, and Fit controls. Zoom preserves the visible center; Fit shows all video and audio clips and adapts to the available width. Ruler ticks gain detail when zooming.
+
+### Fixed
+
+- Explicitly close GTK media pipelines when replacing media or exiting. Application shutdown now runs cleanup as well as window close, preventing decoder workers from continuing into process teardown.
+
 ## [0.11.0] — 2026-09-13
 
 ### Added
