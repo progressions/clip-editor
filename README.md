@@ -202,7 +202,10 @@ subject into frame, Export.
 ### Timeline zoom
 
 Use **−** and **+** above the timeline to zoom out or in around the visible
-center. Zoom out continues past the point where all clips fit, leaving more
+center. With the timeline focused, plain **=** zooms in and plain **-** zooms out;
+no Shift is needed. **+** and the keypad add/subtract keys also work. **F** fits
+the timeline. **Space** toggles playback from any focused editor control.
+Zoom out continues past the point where all clips fit, leaving more
 empty timeline space after them. **Fit** uses the edited video and audio clip endpoints (including trims,
 playback speed, and gaps), rather than the full source-file lengths, and
 returns the horizontal scroll to the start. Fit continues to adapt when the

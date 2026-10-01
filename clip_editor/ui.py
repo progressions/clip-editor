@@ -2640,6 +2640,13 @@ class EditorWindow(Adw.ApplicationWindow):
         self._start_playthrough_render()
 
     def _on_key_pressed(self, _c: Gtk.EventControllerKey, keyval: int, _code: int, state: int) -> bool:
+        # Playback belongs to the whole editor, including focused controls.
+        mods = state & Gtk.accelerator_get_default_mod_mask()
+        if not mods and keyval in (Gdk.KEY_space, Gdk.KEY_KP_Space):
+            if not self._space_held:
+                self._space_held = True
+                self._on_play()
+            return True
         # Timeline is a leaf widget: exact ownership also excludes inspector
         # entries, buttons, popovers, dialogs, and the colon command entry.
         if self.get_focus() is not self.timeline:
@@ -2737,19 +2744,13 @@ class EditorWindow(Adw.ApplicationWindow):
         if keyval in (Gdk.KEY_minus, Gdk.KEY_KP_Subtract):
             self.timeline.zoom_view(1 / 1.5)
             return True
-        if keyval == Gdk.KEY_KP_Add:
+        if keyval in (Gdk.KEY_equal, Gdk.KEY_KP_Add):
             self.timeline.zoom_view(1.5)
             return True
-        if keyval == Gdk.KEY_equal:
+        if keyval == Gdk.KEY_f:
             self.timeline.fit_view()
             return True
-        if keyval not in (Gdk.KEY_space, Gdk.KEY_KP_Space):
-            return False
-        if self._space_held:
-            return True
-        self._space_held = True
-        self._on_play()
-        return True
+        return False
 
     def _on_key_released(self, _c: Gtk.EventControllerKey, keyval: int, _code: int, _state: int) -> bool:
         if keyval in (Gdk.KEY_space, Gdk.KEY_KP_Space):
@@ -3658,10 +3659,10 @@ class EditorWindow(Adw.ApplicationWindow):
             "-", "", lambda: self.timeline.zoom_view(1 / 1.5), tooltip="Zoom out"
         )
         self.btn_timeline_zoom_in = self._hint(
-            "+", "zoom", lambda: self.timeline.zoom_view(1.5), tooltip="Zoom in"
+            "=", "zoom", lambda: self.timeline.zoom_view(1.5), tooltip="Zoom in (= or +)"
         )
         self.btn_timeline_fit = self._hint(
-            "=", "fit", lambda: self.timeline.fit_view(), tooltip="Fit the whole timeline"
+            "f", "fit", lambda: self.timeline.fit_view(), tooltip="Fit the whole timeline (F)"
         )
         # h/l and j/k only work from the keyboard, so their hints are labels.
         clip_nav = self._hint("h/l", "clip")
