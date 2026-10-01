@@ -387,6 +387,8 @@ class Timeline(Gtk.DrawingArea):
         self._ripple_t1_0 = 0.0
         self._ripple_starts: dict[int, float] = {}
         self._drag_moved = False
+        self._seek_scroll_source = 0
+        self._seek_pointer_x = 0.0
         self._snap_line: float | None = None
         self._drop_hover: tuple[str, float, int] | None = None
         self.set_hexpand(False)
@@ -415,6 +417,8 @@ class Timeline(Gtk.DrawingArea):
         drag.connect("drag-begin", self._on_drag_begin)
         drag.connect("drag-update", self._on_drag_update)
         drag.connect("drag-end", self._on_drag_end)
+        drag.connect("cancel", lambda *_: self._stop_seek_scroll())
+        self.connect("unmap", lambda *_: self._stop_seek_scroll())
         self.add_controller(drag)
         motion = Gtk.EventControllerMotion()
         motion.connect("motion", self._on_motion)
@@ -835,6 +839,50 @@ class Timeline(Gtk.DrawingArea):
         if callable(self.on_seek):
             self.on_seek(t)
 
+    def _stop_seek_scroll(self) -> None:
+        if self._seek_scroll_source:
+            GLib.source_remove(self._seek_scroll_source)
+            self._seek_scroll_source = 0
+
+    def _drag_seek_x(self, x: float) -> None:
+        self._seek_x(x)
+        adjustment = self._scroll_adjustment()
+        if adjustment is None:
+            return
+        # Keep the pointer relative to the viewport while the canvas scrolls.
+        self._seek_pointer_x = x - adjustment.get_value()
+        if not self._seek_scroll_source:
+            self._seek_scroll_source = GLib.timeout_add(33, self._scroll_seek_edge)
+
+    def _scroll_seek_edge(self) -> bool:
+        adjustment = self._scroll_adjustment()
+        if self._drag_mode != "seek" or adjustment is None:
+            self._seek_scroll_source = 0
+            return False
+        page = adjustment.get_page_size()
+        edge = min(40.0, page / 4)
+        if edge <= 0:
+            return True
+        pointer = self._seek_pointer_x
+        direction = 0.0
+        if pointer < edge:
+            direction = max(-1.0, (pointer - edge) / edge)
+        elif pointer > page - edge:
+            direction = min(1.0, (pointer - (page - edge)) / edge)
+        if not direction:
+            return True
+        old = adjustment.get_value()
+        lower = adjustment.get_lower()
+        upper = max(lower, adjustment.get_upper() - page)
+        adjustment.set_value(max(lower, min(upper, old + direction * 24)))
+        position = adjustment.get_value()
+        if position != old:
+            x = position + max(0.0, min(page, pointer))
+            if direction < 0 and position == lower:
+                x = 0.0
+            self._seek_x(x)
+        return True
+
     def _shift_held(self, gesture: Gtk.GestureClick) -> bool:
         """True when Shift is down at click time.
 
@@ -1036,6 +1084,7 @@ class Timeline(Gtk.DrawingArea):
             self.set_cursor_from_name("col-resize")
 
     def _on_drag_begin(self, gesture: Gtk.GestureDrag, _x: float, _y: float) -> None:
+        self._stop_seek_scroll()
         ok, ox, oy = gesture.get_start_point()
         if not ok:
             return
@@ -1048,7 +1097,7 @@ class Timeline(Gtk.DrawingArea):
         if self.read_only:
             self._drag_mode = "seek"
             self._drag_index = -1
-            self._seek_x(ox)
+            self._drag_seek_x(ox)
             return
         vi, vp = self._hit_kind(ox, oy, "video")
         ai, ap = (-1, "")
@@ -1135,7 +1184,7 @@ class Timeline(Gtk.DrawingArea):
         else:
             self._drag_mode = "seek"
             self._drag_index = -1
-            self._seek_x(ox)
+            self._drag_seek_x(ox)
 
     def _dt(self, dx: float) -> float:
         return dx / self._drag_inner * self._drag_span
@@ -1371,9 +1420,10 @@ class Timeline(Gtk.DrawingArea):
             return
         ok, ox, _oy = gesture.get_start_point()
         if ok:
-            self._seek_x(ox + dx)
+            self._drag_seek_x(ox + dx)
 
     def _on_drag_end(self, *_args: object) -> None:
+        self._stop_seek_scroll()
         mode = self._drag_mode
         group_starts = dict(self._drag_group_starts)
         idx = self._drag_index
