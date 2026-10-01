@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-10-01
+
 ### Changed
 
 - New Omarchy-style interface: bordered panes like Hyprland windows (focused pane gets the accent border), terminal font, key hints in place of buttons, and a statusline with the keyboard mode, status, export target and project menu. The header bar and sidebar are gone; the media bin is a strip under the timeline.
