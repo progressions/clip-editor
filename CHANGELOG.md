@@ -7,6 +7,12 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.12.3] — 2026-10-01
+
+### Fixed
+
+- Dragging the playhead near either visible timeline edge scrolls and seeks into hidden time, including back to 0:00. Holding the pointer at the edge continues scrolling; release, cancellation, or hiding the timeline stops it. Rendered previews support the same behavior (PR #43).
+
 ## [0.12.2] — 2026-10-01
 
 ### Fixed
@@ -134,7 +140,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 - Initial packaged release of the native GTK clip editor for Buffer-safe H.264/AAC exports.
 
-[Unreleased]: https://github.com/progressions/clip-editor/compare/v0.12.2...HEAD
+[Unreleased]: https://github.com/progressions/clip-editor/compare/v0.12.3...HEAD
+[0.12.3]: https://github.com/progressions/clip-editor/compare/v0.12.2...v0.12.3
 [0.12.2]: https://github.com/progressions/clip-editor/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/progressions/clip-editor/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/progressions/clip-editor/compare/v0.11.0...v0.12.0
