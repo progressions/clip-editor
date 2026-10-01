@@ -40,6 +40,38 @@ class TimelineZoomTest(unittest.TestCase):
             self.timeline.zoom_view(1 / 1.5)
         self.assertEqual(self.timeline._desired_width(), 800)
 
+    def test_zoom_out_beyond_fit_shrinks_clips_and_extends_visible_time(self):
+        before = [vars(c).copy() for c in self.timeline.vclips + self.timeline.aclips]
+        self.timeline.fit_view()
+        with patch.object(self.timeline, 'get_width', return_value=800):
+            fit_span = self.timeline._map_span()
+            fit_end = self.timeline._t_to_x(720, 800)
+            for step in range(1, 6):
+                self.timeline.zoom_view(1 / 1.5)
+                self.assertEqual(self.timeline._desired_width(), 800)
+                self.assertAlmostEqual(self.timeline._map_span(), fit_span * 1.5 ** step)
+                end = self.timeline._t_to_x(720, 800)
+                self.assertAlmostEqual(end - self.timeline._GUTTER,
+                                       (fit_end - self.timeline._GUTTER) / 1.5 ** step)
+                self.assertAlmostEqual(self.timeline._x_to_t(end), 720)
+            for _ in range(5):
+                self.timeline.zoom_view(1.5)
+            self.assertAlmostEqual(self.timeline._map_span(), fit_span)
+            self.timeline.zoom_view(1 / 1.5)
+            self.timeline.fit_view()
+            self.assertAlmostEqual(self.timeline._map_span(), fit_span)
+        self.assertEqual(before, [vars(c).copy() for c in self.timeline.vclips + self.timeline.aclips])
+
+    def test_repeated_zoom_out_stays_finite_and_zoom_in_recovers(self):
+        self.timeline.fit_view()
+        with patch.object(self.timeline, 'get_width', return_value=800):
+            for _ in range(100):
+                self.timeline.zoom_view(1 / 1.5)
+            span = self.timeline._map_span()
+            self.assertGreater(span, 720)
+            self.timeline.zoom_view(1.5)
+            self.assertAlmostEqual(self.timeline._map_span(), span / 1.5)
+
     def test_fit_resets_scroll_and_empty_timeline_is_safe(self):
         scroll = Gtk.ScrolledWindow()
         scroll.set_child(self.timeline)
