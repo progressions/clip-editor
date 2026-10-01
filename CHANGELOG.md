@@ -21,6 +21,13 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Safe-zone overlay for 9:16 (`z`): shades where TikTok, Reels and Shorts draw their interface.
 - Timeline keys: `Enter` clip settings, `z` safe zones, `e` export, `-` / `+` zoom, `=` fit.
 
+### Fixed
+
+- Audio trim fields and playhead buttons edit the selected audio clip, with undo/redo and source-duration limits.
+- Small fade/volume drags are committed; cancelled drags restore their original values. Clicking a fade knob keeps the clip selected.
+- Filmstrip and waveform jobs are deduplicated, limited to two concurrent workers, and matched to current media after project switches. Closing a window releases its theme listener and visual cache.
+- Closing a settings popover no longer steals focus from another open popover.
+
 ## [0.13.0] — 2026-10-01
 
 ### Added

@@ -30,10 +30,11 @@ class MediaShutdownTest(unittest.TestCase):
             get_application=Mock(return_value=Mock()),
             _abandon_preview_render=Mock(), _stop=Mock(),
             _reset_compiled_preview_flags=Mock(), _flush_autosave=Mock(),
-            _dispose_media=Mock(),
+            _dispose_media=Mock(), _on_theme_change=Mock(), _clear_visuals=Mock(),
         )
         self.assertFalse(EditorWindow._on_close(win))
         self.assertFalse(EditorWindow._on_close(win))
+        win._clear_visuals.assert_called_once()
         win._dispose_media.assert_called_once()
         win._flush_autosave.assert_called_once()
         win.get_application.return_value.disconnect.assert_called_once_with(1)

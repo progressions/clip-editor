@@ -270,6 +270,12 @@ def on_theme_change(callback: Any) -> None:
         _listeners.append(callback)
 
 
+def off_theme_change(callback: Any) -> None:
+    """Release a window callback when its window closes."""
+    if callback in _listeners:
+        _listeners.remove(callback)
+
+
 def apply_omarchy_theme() -> None:
     """Apply the active Omarchy colors to GTK; no-op on other desktops."""
     global _provider
