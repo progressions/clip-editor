@@ -207,4 +207,6 @@ empty timeline space after them. **Fit** uses the edited video and audio clip en
 playback speed, and gaps), rather than the full source-file lengths, and
 returns the horizontal scroll to the start. Fit continues to adapt when the
 window is resized or the timeline changes. These controls change only the view;
-clip timings, trims, and export settings are unaffected.
+clip timings, trims, and export settings are unaffected. While dragging the
+playhead or ruler, hold the pointer near either visible edge to scroll and seek
+into the hidden portion of the timeline, including back to 0:00.
