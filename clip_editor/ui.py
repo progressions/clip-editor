@@ -2353,7 +2353,12 @@ class EditorWindow(Adw.ApplicationWindow):
         root.append(scroller)
         toolbar.set_content(root)
         self.set_content(toolbar)
+        self._closed = False
+        self._shutdown_handler = 0
         self.connect("close-request", self._on_close)
+        application = self.get_application()
+        if application is not None:
+            self._shutdown_handler = application.connect("shutdown", self._on_close)
 
         # Hyprland+Nautilus prefers MOVE; COPY-only targets reject the drop.
         self._install_drop(self)
@@ -3440,6 +3445,13 @@ class EditorWindow(Adw.ApplicationWindow):
         return Gdk.DragAction.COPY
 
     def _on_close(self, *_args: object) -> bool:
+        if self._closed:
+            return False
+        self._closed = True
+        application = self.get_application()
+        if application is not None and self._shutdown_handler:
+            application.disconnect(self._shutdown_handler)
+            self._shutdown_handler = 0
         self._abandon_preview_render()
         self._stop()
         self._reset_compiled_preview_flags()
@@ -3447,6 +3459,7 @@ class EditorWindow(Adw.ApplicationWindow):
             GLib.source_remove(self._ckpt_src)
             self._ckpt_src = 0
         self._flush_autosave()
+        self._dispose_media()
         return False
 
     def _refresh_crop(self) -> None:
@@ -5118,11 +5131,15 @@ class EditorWindow(Adw.ApplicationWindow):
             except (TypeError, RuntimeError):
                 pass
             self._prep_handler = 0
-        if self._vmedia is not None:
-            self._vmedia.pause()
+        media = self._vmedia
         self._vmedia = None
         self._vmedia_path = None
         self.preview.set_media(None)
+        if media is not None:
+            media.pause()
+            # Pause leaves decoding/preroll workers alive. Close the source before
+            # replacing it or allowing application/GObject teardown to begin.
+            media.clear()
 
     def _load_media(self, path: Path) -> None:
         if self._vmedia is not None and _same_path(self._vmedia_path, path):

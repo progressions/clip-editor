@@ -367,8 +367,8 @@ class ProjectLoadingTest(unittest.TestCase):
 
 class ProjectLoadingUITest(unittest.TestCase):
     def test_gtk_load_restores_timeline_and_resets_undo(self) -> None:
-        # Adw.Application tears down GObject types on exit; run in a child
-        # process so the rest of the suite is unaffected.
+        # Exercise real GTK media loading and application shutdown in a child;
+        # a decoder left alive during process teardown must fail this test.
         script = r"""
 from __future__ import annotations
 import json, sys, tempfile
@@ -385,6 +385,9 @@ from tests.test_project_loading import _make_media
 
 td = tempfile.TemporaryDirectory(prefix="clip-editor-load-ui-")
 root = Path(td.name)
+# The test's real shutdown flushes autosave; keep it out of the user's state.
+import clip_editor.project as project_module
+project_module.AUTOSAVE_PATH = root / "autosave.clip.json"
 video, video_b, audio = _make_media(root)
 path = root / "ui.clip.json"
 write_project(
@@ -407,9 +410,11 @@ write_project(
 )
 app = Adw.Application(application_id="local.clip-editor.load-ui-test")
 result = {}
+windows = []
 
 def on_activate(application):
     win = EditorWindow(application=application)
+    windows.append(win)
     win.media = [MediaItem(id="old", path=video, kind="video")]
     win.video_clips = [ClipInst(start=0.0, in_s=0.0, out_s=0.2, media_id="old")]
     win._history = [win._current_project()]
@@ -446,6 +451,8 @@ def on_activate(application):
 
 app.connect("activate", on_activate)
 app.run([])
+result["media_disposed"] = windows[0]._vmedia is None
+result["closed"] = windows[0]._closed
 print(json.dumps(result))
 """
         proc = subprocess.run(
@@ -454,12 +461,15 @@ print(json.dumps(result))
             capture_output=True,
             text=True,
             check=False,
+            timeout=30,
         )
         if proc.returncode != 0:
             self.fail(proc.stderr or proc.stdout or f"exit {proc.returncode}")
         lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("{")]
         self.assertTrue(lines, proc.stdout)
         result = json.loads(lines[-1])
+        self.assertTrue(result["media_disposed"])
+        self.assertTrue(result["closed"])
         self.assertIn("Opened missing.clip.json with media warnings", result["warning_status"])
         self.assertEqual(result["offline_clips"], ["m1"])
         self.assertEqual(result["offline_media"][0][0], "m1")
