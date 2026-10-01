@@ -35,7 +35,7 @@ from clip_editor.keyboard_edits import (
     seek_frame, trim_clip,
 )
 from clip_editor.eagle import apply_omarchy_theme, theme_rgb
-from clip_editor.theme import on_theme_change
+from clip_editor.theme import on_theme_change, off_theme_change
 from clip_editor.export import ExportCancelled, ExportError, default_out_path, run_export
 from clip_editor.preview import (
     PREVIEW_PROFILE,
@@ -593,6 +593,8 @@ class Timeline(Gtk.DrawingArea):
         self.waves: dict[str, tuple[list[float], float]] = {}
         self._drag_kind = ""
         self._drag_fades = (0.0, 0.0)
+        self._handle_dirty = False
+        self._handle_offsets = (0.0, 0.0)
         self._drag_mode = ""
         self._drag_index = -1
         self._drag_v0 = 0.0
@@ -633,7 +635,7 @@ class Timeline(Gtk.DrawingArea):
         drag.connect("drag-begin", self._on_drag_begin)
         drag.connect("drag-update", self._on_drag_update)
         drag.connect("drag-end", self._on_drag_end)
-        drag.connect("cancel", lambda *_: self._stop_seek_scroll())
+        drag.connect("cancel", self._on_drag_cancel)
         self.connect("unmap", lambda *_: self._stop_seek_scroll())
         self.add_controller(drag)
         motion = Gtk.EventControllerMotion()
@@ -1265,6 +1267,8 @@ class Timeline(Gtk.DrawingArea):
         if self.read_only:
             self._seek_x(x)
             return
+        if self._hit_handle(x, y)[0]:
+            return
         if n == 2 and callable(self.on_activate):
             for kind in ("video", "audio"):
                 i, _part = self._hit_kind(x, y, kind)
@@ -1314,6 +1318,8 @@ class Timeline(Gtk.DrawingArea):
 
     def _on_drag_begin(self, gesture: Gtk.GestureDrag, _x: float, _y: float) -> None:
         self._stop_seek_scroll()
+        self._handle_dirty = False
+        self._handle_offsets = (0.0, 0.0)
         ok, ox, oy = gesture.get_start_point()
         if not ok:
             return
@@ -1531,6 +1537,7 @@ class Timeline(Gtk.DrawingArea):
             self._drag_moved = True
         dt = self._dt(dx)
         if self._drag_mode in ("fade-in", "fade-out", "volume"):
+            self._handle_offsets = (dt, dy)
             self._drag_handle(dt, dy, final=False)
             return
         if self._drag_mode == "video-in":
@@ -1684,6 +1691,7 @@ class Timeline(Gtk.DrawingArea):
             vol = max(0.0, min(2.0, self._drag_v0 - dy / h * 2.0))
             if abs(vol - 1.0) < 0.04:
                 vol = 1.0
+            self._handle_dirty |= c.volume != vol
             c.volume = vol
             if callable(self.on_volume):
                 self.on_volume(kind, idx, vol, final)
@@ -1697,9 +1705,31 @@ class Timeline(Gtk.DrawingArea):
             else:
                 fo = max(0.0, min(t1 - t0, fo - dt))
                 fo = 0.0 if fo < 0.05 else fo
-            c.fade_in_s, c.fade_out_s = clamp_clip_fades(fi, fo, t1 - t0)
+            fades = clamp_clip_fades(fi, fo, t1 - t0)
+            self._handle_dirty |= fades != (c.fade_in_s, c.fade_out_s)
+            c.fade_in_s, c.fade_out_s = fades
             if callable(self.on_fade):
                 self.on_fade(kind, idx, c.fade_in_s, c.fade_out_s, final)
+        self.queue_draw()
+
+    def _on_drag_cancel(self, *_args: object) -> None:
+        self._stop_seek_scroll()
+        if self._drag_mode not in ("fade-in", "fade-out", "volume", "transition"):
+            return
+        clips = self.vclips if self._drag_kind == "video" else self.aclips
+        if self._handle_dirty and 0 <= self._drag_index < len(clips):
+            clip = clips[self._drag_index]
+            if self._drag_mode == "volume":
+                clip.volume = self._drag_v0
+                if callable(self.on_volume):
+                    self.on_volume(self._drag_kind, self._drag_index, clip.volume, True)
+            else:
+                clip.fade_in_s, clip.fade_out_s = self._drag_fades
+                if callable(self.on_fade):
+                    self.on_fade(self._drag_kind, self._drag_index, *self._drag_fades, True)
+        self._drag_mode = self._drag_kind = ""
+        self._drag_index = -1
+        self._handle_dirty = False
         self.queue_draw()
 
     def _on_drag_end(self, gesture: Gtk.GestureDrag | None = None, *_args: object) -> None:
@@ -1709,10 +1739,8 @@ class Timeline(Gtk.DrawingArea):
             if mode == "transition":
                 if not self._drag_moved and callable(self.on_transition):
                     self.on_transition(self._drag_index)
-            elif self._drag_moved and gesture is not None:
-                ok, dx, dy = gesture.get_offset()
-                if ok:
-                    self._drag_handle(self._dt(dx), dy, final=True)
+            elif self._handle_dirty:
+                self._drag_handle(*self._handle_offsets, final=True)
             self._drag_mode = ""
             self._drag_kind = ""
             self._drag_index = -1
@@ -3139,6 +3167,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self._refresh_media()
 
     def _install_media_list(self, items: list[MediaItem]) -> None:
+        self._clear_visuals()
         self.media = []
         self.media_info = {}
         self.media_thumbs = {}
@@ -3323,6 +3352,7 @@ class EditorWindow(Adw.ApplicationWindow):
         return store
 
     def _clear_session(self) -> None:
+        self._clear_visuals()
         self._abandon_preview_render()
         self._stop()
         self._reset_compiled_preview_flags()
@@ -3795,10 +3825,14 @@ class EditorWindow(Adw.ApplicationWindow):
         pop.set_has_arrow(False)
         pop.set_autohide(True)
         pop.set_parent(self.timeline)
-        pop.connect("closed", lambda *_: self.timeline.grab_focus())
+        pop.connect("closed", self._on_popover_closed)
         grid = Gtk.Grid(column_spacing=10, row_spacing=6)
         pop.set_child(grid)
         return pop, grid
+
+    def _on_popover_closed(self, _popover) -> None:
+        if not any(p.get_visible() for p in (self.clip_popover, self.transition_popover)):
+            self.timeline.grab_focus()
 
     def _build_popovers(self) -> None:
         self.clip_popover, grid = self._popover_grid()
@@ -3826,7 +3860,10 @@ class EditorWindow(Adw.ApplicationWindow):
         self.video_label = self._wrapping_label("no clip selected")
         self.video_label.add_css_class("pane-name")
         self.video_label.set_selectable(False)
-        note(self.video_label)
+        self.clip_title = self._wrapping_label("no clip selected")
+        self.clip_title.add_css_class("pane-name")
+        self.clip_title.set_selectable(False)
+        note(self.clip_title)
 
         self.in_spin = Gtk.SpinButton.new_with_range(0, 99999, 0.05)
         self.in_spin.set_digits(2)
@@ -3834,12 +3871,17 @@ class EditorWindow(Adw.ApplicationWindow):
         self.out_spin = Gtk.SpinButton.new_with_range(0, 99999, 0.05)
         self.out_spin.set_digits(2)
         self.out_spin.connect("value-changed", self._on_trim_spin_changed)
-        set_in = self._hint("", "← playhead", lambda: self._set_in(),
-                            tooltip="Set the in-point to the playhead")
-        set_out = self._hint("", "← playhead", lambda: self._set_out(),
-                             tooltip="Set the out-point to the playhead")
-        field("in", self.in_spin, set_in)
-        field("out", self.out_spin, set_out)
+        self.clip_in_spin = Gtk.SpinButton.new_with_range(0, 99999, 0.05)
+        self.clip_out_spin = Gtk.SpinButton.new_with_range(0, 99999, 0.05)
+        for spin in (self.clip_in_spin, self.clip_out_spin):
+            spin.set_digits(2)
+            spin.connect("value-changed", self._on_clip_trim_changed)
+        self.clip_set_in = self._hint("", "← playhead", lambda: self._set_clip_bound(True),
+                                      tooltip="Set this clip's in-point to the playhead")
+        self.clip_set_out = self._hint("", "← playhead", lambda: self._set_clip_bound(False),
+                                       tooltip="Set this clip's out-point to the playhead")
+        field("in", self.clip_in_spin, self.clip_set_in)
+        field("out", self.clip_out_spin, self.clip_set_out)
 
         self.speed_spin = Gtk.SpinButton.new_with_range(MIN_SPEED, MAX_SPEED, 0.05)
         self.speed_spin.set_digits(2)
@@ -3915,6 +3957,68 @@ class EditorWindow(Adw.ApplicationWindow):
         self.transition_hint = wrap_dim()
         tgrid.attach(self.transition_hint, 0, 3, 2, 1)
 
+    def _trim_target(self) -> tuple[str, int, ClipInst | None]:
+        kind = self._selected_clip_kind()
+        index = self.sel_v if kind == "video" else self.sel_a
+        clips = self.video_clips if kind == "video" else self.audio_clips
+        if kind and 0 <= index < len(clips):
+            return kind, index, clips[index]
+        return kind, index, None
+
+    def _sync_clip_trim_controls(self) -> None:
+        if not hasattr(self, "clip_in_spin"):
+            return
+        kind, index, clip = self._trim_target()
+        linked = kind == "audio" and self.timeline.audio_kind == "source"
+        if linked and 0 <= index < len(self.timeline.aclips):
+            clip = self.timeline.aclips[index]
+        loading = self._loading
+        self._loading = True
+        try:
+            enabled = clip is not None and not linked and not self._busy_rendering() and not self._editing_locked()
+            duration = self._media_dur(clip.media_id) if clip is not None else 0.0
+            self.clip_in_spin.set_value(clip.in_s if clip else 0)
+            self.clip_out_spin.set_value((clip.out_s or duration) if clip else 0)
+            item = self._clip_item(clip, kind) if clip is not None else None
+            self.clip_title.set_text(item.path.name if item else "no clip selected")
+            hint = "Linked soundtrack: trim the video clip, or detach audio using a timeline edit." if linked else None
+            for control in (self.clip_in_spin, self.clip_out_spin, self.clip_set_in, self.clip_set_out):
+                control.set_sensitive(enabled)
+                control.set_tooltip_text(hint)
+        finally:
+            self._loading = loading
+
+    def _on_clip_trim_changed(self, spin) -> None:
+        if self._loading:
+            return
+        kind, index, clip = self._trim_target()
+        if clip is None or self._busy_rendering() or not self._guard_edit("trim"):
+            self._sync_clip_trim_controls()
+            return
+        duration = self._media_dur(clip.media_id) or max(clip.out_s, clip.in_s + .05)
+        if duration < .05:
+            return
+        inn = min(self.clip_in_spin.get_value(), duration - .05)
+        out = min(duration, max(inn + .05, self.clip_out_spin.get_value()))
+        if spin is self.clip_out_spin and out <= clip.in_s:
+            out = min(duration, clip.in_s + .05)
+            inn = clip.in_s
+        self._flush_checkpoint()
+        self._checkpoint()
+        self._stop()
+        if kind == "audio":
+            self._on_audio_trim(index, inn, out, True)
+        else:
+            self._on_video_trim(index, inn, out, True)
+        self._sync_clip_trim_controls()
+
+    def _set_clip_bound(self, is_in: bool) -> None:
+        kind, _index, clip = self._trim_target()
+        if clip is None or self._busy_rendering() or not self._guard_edit("trim"):
+            return
+        source_time = self._source_time(clip, self._timeline_now(), self._media_dur(clip.media_id))
+        (self.clip_in_spin if is_in else self.clip_out_spin).set_value(source_time)
+
     def _open_clip_popover(self, kind: str | None = None, index: int | None = None) -> None:
         kind = kind or self._selected_clip_kind()
         if not kind:
@@ -3925,6 +4029,7 @@ class EditorWindow(Adw.ApplicationWindow):
         rect = self.timeline.clip_rect(kind, index)
         if rect is None:
             return
+        self._sync_clip_trim_controls()
         self.transition_popover.popdown()
         self.clip_popover.set_pointing_to(rect)
         self.clip_popover.set_position(Gtk.PositionType.TOP)
@@ -4008,46 +4113,94 @@ class EditorWindow(Adw.ApplicationWindow):
         self.btn_safe_zones.set_sensitive(supported)
         self.preview.set_safe_zones(self.btn_safe_zones.get_active() and supported)
 
+    @staticmethod
+    def _visual_key(path: Path) -> tuple[str, int, int] | None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return str(path), stat.st_mtime_ns, stat.st_size
+
+    def _clear_visuals(self) -> None:
+        self.timeline.filmstrips.clear()
+        self.timeline.waves.clear()
+        running = self.__dict__.get("_visual_running", set())
+        pending = self.__dict__.get("_visual_pending", {})
+        for key in list(pending):
+            if key not in running:
+                pending.pop(key)
+
     def _queue_visuals(self, mid: str) -> None:
-        """Build the filmstrip / waveform for `mid` off the main thread."""
+        """Deduplicate file jobs and run at most two FFmpeg workers per window."""
+        if self._closed:
+            return
         item = self._media_by_id(mid)
         info = self.media_info.get(mid) or {}
-        if item is None or not item.path.is_file():
+        if item is None or (key := self._visual_key(item.path)) is None:
             return
         cache = self.__dict__.setdefault("_visual_cache", {})
-        key = str(item.path)
-        want_strip = bool(info.get("has_video"))
-        want_wave = bool(info.get("has_audio"))
-        duration = float(info.get("duration") or 0)
-
-        def apply(strip, wave) -> bool:  # noqa: ANN001
+        if key in cache:
+            strip, wave = cache[key]
             if strip is not None:
                 self.timeline.filmstrips[mid] = strip
             if wave is not None:
                 self.timeline.waves[mid] = wave
             self.timeline.queue_draw()
-            return False
-
-        if key in cache:
-            apply(*cache[key])
             return
+        pending = self.__dict__.setdefault("_visual_pending", {})
+        pending.setdefault(key, (item.path, bool(info.get("has_video")),
+                                 bool(info.get("has_audio")), float(info.get("duration") or 0)))
+        self._start_visual_jobs()
 
-        def work() -> None:
-            strip = wave = None
-            try:
-                if want_strip:
-                    strip = _load_filmstrip(item.path, duration)
-            except (OSError, ProbeError, subprocess.SubprocessError):
-                strip = None
-            try:
-                if want_wave:
-                    wave = _load_waveform(item.path)
-            except (OSError, ProbeError, subprocess.SubprocessError):
-                wave = None
-            cache[key] = (strip, wave)
-            GLib.idle_add(apply, strip, wave)
+    def _start_visual_jobs(self) -> None:
+        running = self.__dict__.setdefault("_visual_running", set())
+        pending = self.__dict__.setdefault("_visual_pending", {})
+        if self._closed:
+            return
+        for key, task in list(pending.items()):
+            if len(running) >= 2:
+                break
+            if key in running:
+                continue
+            running.add(key)
+            threading.Thread(target=self._build_visuals, args=(key, task), daemon=True).start()
 
-        threading.Thread(target=work, daemon=True).start()
+    def _build_visuals(self, key, task) -> None:
+        path, want_strip, want_wave, duration = task
+        strip = wave = None
+        try:
+            if want_strip:
+                strip = _load_filmstrip(path, duration)
+        except (OSError, ProbeError, subprocess.SubprocessError, GLib.Error):
+            pass
+        try:
+            if want_wave:
+                wave = _load_waveform(path)
+        except (OSError, ProbeError, subprocess.SubprocessError, GLib.Error):
+            pass
+        GLib.idle_add(self._visuals_ready, key, strip, wave)
+
+    def _visuals_ready(self, key, strip, wave) -> bool:
+        self._visual_running.discard(key)
+        self._visual_pending.pop(key, None)
+        if self._closed:
+            return False
+        # A worker may finish after New/Open/Undo reused m1 for a different file.
+        # Match current file identity, never the media id captured at submission.
+        cache = self.__dict__.setdefault("_visual_cache", {})
+        cache[key] = (strip, wave)
+        while len(cache) > 16:
+            cache.pop(next(iter(cache)))
+        for item in self.media:
+            if self._visual_key(item.path) != key:
+                continue
+            if strip is not None:
+                self.timeline.filmstrips[item.id] = strip
+            if wave is not None:
+                self.timeline.waves[item.id] = wave
+        self.timeline.queue_draw()
+        self._start_visual_jobs()
+        return False
 
     def _on_theme_change(self) -> None:
         """Cairo/snapshot drawing reads the palette at draw time; repaint it."""
@@ -4238,6 +4391,9 @@ class EditorWindow(Adw.ApplicationWindow):
         if self._closed:
             return False
         self._closed = True
+        off_theme_change(self._on_theme_change)
+        self._clear_visuals()
+        self.__dict__.get("_visual_cache", {}).clear()
         application = self.get_application()
         if application is not None and self._shutdown_handler:
             application.disconnect(self._shutdown_handler)
@@ -4345,6 +4501,7 @@ class EditorWindow(Adw.ApplicationWindow):
         return self._speed_target_clips()
 
     def _sync_audio_volume_controls(self) -> None:
+        self._sync_clip_trim_controls()
         if not hasattr(self, "audio_volume_spins"):
             return
         loading = self._loading
