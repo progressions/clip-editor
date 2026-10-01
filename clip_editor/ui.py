@@ -340,6 +340,9 @@ class Timeline(Gtk.DrawingArea):
     def __init__(self) -> None:
         super().__init__()
         self.duration = 0.0
+        # None preserves the initial automatic scale; 1.0 fits the whole timeline.
+        self._view_zoom: float | None = None
+        self._zoom_anchor: tuple[float, Gtk.Adjustment] | None = None
         self.video_dur = 0.0
         self.video_start = 0.0
         self.video_name = ""
@@ -578,9 +581,50 @@ class Timeline(Gtk.DrawingArea):
             return int(vp)
         content_px = max(1.0, inner_vp - trail_px)
         fit_pps = content_px / content
-        pps = max(self._MIN_PPS, fit_pps)
+        pps = (max(self._MIN_PPS, fit_pps) if self._view_zoom is None
+               else fit_pps * self._view_zoom)
         width = int(self._GUTTER + content * pps + trail_px + self._PAD_RIGHT)
         return max(width, int(vp))
+
+    def _scroll_adjustment(self) -> Gtk.Adjustment | None:
+        parent = self.get_parent()
+        for _ in range(4):
+            if isinstance(parent, Gtk.ScrolledWindow):
+                return parent.get_hadjustment()
+            parent = parent.get_parent() if parent is not None else None
+        return None
+
+    def zoom_view(self, factor: float) -> None:
+        """Change only timeline display scale, preserving the visible center."""
+        if self._drag_mode or self.duration <= 0.04:
+            return
+        adjustment = self._scroll_adjustment()
+        if adjustment is not None:
+            center = adjustment.get_value() + adjustment.get_page_size() / 2
+            self._zoom_anchor = (self._x_to_t(center), adjustment)
+        fit_px = max(1.0, self._viewport_width() - self._GUTTER
+                     - self._PAD_RIGHT - self._TRAIL_PX)
+        current_px = max(1.0, self._desired_width() - self._GUTTER
+                         - self._PAD_RIGHT - self._TRAIL_PX)
+        previous_width = self._desired_width()
+        self._view_zoom = max(1.0, min(max(256.0, current_px / fit_px),
+                                       current_px / fit_px * factor))
+        if self._desired_width() == previous_width:
+            self._zoom_anchor = None
+        self._sync_canvas()
+        self.queue_draw()
+
+    def fit_view(self) -> None:
+        """Fit all video/audio clips, including gaps, into the available width."""
+        if self._drag_mode:
+            return
+        self._view_zoom = 1.0
+        self._zoom_anchor = None
+        adjustment = self._scroll_adjustment()
+        if adjustment is not None:
+            adjustment.set_value(0)
+        self._sync_canvas()
+        self.queue_draw()
 
     def _sync_canvas(self) -> None:
         w = self._desired_width()
@@ -591,6 +635,11 @@ class Timeline(Gtk.DrawingArea):
 
     def _on_resize(self, _area: Gtk.DrawingArea, _width: int, _height: int) -> None:
         self._sync_canvas()
+        if self._zoom_anchor is not None:
+            time, adjustment = self._zoom_anchor
+            self._zoom_anchor = None
+            target = self._t_to_x(time, float(_width)) - adjustment.get_page_size() / 2
+            adjustment.set_value(max(0.0, target))
 
     def _map_span(self) -> float:
         if self._drag_mode and self._drag_mode != "seek" and self._drag_span > 0:
@@ -1684,8 +1733,8 @@ class Timeline(Gtk.DrawingArea):
         span = self._map_span()
         if span > 0:
             step = span
-            for cand in (0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0):
-                if span / cand <= 8:
+            for cand in (0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0):
+                if span / cand <= max(1.0, (width - self._GUTTER - self._PAD_RIGHT) / 100):
                     step = cand
                     break
             t = 0.0
@@ -2033,6 +2082,23 @@ class EditorWindow(Adw.ApplicationWindow):
         self.timeline_scroll.set_min_content_height(Timeline._HEIGHT)
         self.timeline_scroll.set_child(self.timeline)
         self.timeline_scroll.connect("notify::width", lambda *_: self.timeline._sync_canvas())
+        timeline_controls = Gtk.Box(spacing=6)
+        timeline_label = Gtk.Label(label="Timeline")
+        timeline_label.set_hexpand(True)
+        timeline_label.set_xalign(0)
+        timeline_controls.append(timeline_label)
+        self.btn_timeline_zoom_out = Gtk.Button(label="−")
+        self.btn_timeline_zoom_out.set_tooltip_text("Zoom out timeline")
+        self.btn_timeline_zoom_out.connect("clicked", lambda *_: self.timeline.zoom_view(1 / 1.5))
+        self.btn_timeline_zoom_in = Gtk.Button(label="+")
+        self.btn_timeline_zoom_in.set_tooltip_text("Zoom in timeline")
+        self.btn_timeline_zoom_in.connect("clicked", lambda *_: self.timeline.zoom_view(1.5))
+        self.btn_timeline_fit = Gtk.Button(label="Fit")
+        self.btn_timeline_fit.set_tooltip_text("Fit the whole timeline in view")
+        self.btn_timeline_fit.connect("clicked", lambda *_: self.timeline.fit_view())
+        for button in (self.btn_timeline_zoom_out, self.btn_timeline_zoom_in, self.btn_timeline_fit):
+            timeline_controls.append(button)
+        left.append(timeline_controls)
         left.append(self.timeline_scroll)
 
         right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)

@@ -198,3 +198,11 @@ Drop a ``.clip.json`` onto the window to open it.
 
 Open a (usually 1:1) gen, add a music or driver track, set 9:16, drag the
 subject into frame, Export.
+
+### Timeline zoom
+
+Use **−** and **+** above the timeline to zoom out or in around the visible
+center. **Fit** shows the entire video and audio timeline, including gaps, and
+returns the horizontal scroll to the start. Fit continues to adapt when the
+window is resized or the timeline changes. These controls change only the view;
+clip timings, trims, and export settings are unaffected.
