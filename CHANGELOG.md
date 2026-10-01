@@ -7,6 +7,27 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Changed
+
+- New Omarchy-style interface: bordered panes like Hyprland windows (focused pane gets the accent border), terminal font, key hints in place of buttons, and a statusline with the keyboard mode, status, export target and project menu. The header bar and sidebar are gone; the media bin is a strip under the timeline.
+- Clip settings (trim, speed, frame, fades, clip and track volume) are in a popover: Enter or double-click a clip. Transitions open from the diamond at a cut.
+- Colors come from the active Omarchy theme, including derived surfaces, hue-matched status colors and btop's key-hint color; the window repaints when the theme changes.
+
+### Added
+
+- Timeline filmstrips on video clips and waveforms on audio clips.
+- Drag fade knobs to set fades and the line across an audio clip to set its volume.
+- Scroll on the preview to scale the selected clip.
+- Safe-zone overlay for 9:16 (`z`): shades where TikTok, Reels and Shorts draw their interface.
+- Timeline keys: `Enter` clip settings, `z` safe zones, `e` export, `-` / `+` zoom, `=` fit.
+
+### Fixed
+
+- Audio trim fields and playhead buttons edit the selected audio clip, with undo/redo and source-duration limits.
+- Small fade/volume drags are committed; cancelled drags restore their original values. Clicking a fade knob keeps the clip selected.
+- Filmstrip and waveform jobs are deduplicated, limited to two concurrent workers, and matched to current media after project switches. Closing a window releases its theme listener and visual cache.
+- Closing a settings popover no longer steals focus from another open popover.
+
 ## [0.13.0] — 2026-10-01
 
 ### Added

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import array
 import os
 import shutil
 import subprocess
@@ -10,6 +11,7 @@ import time
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+import cairo
 import gi
 
 gi.require_version("Gtk", "4.0")
@@ -33,6 +35,7 @@ from clip_editor.keyboard_edits import (
     seek_frame, trim_clip,
 )
 from clip_editor.eagle import apply_omarchy_theme, theme_rgb
+from clip_editor.theme import on_theme_change, off_theme_change
 from clip_editor.export import ExportCancelled, ExportError, default_out_path, run_export
 from clip_editor.preview import (
     PREVIEW_PROFILE,
@@ -105,6 +108,92 @@ APP_ID = "local.clip.Editor"
 HISTORY_LIMIT = 80
 JOIN_EPS = 0.04
 
+# 9:16 areas that TikTok, Reels and Shorts cover with their own interface,
+# as fractions of the frame. Rounded up from each app's 1080×1920 overlay so
+# one shading covers all three; these are working margins, not platform specs.
+SAFE_TOP = 0.08
+SAFE_BOTTOM = 0.22
+SAFE_RIGHT = 0.13
+SAFE_RIGHT_RAIL = (0.35, 0.78)
+SAFE_ZONE_ASPECTS = ("9:16",)
+
+APP_CSS = """
+/* Omarchy-style shell. Colors are --clip-* roles from theme.py, derived from
+   the active Omarchy theme; these defaults only apply without one. */
+:root {
+  --clip-key: @accent_color; --clip-line: alpha(currentColor, 0.2);
+  --clip-hover: alpha(@accent_color, 0.16); --clip-muted: alpha(currentColor, 0.55);
+  --clip-surface: alpha(currentColor, 0.06); --clip-accent: @accent_color;
+  --clip-on-accent: @accent_fg_color; --clip-bg: @window_bg_color; --clip-fg: @window_fg_color;
+}
+window.clip-editor { font-family: monospace; font-size: 10pt; background-color: var(--clip-bg); }
+window.clip-editor popover { font-family: monospace; font-size: 10pt; }
+
+/* Panes: bordered like Hyprland windows, title set into the top border. */
+frame.pane { border: 2px solid var(--clip-line); border-radius: 8px; }
+frame.pane.focused { border: 3px solid var(--clip-accent); }
+frame.pane > .pane-title {
+  background-color: var(--clip-bg); margin-left: 10px; padding: 0 4px;
+}
+.pane-name { font-weight: bold; color: var(--clip-fg); margin-right: 6px; }
+.key { color: var(--clip-key); }
+.dim { color: var(--clip-muted); }
+
+/* Key hints: text that is also a button. */
+button.hint {
+  background: none; border: none; box-shadow: none; outline: none;
+  min-height: 0; min-width: 0; padding: 1px 5px; border-radius: 4px;
+  font-weight: normal; color: var(--clip-fg);
+}
+button.hint:hover { background-color: var(--clip-hover); }
+button.hint:focus-visible { outline: 1px solid var(--clip-accent); }
+button.hint:disabled { opacity: 0.4; }
+button.hint.choice { color: var(--clip-muted); }
+button.hint.choice:checked { color: var(--clip-fg); font-weight: bold; background: none; }
+button.hint:checked { background: none; }
+
+.clock { font-size: 15pt; font-weight: bold; }
+
+/* Media strip */
+.media-row { padding: 4px 8px 4px 4px; border-radius: 6px; border: 1px solid var(--clip-line); }
+.media-row:hover { background-color: var(--clip-hover); }
+
+/* Statusline, lualine-style */
+.statusline { background-color: var(--clip-surface); border-radius: 6px; min-height: 24px; }
+.statusline > label, .statusline > progressbar { padding: 0 10px; }
+.statusline .mode {
+  background-color: var(--clip-accent); color: var(--clip-on-accent);
+  font-weight: 800; border-radius: 6px 0 0 6px;
+}
+.statusline .seg { border-right: 1px solid var(--clip-line); }
+.commandline entry { background-color: var(--clip-hover); border: none; box-shadow: none; }
+progressbar.thin > trough { min-height: 3px; background-color: var(--clip-line); border: none; }
+progressbar.thin > trough > progress { min-height: 3px; background-color: var(--clip-accent); border: none; }
+
+/* Popovers: Walker-style box. */
+popover.clip-pop > contents {
+  background-color: var(--clip-bg); border: 3px solid var(--clip-accent);
+  border-radius: 8px; padding: 10px 12px; box-shadow: none;
+}
+popover.clip-pop spinbutton, popover.clip-pop dropdown > button {
+  background-color: var(--clip-hover); border: none; border-radius: 6px; box-shadow: none;
+}
+"""
+_app_css: Gtk.CssProvider | None = None
+
+
+def install_app_css() -> None:
+    global _app_css
+    display = Gdk.Display.get_default()
+    if _app_css is not None or display is None:
+        return
+    _app_css = Gtk.CssProvider()
+    _app_css.load_from_data(APP_CSS.encode())
+    # Below the Omarchy provider (USER) so theme colors still win.
+    Gtk.StyleContext.add_provider_for_display(
+        display, _app_css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+    )
+
 
 def _same_path(a: Path | None, b: Path | None) -> bool:
     if a is None and b is None:
@@ -115,6 +204,52 @@ def _same_path(a: Path | None, b: Path | None) -> bool:
         return a.resolve() == b.resolve()
     except OSError:
         return a == b
+
+
+FILMSTRIP_FRAMES = 24
+FILMSTRIP_HEIGHT = 72
+WAVE_RATE = 100.0  # peaks per second of source audio
+
+
+def _load_filmstrip(path: Path, duration: float) -> tuple[GdkPixbuf.Pixbuf, int] | None:
+    """Evenly spaced frames from `path`, tiled left to right in one image."""
+    if duration <= 0:
+        return None
+    frames = max(2, min(FILMSTRIP_FRAMES, int(duration * 2)))
+    raw = subprocess.check_output(
+        [
+            which_ffmpeg(), "-hide_banner", "-loglevel", "error", "-i", str(path),
+            "-vf", f"fps={frames}/{duration:.3f},scale=-2:{FILMSTRIP_HEIGHT},tile={frames}x1",
+            "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1",
+        ],
+        timeout=120,
+    )
+    loader = GdkPixbuf.PixbufLoader.new_with_type("png")
+    loader.write(raw)
+    loader.close()
+    pb = loader.get_pixbuf()
+    return (pb, frames) if pb is not None else None
+
+
+def _load_waveform(path: Path) -> tuple[list[float], float] | None:
+    """Peak amplitude (0–1) per 1/WAVE_RATE second of `path`'s first audio stream."""
+    sample_rate = 8000
+    raw = subprocess.check_output(
+        [
+            which_ffmpeg(), "-hide_banner", "-loglevel", "error", "-i", str(path),
+            "-map", "0:a:0", "-ac", "1", "-ar", str(sample_rate), "-f", "s16le", "pipe:1",
+        ],
+        timeout=120,
+    )
+    samples = array.array("h")
+    samples.frombytes(raw[: len(raw) - len(raw) % 2])
+    per = int(sample_rate / WAVE_RATE)
+    peaks = [
+        max(max(chunk), -min(chunk)) / 32768.0
+        for chunk in (samples[i : i + per] for i in range(0, len(samples), per))
+        if len(chunk)
+    ]
+    return peaks, WAVE_RATE
 
 
 def _load_frame(path: Path) -> GdkPixbuf.Pixbuf:
@@ -171,12 +306,14 @@ class CoverPreview(Gtk.Widget):
         self.output_height = 1920
         self.on_pan = None
         self.on_pan_end = None
+        self.on_scale = None
         self._drag_pan = (0.5, 0.5)
         self._texture: Gdk.Texture | None = None
         self._media: Gtk.MediaFile | None = None
         self._inv_id = 0
         self.blank = False
         self.read_only = False
+        self.safe_zones = False
         self.set_layout_manager(Gtk.BinLayout())
         self.set_hexpand(True)
         self.set_vexpand(True)
@@ -186,6 +323,15 @@ class CoverPreview(Gtk.Widget):
         drag.connect("drag-update", self._drag_update)
         drag.connect("drag-end", self._drag_end)
         self.add_controller(drag)
+        scroll = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.VERTICAL)
+        scroll.connect("scroll", self._on_scroll)
+        self.add_controller(scroll)
+
+    def _on_scroll(self, _c: Gtk.EventControllerScroll, _dx: float, dy: float) -> bool:
+        if self.read_only or not callable(self.on_scale):
+            return False
+        self.on_scale(dy)
+        return True
 
     def do_measure(self, orientation: Gtk.Orientation, for_size: int) -> tuple[int, int, int, int]:  # noqa: N802
         return 32, 240, -1, -1
@@ -262,6 +408,36 @@ class CoverPreview(Gtk.Widget):
         snapshot.translate(Graphene.Point().init(x, y))
         p.snapshot(snapshot, sw, sh)
         snapshot.pop()
+        if self.safe_zones:
+            self._snapshot_safe_zones(snapshot, w, h)
+
+    def set_safe_zones(self, on: bool) -> None:
+        if self.safe_zones == on:
+            return
+        self.safe_zones = on
+        self.queue_draw()
+
+    def _snapshot_safe_zones(self, snapshot: Gtk.Snapshot, w: int, h: int) -> None:
+        shade = Gdk.RGBA()
+        shade.red = shade.green = shade.blue = 0.0
+        shade.alpha = 0.5
+        top = h * SAFE_TOP
+        bottom = h * (1.0 - SAFE_BOTTOM)
+        right = w * (1.0 - SAFE_RIGHT)
+        rail_top = h * SAFE_RIGHT_RAIL[0]
+        rail_bottom = h * SAFE_RIGHT_RAIL[1]
+        for rx, ry, rw, rh in (
+            (0, 0, w, top),
+            (0, bottom, w, h - bottom),
+            (right, max(top, rail_top), w - right, min(bottom, rail_bottom) - max(top, rail_top)),
+        ):
+            if rw > 0 and rh > 0:
+                snapshot.append_color(shade, Graphene.Rect().init(rx, ry, rw, rh))
+        r, g, b = theme_rgb("accent", (1.0, 1.0, 1.0))
+        edge = Gdk.RGBA()
+        edge.red, edge.green, edge.blue, edge.alpha = r, g, b, 0.9
+        for rx, ry, rw, rh in ((0, top, w, 1), (0, bottom - 1, w, 1)):
+            snapshot.append_color(edge, Graphene.Rect().init(rx, ry, rw, rh))
 
     def _overflow(self) -> tuple[float, float]:
         p = self._paintable()
@@ -307,6 +483,30 @@ class CoverPreview(Gtk.Widget):
             self.on_pan_end()
 
 
+def _rgb_luminance(color: tuple[float, float, float]) -> float:
+    def lin(c: float) -> float:
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+    return 0.2126 * lin(color[0]) + 0.7152 * lin(color[1]) + 0.0722 * lin(color[2])
+
+
+def _label_rgb_on(
+    color: tuple[float, float, float], alpha: float = 1.0
+) -> tuple[float, float, float]:
+    """Theme background or foreground, whichever contrasts more with `color`."""
+    fg = theme_rgb("foreground", (1.0, 1.0, 1.0))
+    if alpha < 0.6:
+        return fg
+    bg = theme_rgb("background", (0.0, 0.0, 0.0))
+    lum = _rgb_luminance(color)
+
+    def contrast(other: tuple[float, float, float]) -> float:
+        hi, lo = sorted((lum, _rgb_luminance(other)), reverse=True)
+        return (hi + 0.05) / (lo + 0.05)
+
+    return bg if contrast(bg) > contrast(fg) else fg
+
+
 def _round_rect(cr, x: float, y: float, w: float, h: float, r: float) -> None:  # noqa: ANN001
     if w <= 0 or h <= 0:
         return
@@ -328,16 +528,19 @@ class Timeline(Gtk.DrawingArea):
     _PAD_RIGHT = 8.0
     _RULER_H = 16.0
     _CACHE_BAR_H = 8.0
-    _LANE_H = 28.0
+    _LANE_H = 40.0
+    _CLIP_PAD = 3.0
+    _KNOB_R = 5.0
+    _KNOB_INSET = 8.0
     _LANE_GAP = 6.0
-    _BOTTOM = 16.0
+    _BOTTOM = 6.0
     _EDGE = 8.0
     _MIN = 0.05
     _SNAP_PX = 10.0
     _TRAIL_PX = 160.0
     _TRAIL_MIN_S = 8.0
     _MIN_PPS = 8.0
-    _HEIGHT = 170
+    _HEIGHT = 208
 
     def __init__(self) -> None:
         super().__init__()
@@ -379,6 +582,19 @@ class Timeline(Gtk.DrawingArea):
         self.on_navigation_track_change = None
         self.on_place = None
         self.on_select = None
+        # Direct edits: on_fade(kind, i, in_s, out_s, final),
+        # on_volume(kind, i, volume, final), on_transition(i), on_activate(kind, i).
+        self.on_fade = None
+        self.on_volume = None
+        self.on_transition = None
+        self.on_activate = None
+        # media_id -> (tiled frames pixbuf, frame count) / (peaks, peaks per second)
+        self.filmstrips: dict[str, tuple[GdkPixbuf.Pixbuf, int]] = {}
+        self.waves: dict[str, tuple[list[float], float]] = {}
+        self._drag_kind = ""
+        self._drag_fades = (0.0, 0.0)
+        self._handle_dirty = False
+        self._handle_offsets = (0.0, 0.0)
         self._drag_mode = ""
         self._drag_index = -1
         self._drag_v0 = 0.0
@@ -419,7 +635,7 @@ class Timeline(Gtk.DrawingArea):
         drag.connect("drag-begin", self._on_drag_begin)
         drag.connect("drag-update", self._on_drag_update)
         drag.connect("drag-end", self._on_drag_end)
-        drag.connect("cancel", lambda *_: self._stop_seek_scroll())
+        drag.connect("cancel", self._on_drag_cancel)
         self.connect("unmap", lambda *_: self._stop_seek_scroll())
         self.add_controller(drag)
         motion = Gtk.EventControllerMotion()
@@ -1046,11 +1262,19 @@ class Timeline(Gtk.DrawingArea):
             )
         self.queue_draw()
 
-    def _on_pressed(self, gesture: Gtk.GestureClick, _n: int, x: float, y: float) -> None:
+    def _on_pressed(self, gesture: Gtk.GestureClick, n: int, x: float, y: float) -> None:
         self.grab_focus()
         if self.read_only:
             self._seek_x(x)
             return
+        if self._hit_handle(x, y)[0]:
+            return
+        if n == 2 and callable(self.on_activate):
+            for kind in ("video", "audio"):
+                i, _part = self._hit_kind(x, y, kind)
+                if i >= 0 and (kind == "video" or self.audio_kind != "source"):
+                    self.on_activate(kind, i)
+                    return
         shift = self._shift_held(gesture)
         vi, _vp = self._hit_kind(x, y, "video")
         if vi >= 0:
@@ -1072,7 +1296,14 @@ class Timeline(Gtk.DrawingArea):
         if self.read_only:
             self.set_cursor_from_name("col-resize")
             return
-        if self._drag_mode in ("video-in", "video-out", "audio-in", "audio-out"):
+        part = self._drag_mode or self._hit_handle(x, y)[0]
+        if part in ("fade-in", "fade-out"):
+            self.set_cursor_from_name("ew-resize")
+        elif part == "volume":
+            self.set_cursor_from_name("ns-resize")
+        elif part == "transition":
+            self.set_cursor_from_name("pointer")
+        elif self._drag_mode in ("video-in", "video-out", "audio-in", "audio-out"):
             self.set_cursor_from_name("ew-resize")
         elif self._drag_mode in ("video", "video-group", "audio"):
             self.set_cursor_from_name("grabbing")
@@ -1087,6 +1318,8 @@ class Timeline(Gtk.DrawingArea):
 
     def _on_drag_begin(self, gesture: Gtk.GestureDrag, _x: float, _y: float) -> None:
         self._stop_seek_scroll()
+        self._handle_dirty = False
+        self._handle_offsets = (0.0, 0.0)
         ok, ox, oy = gesture.get_start_point()
         if not ok:
             return
@@ -1100,6 +1333,24 @@ class Timeline(Gtk.DrawingArea):
             self._drag_mode = "seek"
             self._drag_index = -1
             self._drag_seek_x(ox)
+            return
+        part, kind, index = self._hit_handle(ox, oy)
+        if part:
+            self._drag_mode = part
+            self._drag_kind = kind
+            self._drag_index = index
+            clips = self.vclips if kind == "video" else self.aclips
+            c = clips[index]
+            self._drag_fades = (float(c.fade_in_s), float(c.fade_out_s))
+            self._drag_v0 = float(c.volume)
+            if kind == "video":
+                self.sel_v, self.sel_vs = index, {index}
+            else:
+                self.sel_a, self.sel_as = index, {index}
+            self._mirror_sel()
+            if callable(self.on_select):
+                self.on_select(kind, index, frozenset({index}) if kind == "video" else frozenset())
+            self.queue_draw()
             return
         vi, vp = self._hit_kind(ox, oy, "video")
         ai, ap = (-1, "")
@@ -1285,6 +1536,10 @@ class Timeline(Gtk.DrawingArea):
         if abs(dx) >= 1.0 or abs(dy) >= 1.0:
             self._drag_moved = True
         dt = self._dt(dx)
+        if self._drag_mode in ("fade-in", "fade-out", "volume"):
+            self._handle_offsets = (dt, dy)
+            self._drag_handle(dt, dy, final=False)
+            return
         if self._drag_mode == "video-in":
             c = self._vclip()
             if c is None:
@@ -1424,9 +1679,73 @@ class Timeline(Gtk.DrawingArea):
         if ok:
             self._drag_seek_x(ox + dx)
 
-    def _on_drag_end(self, *_args: object) -> None:
+    def _drag_handle(self, dt: float, dy: float, *, final: bool) -> None:
+        kind, idx = self._drag_kind, self._drag_index
+        clips = self.vclips if kind == "video" else self.aclips
+        if not 0 <= idx < len(clips):
+            return
+        c = clips[idx]
+        if self._drag_mode == "volume":
+            box = self._clip_box("audio", idx)
+            h = box[3] if box else self._LANE_H
+            vol = max(0.0, min(2.0, self._drag_v0 - dy / h * 2.0))
+            if abs(vol - 1.0) < 0.04:
+                vol = 1.0
+            self._handle_dirty |= c.volume != vol
+            c.volume = vol
+            if callable(self.on_volume):
+                self.on_volume(kind, idx, vol, final)
+        else:
+            lane = "v" if kind == "video" else "a"
+            t0, t1 = self._clip_times(c, self._clip_src_dur(c, lane))
+            fi, fo = self._drag_fades
+            if self._drag_mode == "fade-in":
+                fi = max(0.0, min(t1 - t0, fi + dt))
+                fi = 0.0 if fi < 0.05 else fi
+            else:
+                fo = max(0.0, min(t1 - t0, fo - dt))
+                fo = 0.0 if fo < 0.05 else fo
+            fades = clamp_clip_fades(fi, fo, t1 - t0)
+            self._handle_dirty |= fades != (c.fade_in_s, c.fade_out_s)
+            c.fade_in_s, c.fade_out_s = fades
+            if callable(self.on_fade):
+                self.on_fade(kind, idx, c.fade_in_s, c.fade_out_s, final)
+        self.queue_draw()
+
+    def _on_drag_cancel(self, *_args: object) -> None:
+        self._stop_seek_scroll()
+        if self._drag_mode not in ("fade-in", "fade-out", "volume", "transition"):
+            return
+        clips = self.vclips if self._drag_kind == "video" else self.aclips
+        if self._handle_dirty and 0 <= self._drag_index < len(clips):
+            clip = clips[self._drag_index]
+            if self._drag_mode == "volume":
+                clip.volume = self._drag_v0
+                if callable(self.on_volume):
+                    self.on_volume(self._drag_kind, self._drag_index, clip.volume, True)
+            else:
+                clip.fade_in_s, clip.fade_out_s = self._drag_fades
+                if callable(self.on_fade):
+                    self.on_fade(self._drag_kind, self._drag_index, *self._drag_fades, True)
+        self._drag_mode = self._drag_kind = ""
+        self._drag_index = -1
+        self._handle_dirty = False
+        self.queue_draw()
+
+    def _on_drag_end(self, gesture: Gtk.GestureDrag | None = None, *_args: object) -> None:
         self._stop_seek_scroll()
         mode = self._drag_mode
+        if mode in ("fade-in", "fade-out", "volume", "transition"):
+            if mode == "transition":
+                if not self._drag_moved and callable(self.on_transition):
+                    self.on_transition(self._drag_index)
+            elif self._handle_dirty:
+                self._drag_handle(*self._handle_offsets, final=True)
+            self._drag_mode = ""
+            self._drag_kind = ""
+            self._drag_index = -1
+            self.queue_draw()
+            return
         group_starts = dict(self._drag_group_starts)
         idx = self._drag_index
         if self._drag_moved and mode == "video-out":
@@ -1547,287 +1866,452 @@ class Timeline(Gtk.DrawingArea):
                 return True
         return False
 
-    def _draw_clip(
-        self,
-        cr,  # noqa: ANN001
-        x: float,
-        y: float,
-        w: float,
-        h: float,
+    # ── Direct-edit handles: fade knobs, volume line, cut diamonds ───────
+
+    def _clip_box(self, kind: str, index: int) -> tuple[float, float, float, float] | None:
+        """(x0, y, x1, h) of a clip's drawn body, in widget coordinates."""
+        clips = self.vclips if kind == "video" else self.aclips
+        if not 0 <= index < len(clips):
+            return None
+        c = clips[index]
+        lane = "v" if kind == "video" else "a"
+        t0, t1 = self._clip_times(c, self._clip_src_dur(c, lane))
+        if t1 <= t0:
+            return None
+        width = max(1.0, float(self.get_width()))
+        y = self._lane_y(kind, c.track) + self._CLIP_PAD
+        return self._t_to_x(t0, width), y, self._t_to_x(t1, width), self._LANE_H - 2 * self._CLIP_PAD
+
+    def clip_rect(self, kind: str, index: int) -> Gdk.Rectangle | None:
+        box = self._clip_box(kind, index)
+        if box is None:
+            return None
+        x0, y, x1, h = box
+        rect = Gdk.Rectangle()
+        rect.x, rect.y = int(x0), int(y)
+        rect.width, rect.height = max(1, int(x1 - x0)), int(h)
+        return rect
+
+    def _cuts(self) -> list[tuple[int, float]]:
+        """(outgoing clip index, cut time) for video clips with a touching follower."""
+        times = [self._clip_times(c, self._clip_src_dur(c, "v")) for c in self.vclips]
+        cuts = []
+        for i, c in enumerate(self.vclips):
+            t1 = times[i][1]
+            for j, d in enumerate(self.vclips):
+                if j != i and d.track == c.track and abs(times[j][0] - t1) <= JOIN_EPS:
+                    cuts.append((i, t1))
+                    break
+        return cuts
+
+    def cut_rect(self, index: int) -> Gdk.Rectangle | None:
+        box = self._clip_box("video", index)
+        if box is None:
+            return None
+        _x0, y, x1, h = box
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = int(x1 - 6), int(y + h - 6), 12, 12
+        return rect
+
+    def _fade_knob_x(self, kind: str, index: int, which: str) -> float | None:
+        box = self._clip_box(kind, index)
+        if box is None:
+            return None
+        x0, _y, x1, _h = box
+        clips = self.vclips if kind == "video" else self.aclips
+        c = clips[index]
+        lane = "v" if kind == "video" else "a"
+        t0, t1 = self._clip_times(c, self._clip_src_dur(c, lane))
+        fi, fo = clamp_clip_fades(c.fade_in_s, c.fade_out_s, t1 - t0)
+        width = max(1.0, float(self.get_width()))
+        if which == "in":
+            return min(x1, self._t_to_x(t0 + fi, width)) if fi > 0 else x0 + self._KNOB_INSET
+        return max(x0, self._t_to_x(t1 - fo, width)) if fo > 0 else x1 - self._KNOB_INSET
+
+    def _volume_y(self, index: int) -> float | None:
+        box = self._clip_box("audio", index)
+        if box is None:
+            return None
+        _x0, y, _x1, h = box
+        vol = max(0.0, min(2.0, float(self.aclips[index].volume)))
+        return y + h * (1.0 - vol / 2.0)
+
+    def _knob_visible(self, kind: str, index: int, which: str) -> bool:
+        primary = self.sel_v if kind == "video" else self.sel_a
+        if index == primary:
+            return True
+        clips = self.vclips if kind == "video" else self.aclips
+        c = clips[index]
+        return (c.fade_in_s if which == "in" else c.fade_out_s) > 0
+
+    def _hit_handle(self, x: float, y: float) -> tuple[str, str, int]:
+        """Return (part, kind, index) for a fade knob, volume line or cut diamond."""
+        if self.read_only:
+            return "", "", -1
+        kinds = ["video"] + (["audio"] if self.audio_kind != "source" else [])
+        for kind in kinds:
+            clips = self.vclips if kind == "video" else self.aclips
+            for i in range(len(clips) - 1, -1, -1):
+                box = self._clip_box(kind, i)
+                if box is None:
+                    continue
+                x0, cy, x1, h = box
+                if abs(y - cy) <= self._KNOB_R + 3:
+                    for which in ("in", "out"):
+                        kx = self._fade_knob_x(kind, i, which)
+                        if (kx is not None and abs(x - kx) <= self._KNOB_R + 3
+                                and self._knob_visible(kind, i, which)):
+                            return f"fade-{which}", kind, i
+        for i, _t in self._cuts():
+            box = self._clip_box("video", i)
+            if box is None:
+                continue
+            _x0, cy, x1, h = box
+            if abs(x - x1) <= 7 and abs(y - (cy + h)) <= 7:
+                return "transition", "video", i
+        if self.audio_kind != "source":
+            for i in range(len(self.aclips) - 1, -1, -1):
+                box = self._clip_box("audio", i)
+                vy = self._volume_y(i)
+                if box is None or vy is None:
+                    continue
+                x0, _cy, x1, _h = box
+                if x0 + self._EDGE < x < x1 - self._EDGE and abs(y - vy) <= 4:
+                    return "volume", "audio", i
+        return "", "", -1
+
+    def _draw_filmstrip(
+        self, cr, c: ClipInst, x0: float, x1: float, y: float, h: float  # noqa: ANN001
+    ) -> bool:
+        strip = self.filmstrips.get(c.media_id)
+        src = self._clip_src_dur(c, "v")
+        if strip is None or src <= 0 or x1 - x0 < 2:
+            return False
+        pixbuf, frames = strip
+        fw = pixbuf.get_width() / frames
+        fh = pixbuf.get_height()
+        scale = h / fh
+        slot = fw * scale
+        inn, out = self._clip_used(c, src)
+        cr.save()
+        _round_rect(cr, x0, y, x1 - x0, h, 4)
+        cr.clip()
+        x = x0
+        while x < x1:
+            frac = (x + slot / 2 - x0) / max(1.0, x1 - x0)
+            src_t = inn + min(1.0, max(0.0, frac)) * (out - inn)
+            idx = min(frames - 1, max(0, int(src_t / src * frames)))
+            cr.save()
+            cr.rectangle(x, y, slot, h)
+            cr.clip()
+            cr.translate(x - idx * slot, y)
+            cr.scale(scale, scale)
+            Gdk.cairo_set_source_pixbuf(cr, pixbuf, 0, 0)
+            cr.paint()
+            cr.restore()
+            x += slot
+        cr.restore()
+        return True
+
+    def _draw_waveform(
+        self, cr, c: ClipInst, x0: float, x1: float, y: float, h: float,  # noqa: ANN001
         color: tuple[float, float, float],
-        name: str,
-        alpha: float = 1.0,
     ) -> None:
-        w = max(3.0, w)
-        _round_rect(cr, x, y, w, h, 4)
-        cr.set_source_rgba(*color, alpha)
-        cr.fill()
-        if not name or w < 18:
+        wave = self.waves.get(c.media_id)
+        src = self._clip_src_dur(c, "a")
+        if wave is None or src <= 0 or x1 - x0 < 2:
+            return
+        peaks, rate = wave
+        if not peaks:
+            return
+        inn, out = self._clip_used(c, src)
+        top = max(peaks) or 1.0
+        mid = y + h / 2.0
+        cr.save()
+        cr.rectangle(x0, y, x1 - x0, h)
+        cr.clip()
+        cr.set_source_rgba(*color, 0.75)
+        cr.set_line_width(1.0)
+        span = max(1.0, x1 - x0)
+        step = 2.0
+        x = x0 + 1.0
+        per_px = (out - inn) / span
+        while x < x1:
+            a = inn + (x - x0) * per_px
+            i0 = int(a * rate)
+            i1 = max(i0 + 1, int((a + per_px * step) * rate))
+            chunk = peaks[i0:i1]
+            amp = (max(chunk) if chunk else 0.0) / top
+            half = max(0.5, amp * (h / 2.0 - 2.0))
+            cr.move_to(x, mid - half)
+            cr.line_to(x, mid + half)
+            x += step
+        cr.stroke()
+        cr.restore()
+
+    def _draw_fades(
+        self, cr, c: ClipInst, t0: float, t1: float,  # noqa: ANN001
+        x0: float, x1: float, y: float, h: float, width: float,
+    ) -> None:
+        fi, fo = clamp_clip_fades(c.fade_in_s, c.fade_out_s, t1 - t0)
+        if fi > 0:
+            fx = min(x1, self._t_to_x(t0 + fi, width))
+            grad = cairo.LinearGradient(x0, 0, fx, 0)
+            grad.add_color_stop_rgba(0, 0, 0, 0, 0.8)
+            grad.add_color_stop_rgba(1, 0, 0, 0, 0.0)
+            cr.rectangle(x0, y, fx - x0, h)
+            cr.set_source(grad)
+            cr.fill()
+        if fo > 0:
+            fx = max(x0, self._t_to_x(t1 - fo, width))
+            grad = cairo.LinearGradient(fx, 0, x1, 0)
+            grad.add_color_stop_rgba(0, 0, 0, 0, 0.0)
+            grad.add_color_stop_rgba(1, 0, 0, 0, 0.8)
+            cr.rectangle(fx, y, x1 - fx, h)
+            cr.set_source(grad)
+            cr.fill()
+
+    def _draw_knob(self, cr, x: float, y: float, fg, bg) -> None:  # noqa: ANN001
+        cr.new_path()
+        cr.arc(x, y, self._KNOB_R, 0, 6.2832)
+        cr.set_source_rgb(*fg)
+        cr.fill_preserve()
+        cr.set_source_rgb(*bg)
+        cr.set_line_width(2)
+        cr.stroke()
+
+    def _draw_tab(self, cr, x0: float, x1: float, y: float, name: str,  # noqa: ANN001
+                  fill, ink) -> None:
+        if not name or x1 - x0 < 24:
             return
         cr.save()
-        cr.rectangle(x + 4, y, max(0.0, w - 8), h)
+        cr.rectangle(x0, y, x1 - x0, self._LANE_H)
         cr.clip()
-        cr.set_source_rgba(1.0, 1.0, 1.0, 0.92)
-        cr.set_font_size(11)
+        cr.set_font_size(10)
         ext = cr.text_extents(name)
-        cr.move_to(x + 8, y + (h + ext.height) / 2.0)
+        tw = min(ext.x_advance + 10, x1 - x0)
+        cr.rectangle(x0, y, tw, 15)
+        cr.set_source_rgb(*fill)
+        cr.fill()
+        cr.rectangle(x0 + 5, y, tw - 7, 15)
+        cr.clip()
+        cr.set_source_rgb(*ink)
+        cr.move_to(x0 + 5, y + 11)
         cr.show_text(name)
         cr.restore()
 
-    def _draw_handles(
-        self,
-        cr,  # noqa: ANN001
-        x0: float,
-        x1: float,
-        y: float,
-        h: float,
-        color: tuple[float, float, float],
-    ) -> None:
-        cr.set_source_rgb(*color)
-        cr.set_line_width(2)
-        for x in (x0, x1):
-            cr.move_to(x, y)
-            cr.line_to(x, y + h)
-        cr.stroke()
-
-    def _draw_fade_markers(
-        self,
-        cr,  # noqa: ANN001
-        clip: ClipInst,
-        t0: float,
-        t1: float,
-        x0: float,
-        x1: float,
-        y: float,
-        h: float,
-        src_dur: float,
-        color: tuple[float, float, float],
-    ) -> None:
-        """Small wedges at clip start/end when fade in/out is set (#567)."""
-        tl = max(0.0, t1 - t0)
-        fi, fo = clamp_clip_fades(clip.fade_in_s, clip.fade_out_s, tl)
-        if fi <= 0.0 and fo <= 0.0:
-            return
-        width = max(1.0, float(self.get_width() or 1))
-        cr.set_source_rgba(color[0], color[1], color[2], 0.85)
-        if fi > 0.0:
-            fx = self._t_to_x(t0 + fi, width)
-            # Rising wedge from left edge.
-            cr.move_to(x0, y + h)
-            cr.line_to(min(fx, x1), y)
-            cr.line_to(min(fx, x1), y + h)
-            cr.close_path()
-            cr.fill()
-        if fo > 0.0:
-            fx = self._t_to_x(t1 - fo, width)
-            # Falling wedge to right edge.
-            cr.move_to(max(fx, x0), y)
-            cr.line_to(x1, y + h)
-            cr.line_to(max(fx, x0), y + h)
-            cr.close_path()
-            cr.fill()
-
     def _draw(self, _area: Gtk.DrawingArea, cr, width: int, height: int) -> None:  # noqa: ANN001
-        bg = theme_rgb("dark_background", (0.04, 0.05, 0.08))
-        track = theme_rgb("lighter_background", (0.12, 0.14, 0.22))
-        sel = theme_rgb("accent", (0.49, 0.51, 0.85))
-        fg = theme_rgb("foreground", (1.0, 0.8, 0.68))
-        muted = theme_rgb("muted", (0.43, 0.49, 0.71))
-        green = theme_rgb("green", (0.22, 0.62, 0.45))
+        bg = theme_rgb("background", (0.07, 0.07, 0.07))
+        lane_bg = theme_rgb("lighter_background", (0.13, 0.12, 0.13))
+        line = theme_rgb("line", (0.22, 0.19, 0.21))
+        accent = theme_rgb("accent", (0.84, 0.67, 0.80))
+        fg = theme_rgb("foreground", (0.84, 0.67, 0.80))
+        muted = theme_rgb("muted", (0.49, 0.40, 0.47))
+        green = theme_rgb("green", (0.54, 0.86, 0.54))
+        red = theme_rgb("red", (1.0, 0.30, 0.65))
+        audio = theme_rgb("blue", (0.49, 0.65, 0.79))
+        on_accent = _label_rgb_on(accent)
+        cr.select_font_face("monospace")
         cr.set_source_rgb(*bg)
         cr.paint()
 
         left, inner = self._inner(width)
-        v_y = self._lane_y("video", 1)
+        v_y = self._lane_y("video", 2)
         lanes_bottom = self._lane_y("audio", 2) + self._LANE_H
-
-        # Render-cache bar: gray empty, red dirty, green baked (#532).
-        bar_y = self._RULER_H + 1.0
-        bar_h = max(3.0, self._CACHE_BAR_H - 3.0)
-        _round_rect(cr, left, bar_y, inner, bar_h, 2)
-        cr.set_source_rgb(*muted)
-        cr.fill()
-        red = theme_rgb("red", (0.75, 0.28, 0.32))
         span = self._map_span()
-        for t0, t1, green_ok in self.cache_spans:
-            if span <= 0 or t1 <= t0:
-                continue
-            x0 = self._t_to_x(t0, width)
-            x1 = self._t_to_x(t1, width)
-            cr.set_source_rgb(*(green if green_ok else red))
-            cr.rectangle(x0, bar_y, max(1.0, x1 - x0), bar_h)
-            cr.fill()
 
-        for kind, track_no in (("video", 2), ("video", 1), ("audio", 1), ("audio", 2)):
-            lane_y = self._lane_y(kind, track_no)
-            _round_rect(cr, left, lane_y, inner, self._LANE_H, 4)
-            cr.set_source_rgb(*track)
-            cr.fill()
-            if (kind, track_no) == (self.nav_kind, self.nav_track):
-                cr.set_source_rgb(*sel)
-                cr.set_line_width(2)
-                _round_rect(cr, left + 1, lane_y + 1, inner - 2, self._LANE_H - 2, 3)
-                cr.stroke()
-
-        cr.set_source_rgb(*muted)
-        cr.set_font_size(11)
-        for label, kind, track_no in (
-            ("V2", "video", 2), ("V1", "video", 1),
-            ("A1", "audio", 1), ("A2", "audio", 2),
-        ):
-            cr.move_to(3, self._lane_y(kind, track_no) + 19)
-            cr.show_text(label)
-
-        clip_y = 3.0
-        clip_h = self._LANE_H - 6
-        for i, c in enumerate(self.vclips):
-            clip_lane_y = self._lane_y("video", c.track)
-            d = self._clip_src_dur(c, "v")
-            speed = c.playback_speed()
-            t0, t1 = self._clip_times(c, d)
-            # Ghost = full source placed at this speed (shrinks/grows with rate).
-            gx0 = self._t_to_x(c.start, width)
-            gx1 = self._t_to_x(c.start + (d / speed if d > 0 else 0.0), width)
-            self._draw_clip(cr, gx0, clip_lane_y + clip_y, max(3.0, gx1 - gx0), clip_h, sel, "", 0.28)
-            x0 = self._t_to_x(t0, width)
-            x1 = self._t_to_x(t1, width)
-            name = self.clip_names.get(c.media_id) or (
-                self.video_name if i == self.sel_v or len(self.vclips) == 1 else ""
-            )
-            self._draw_clip(
-                cr, x0, clip_lane_y + clip_y, max(3.0, x1 - x0), clip_h, sel, name
-            )
-            self._draw_handles(cr, x0, x1, clip_lane_y + clip_y, clip_h, fg)
-            if i in self.sel_vs or i == self.sel_v:
-                # Accent outline so multi-select stays obvious vs muted neighbors.
-                cr.set_source_rgb(*sel)
-                cr.set_line_width(3.0 if i == self.sel_v else 2.0)
-                cr.rectangle(
-                    x0 - 1.0,
-                    clip_lane_y + clip_y - 1.0,
-                    max(3.0, x1 - x0) + 2.0,
-                    clip_h + 2.0,
-                )
-                cr.stroke()
-            if getattr(c, "transition", TRANSITION_NONE) not in ("", TRANSITION_NONE):
-                # Compact marker at the outgoing cut of a configured transition.
-                mx = x1
-                mid_y = clip_lane_y + clip_y + clip_h / 2.0
-                cr.set_source_rgb(*fg)
-                cr.move_to(mx - 4, mid_y - 5)
-                cr.line_to(mx + 2, mid_y)
-                cr.line_to(mx - 4, mid_y + 5)
-                cr.close_path()
-                cr.fill()
-            self._draw_fade_markers(cr, c, t0, t1, x0, x1, clip_lane_y + clip_y, clip_h, d, fg)
-
-        color = green if self.audio_kind != "source" else muted
-        for i, c in enumerate(self.aclips):
-            clip_lane_y = self._lane_y("audio", c.track)
-            d = self._clip_src_dur(c, "a")
-            speed = c.playback_speed()
-            t0, t1 = self._clip_times(c, d)
-            gx0 = self._t_to_x(c.start, width)
-            gx1 = self._t_to_x(c.start + (d / speed if d > 0 else 0.0), width)
-            self._draw_clip(cr, gx0, clip_lane_y + clip_y, max(3.0, gx1 - gx0), clip_h, color, "", 0.28)
-            x0 = self._t_to_x(t0, width)
-            x1 = self._t_to_x(t1, width)
-            name = self.clip_names.get(c.media_id) or (
-                self.audio_name if i == self.sel_a or len(self.aclips) == 1 else ""
-            )
-            self._draw_clip(
-                cr, x0, clip_lane_y + clip_y, max(3.0, x1 - x0), clip_h, color, name
-            )
-            if self.audio_kind != "source":
-                self._draw_handles(cr, x0, x1, clip_lane_y + clip_y, clip_h, fg)
-            if i in self.sel_as or i == self.sel_a:
-                cr.set_source_rgb(*fg)
-                cr.set_line_width(3.0 if i == self.sel_a else 2.0)
-                cr.rectangle(x0, clip_lane_y + clip_y, max(3.0, x1 - x0), clip_h)
-                cr.stroke()
-            self._draw_fade_markers(cr, c, t0, t1, x0, x1, clip_lane_y + clip_y, clip_h, d, fg)
-
-        if self._drop_hover is not None:
-            kind, t, track_no = self._drop_hover
-            hover_y = self._lane_y(kind, track_no)
-            if kind == "video" and self.video_dur > 0:
-                gx0 = self._t_to_x(t, width)
-                gx1 = self._t_to_x(t + self.video_dur, width)
-                self._draw_clip(
-                    cr, gx0, hover_y + clip_y, max(3.0, gx1 - gx0), clip_h, sel, "", 0.5
-                )
-            elif kind == "audio" and self.audio_dur > 0:
-                gx0 = self._t_to_x(t, width)
-                gx1 = self._t_to_x(t + self.audio_dur, width)
-                self._draw_clip(
-                    cr, gx0, hover_y + clip_y, max(3.0, gx1 - gx0), clip_h, green, "", 0.5
-                )
-
-        if 0 <= self.sel_v < len(self.vclips):
-            c = self.vclips[self.sel_v]
-            t0, t1 = self._clip_times(c, self._clip_src_dur(c, "v"))
-            if t1 > t0:
-                x_in = self._t_to_x(t0, width)
-                x_out = self._t_to_x(t1, width)
-                cr.set_source_rgb(*fg)
-                cr.set_line_width(1)
-                cr.move_to(x_in, v_y - 2)
-                cr.line_to(x_in, lanes_bottom + 2)
-                cr.move_to(x_out, v_y - 2)
-                cr.line_to(x_out, lanes_bottom + 2)
-                cr.stroke()
-
-        cr.set_source_rgb(*muted)
-        cr.set_line_width(1)
+        # Ruler
         cr.set_font_size(10)
-        span = self._map_span()
+        cr.set_line_width(1)
         if span > 0:
             step = span
             for cand in (0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0):
-                if span / cand <= max(1.0, (width - self._GUTTER - self._PAD_RIGHT) / 100):
+                if span / cand <= max(1.0, (width - self._GUTTER - self._PAD_RIGHT) / 90):
                     step = cand
                     break
             t = 0.0
             while t <= span + 0.0001:
-                tx = self._t_to_x(t, width)
-                cr.set_source_rgb(*muted)
-                cr.move_to(tx, 2)
-                cr.line_to(tx, 8)
+                tx = int(self._t_to_x(t, width)) + 0.5
+                cr.set_source_rgb(*line)
+                cr.move_to(tx, 1)
+                cr.line_to(tx, self._RULER_H - 2)
                 cr.stroke()
-                label = f"{t:.0f}s" if step >= 1 else f"{t:.1f}s"
-                cr.move_to(tx + 2, 12)
-                cr.show_text(label)
+                cr.set_source_rgb(*muted)
+                cr.move_to(tx + 3, 11)
+                cr.show_text(f"{t:.0f}s" if step >= 1 else f"{t:.1f}s")
                 t += step
+
+        # Render-cache bar: line = nothing rendered, red = stale, green = current.
+        bar_y = self._RULER_H + 1.0
+        cr.rectangle(left, bar_y, inner, 3)
+        cr.set_source_rgb(*line)
+        cr.fill()
+        for t0, t1, ok in self.cache_spans:
+            if span <= 0 or t1 <= t0:
+                continue
+            x0 = self._t_to_x(t0, width)
+            x1 = self._t_to_x(t1, width)
+            cr.set_source_rgb(*(green if ok else red))
+            cr.rectangle(x0, bar_y, max(1.0, x1 - x0), 3)
+            cr.fill()
+
+        # Lanes and their names
+        for label, kind, track_no in (
+            ("V2", "video", 2), ("V1", "video", 1), ("A1", "audio", 1), ("A2", "audio", 2),
+        ):
+            lane_y = self._lane_y(kind, track_no)
+            _round_rect(cr, left, lane_y, inner, self._LANE_H, 4)
+            cr.set_source_rgb(*lane_bg)
+            cr.fill()
+            active = (kind, track_no) == (self.nav_kind, self.nav_track)
+            cr.set_font_size(10)
+            cr.set_source_rgb(*(fg if active else muted))
+            cr.move_to(2, lane_y + self._LANE_H / 2.0 + 4.0)
+            cr.show_text(label)
+            if active:
+                cr.rectangle(0, lane_y + 4, 2, self._LANE_H - 8)
+                cr.fill()
+
+        ch = self._LANE_H - 2 * self._CLIP_PAD
+
+        # Video clips: filmstrip, accent outline, name tab, fades
+        for i, c in enumerate(self.vclips):
+            d = self._clip_src_dur(c, "v")
+            t0, t1 = self._clip_times(c, d)
+            cy = self._lane_y("video", c.track) + self._CLIP_PAD
+            gx0 = self._t_to_x(c.start, width)
+            gx1 = self._t_to_x(c.start + (d / c.playback_speed() if d > 0 else 0.0), width)
+            _round_rect(cr, gx0, cy, max(3.0, gx1 - gx0), ch, 4)
+            cr.set_source_rgba(*accent, 0.1)
+            cr.fill()
+            x0 = self._t_to_x(t0, width)
+            x1 = max(x0 + 3.0, self._t_to_x(t1, width))
+            if not self._draw_filmstrip(cr, c, x0, x1, cy, ch):
+                _round_rect(cr, x0, cy, x1 - x0, ch, 4)
+                cr.set_source_rgba(*accent, 0.35)
+                cr.fill()
+            self._draw_fades(cr, c, t0, t1, x0, x1, cy, ch, width)
+            primary = i == self.sel_v
+            selected = primary or i in self.sel_vs
+            _round_rect(cr, x0 + 1, cy + 1, x1 - x0 - 2, ch - 2, 4)
+            cr.set_source_rgb(*(accent if selected else muted))
+            cr.set_line_width(3.0 if primary else 2.0 if selected else 1.5)
+            cr.stroke()
+            name = self.clip_names.get(c.media_id) or self.video_name
+            self._draw_tab(cr, x0, x1, cy, Path(name).stem if name else "",
+                           accent if selected else muted, on_accent if selected else bg)
+
+        # Audio clips: tinted body, waveform, volume line
+        source = self.audio_kind == "source"
+        acolor = muted if source else audio
+        for i, c in enumerate(self.aclips):
+            d = self._clip_src_dur(c, "a")
+            t0, t1 = self._clip_times(c, d)
+            cy = self._lane_y("audio", c.track) + self._CLIP_PAD
+            gx0 = self._t_to_x(c.start, width)
+            gx1 = self._t_to_x(c.start + (d / c.playback_speed() if d > 0 else 0.0), width)
+            _round_rect(cr, gx0, cy, max(3.0, gx1 - gx0), ch, 4)
+            cr.set_source_rgba(*acolor, 0.07)
+            cr.fill()
+            x0 = self._t_to_x(t0, width)
+            x1 = max(x0 + 3.0, self._t_to_x(t1, width))
+            _round_rect(cr, x0, cy, x1 - x0, ch, 4)
+            cr.set_source_rgba(*acolor, 0.16)
+            cr.fill()
+            self._draw_waveform(cr, c, x0, x1, cy, ch, acolor)
+            self._draw_fades(cr, c, t0, t1, x0, x1, cy, ch, width)
+            primary = i == self.sel_a
+            selected = primary or i in self.sel_as
+            _round_rect(cr, x0 + 1, cy + 1, x1 - x0 - 2, ch - 2, 4)
+            cr.set_source_rgb(*(fg if selected else acolor))
+            cr.set_line_width(3.0 if primary else 2.0 if selected else 1.5)
+            cr.stroke()
+            if not source:
+                vy = self._volume_y(i)
+                if vy is not None:
+                    cr.set_source_rgb(*fg)
+                    cr.set_line_width(1.5)
+                    cr.move_to(x0 + 2, vy)
+                    cr.line_to(x1 - 2, vy)
+                    cr.stroke()
+                    if selected or abs(c.volume - 1.0) > 0.005:
+                        label = f"{c.volume * 100:.0f}%"
+                        cr.set_font_size(10)
+                        ext = cr.text_extents(label)
+                        lx = x1 - ext.x_advance - 6
+                        ly = vy - 4 if vy - cy > 14 else vy + 12
+                        if lx > x0 + 4:
+                            cr.move_to(lx, ly)
+                            cr.show_text(label)
+            name = self.clip_names.get(c.media_id) or self.audio_name
+            if name:
+                self._draw_tab(cr, x0, x1, cy, Path(name).stem,
+                               fg if selected else acolor, bg)
+
+        # Fade knobs (selected clip, or wherever a fade is set)
+        for kind in ("video", "audio"):
+            clips = self.vclips if kind == "video" else self.aclips
+            if kind == "audio" and source:
+                continue
+            for i in range(len(clips)):
+                box = self._clip_box(kind, i)
+                if box is None:
+                    continue
+                for which in ("in", "out"):
+                    if self._knob_visible(kind, i, which):
+                        kx = self._fade_knob_x(kind, i, which)
+                        if kx is not None:
+                            self._draw_knob(cr, kx, box[1], fg, bg)
+
+        # Cut diamonds: hollow = hard cut, filled = transition set
+        for i, t in self._cuts():
+            box = self._clip_box("video", i)
+            if box is None:
+                continue
+            _x0, cy, x1, h = box
+            dy = cy + h
+            cr.move_to(x1, dy - 6)
+            cr.line_to(x1 + 6, dy)
+            cr.line_to(x1, dy + 6)
+            cr.line_to(x1 - 6, dy)
+            cr.close_path()
+            set_ = self.vclips[i].transition not in ("", TRANSITION_NONE)
+            cr.set_source_rgb(*(fg if set_ else bg))
+            cr.fill_preserve()
+            cr.set_source_rgb(*fg)
+            cr.set_line_width(2)
+            cr.stroke()
+
+        if self._drop_hover is not None:
+            kind, t, track_no = self._drop_hover
+            hover_y = self._lane_y(kind, track_no) + self._CLIP_PAD
+            dur = self.video_dur if kind == "video" else self.audio_dur
+            if dur > 0:
+                gx0 = self._t_to_x(t, width)
+                gx1 = self._t_to_x(t + dur, width)
+                _round_rect(cr, gx0, hover_y, max(3.0, gx1 - gx0), ch, 4)
+                cr.set_source_rgba(*(accent if kind == "video" else audio), 0.45)
+                cr.fill()
 
         if self._snap_line is not None:
             sx = self._t_to_x(self._snap_line, width)
-            cr.set_source_rgba(*sel, 0.95)
+            cr.set_source_rgba(*accent, 0.95)
             cr.set_line_width(1.5)
             cr.move_to(sx, v_y - 2)
             cr.line_to(sx, lanes_bottom + 2)
             cr.stroke()
 
-        px = self._t_to_x(self.playhead, width)
+        px = int(self._t_to_x(self.playhead, width)) + 0.5
         cr.set_source_rgb(*fg)
         cr.set_line_width(2)
-        cr.move_to(px, 2)
+        cr.move_to(px, 4)
         cr.line_to(px, lanes_bottom + 2)
         cr.stroke()
-        cr.move_to(px, 2)
-        cr.line_to(px - 6, 12)
-        cr.line_to(px + 6, 12)
+        cr.move_to(px - 6, 0)
+        cr.line_to(px + 6, 0)
+        cr.line_to(px, 8)
         cr.close_path()
         cr.fill()
-
-        cr.set_source_rgb(*muted)
-        cr.set_font_size(11)
-        cr.move_to(left, height - 3)
-        cr.show_text(f"{self.playhead:.2f}s")
-        if span > 0:
-            label = f"{span:.2f}s"
-            ext = cr.text_extents(label)
-            cr.move_to(width - self._PAD_RIGHT - ext.width, height - 3)
-            cr.show_text(label)
 
 
 class MediaCard(Gtk.Box):
@@ -1835,11 +2319,8 @@ class MediaCard(Gtk.Box):
 
     def __init__(self) -> None:
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.add_css_class("card")
-        self.set_margin_start(4)
-        self.set_margin_end(4)
-        self.set_margin_top(2)
-        self.set_margin_bottom(2)
+        self.add_css_class("media-row")
+        self.set_size_request(230, -1)
         self._kind = "empty"
         self._payload = ""
         drag = Gtk.DragSource()
@@ -1849,13 +2330,13 @@ class MediaCard(Gtk.Box):
         drag.connect("drag-begin", self._drag_begin)
         self.add_controller(drag)
         self._swatch = Gtk.DrawingArea()
-        self._swatch.set_content_width(5)
+        self._swatch.set_content_width(3)
         self._swatch.set_hexpand(False)
         self._swatch.set_draw_func(self._draw_swatch)
         self.append(self._swatch)
         self.picture = Gtk.Picture()
         self.picture.set_content_fit(Gtk.ContentFit.COVER)
-        self.picture.set_size_request(72, 48)
+        self.picture.set_valign(Gtk.Align.CENTER)
         self.picture.set_can_shrink(True)
         self.append(self.picture)
         self.icon = Gtk.Image.new_from_icon_name("audio-x-generic-symbolic")
@@ -1869,11 +2350,14 @@ class MediaCard(Gtk.Box):
         self.title.set_wrap(True)
         self.title.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
         self.title.set_max_width_chars(22)
+        self.title.set_lines(2)
+        self.title.set_ellipsize(Pango.EllipsizeMode.END)
         self.meta = Gtk.Label(xalign=0)
         self.meta.add_css_class("dim-label")
         self.meta.set_wrap(True)
         self.meta.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
-        self.meta.set_max_width_chars(22)
+        self.meta.set_max_width_chars(18)
+        self.meta.add_css_class("tnum")
         texts.append(self.title)
         texts.append(self.meta)
         self.append(texts)
@@ -1894,7 +2378,7 @@ class MediaCard(Gtk.Box):
     def _draw_swatch(self, _area: Gtk.DrawingArea, cr, width: int, height: int) -> None:  # noqa: ANN001
         keys = {
             "video": ("accent", (0.49, 0.51, 0.85)),
-            "audio": ("green", (0.22, 0.62, 0.45)),
+            "audio": ("blue", (0.49, 0.65, 0.79)),
             "source": ("muted", (0.43, 0.49, 0.71)),
             "empty": ("muted", (0.43, 0.49, 0.71)),
         }
@@ -1935,10 +2419,10 @@ class MediaCard(Gtk.Box):
         self.title.set_text(title)
         self.meta.set_text(meta)
         if pixbuf is not None:
-            if pixbuf.get_width() > 96:
-                scale = 96 / pixbuf.get_width()
+            scale = min(44 / pixbuf.get_width(), 64 / pixbuf.get_height())
+            if scale < 1:
                 pixbuf = pixbuf.scale_simple(
-                    96,
+                    max(1, int(pixbuf.get_width() * scale)),
                     max(1, int(pixbuf.get_height() * scale)),
                     GdkPixbuf.InterpType.BILINEAR,
                 )
@@ -2035,389 +2519,31 @@ class EditorWindow(Adw.ApplicationWindow):
         self._undo_action: Gio.SimpleAction | None = None
         self._redo_action: Gio.SimpleAction | None = None
 
+        # No header bar: like other Omarchy apps, Hyprland owns the window
+        # frame. Panes are bordered like Hyprland windows; the focused one gets
+        # the accent border. Actions are key hints, also clickable.
+        self.add_css_class("clip-editor")
         toolbar = Adw.ToolbarView()
-        header = Adw.HeaderBar()
-        file_menu = Gio.Menu()
-        file_menu.append("New", "win.new-project")
-        file_menu.append("Open project…", "win.open-project")
-        file_menu.append("Save", "win.save")
-        file_menu.append("Save As…", "win.save-as")
-        edit_menu = Gio.Menu()
-        edit_menu.append("Undo", "win.undo")
-        edit_menu.append("Redo", "win.redo")
-        menu = Gio.Menu()
-        menu.append_section(None, file_menu)
-        menu.append_section(None, edit_menu)
-        mb = Gtk.MenuButton(icon_name="open-menu-symbolic")
-        mb.set_menu_model(menu)
-        mb.set_tooltip_text("Project")
-        header.pack_start(mb)
-        toolbar.add_top_bar(header)
         self._install_project_actions()
-
-        root = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
-        root.set_margin_top(16)
-        root.set_margin_bottom(16)
-        root.set_margin_start(16)
-        root.set_margin_end(16)
-
-        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        left.set_hexpand(True)
-        self.aspect_frame = Gtk.AspectFrame(ratio=9 / 16, obey_child=False)
-        self.aspect_frame.set_hexpand(True)
-        self.aspect_frame.set_vexpand(True)
-        self.preview = CoverPreview()
-        self.preview.on_pan = self._refresh_crop
-        self.preview.on_pan_end = self._on_preview_pan_end
-        self.aspect_frame.set_child(self.preview)
-        left.append(self.aspect_frame)
-
-        self.crop_label = self._wrapping_label("")
-        self.crop_label.add_css_class("dim-label")
-        left.append(self.crop_label)
-
-        transport = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.btn_play = Gtk.Button(label="Play")
-        self.btn_play.set_sensitive(False)
-        self.btn_play.set_tooltip_text("Play / pause (Space)")
-        self.btn_play.connect("clicked", self._on_play)
-        transport.append(self.btn_play)
-        self.btn_render_preview = Gtk.Button(label="Render Preview")
-        self.btn_render_preview.set_tooltip_text(
-            "Render the timeline preview without playing it (:rp)"
-        )
-        self.btn_render_preview.connect("clicked", self._on_render_preview)
-        transport.append(self.btn_render_preview)
-        self.btn_split = Gtk.Button(label="Split")
-        self.btn_split.set_tooltip_text("Split the selected clip at the playhead (T)")
-        self.btn_split.connect("clicked", lambda *_: self._split_selected_clip())
-        transport.append(self.btn_split)
-        self.clock = Gtk.Label(label="0.00 / 0.00")
-        self.clock.add_css_class("dim-label")
-        transport.append(self.clock)
-        left.append(transport)
-        self.keyboard_hint = Gtk.Label(xalign=0)
-        self.keyboard_hint.set_wrap(True)
-        left.append(self.keyboard_hint)
-        self.command_revealer = Gtk.Revealer()
-        self.command_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
-        command_box = Gtk.Box(spacing=8)
-        command_box.append(Gtk.Label(label=":"))
-        self.command_entry = Gtk.Entry()
-        self.command_entry.set_hexpand(True)
-        self.command_entry.set_placeholder_text("command (r916, r43, rp)")
-        self.command_entry.connect("activate", self._on_command_activate)
-        command_keys = Gtk.EventControllerKey()
-        command_keys.connect("key-pressed", self._on_command_key_pressed)
-        self.command_entry.add_controller(command_keys)
-        command_box.append(self.command_entry)
-        self.command_revealer.set_child(command_box)
-        left.append(self.command_revealer)
-        self.timeline = Timeline()
-        focus = Gtk.EventControllerFocus()
-        focus.connect("leave", lambda *_: self._exit_keyboard_mode())
-        self.timeline.add_controller(focus)
-        self.timeline.on_seek = self._on_timeline_seek
-        self.timeline.on_video_move = self._on_video_move
-        self.timeline.on_audio_move = self._on_audio_move
-        self.timeline.on_video_trim = self._on_video_trim
-        self.timeline.on_audio_trim = self._on_audio_trim
-        self.timeline.on_track_change = self._on_track_change
-        self.timeline.on_navigation_track_change = self._on_navigation_track_change
-        self.timeline.on_place = self._place_clip
-        self.timeline.on_select = self._on_clip_select
-        self.timeline_scroll = Gtk.ScrolledWindow()
-        self.timeline_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
-        self.timeline_scroll.set_hexpand(True)
-        self.timeline_scroll.set_vexpand(False)
-        self.timeline_scroll.set_min_content_height(Timeline._HEIGHT)
-        self.timeline_scroll.set_child(self.timeline)
-        self.timeline_scroll.connect("notify::width", lambda *_: self.timeline._sync_canvas())
-        timeline_controls = Gtk.Box(spacing=6)
-        timeline_label = Gtk.Label(label="Timeline")
-        timeline_label.set_hexpand(True)
-        timeline_label.set_xalign(0)
-        timeline_controls.append(timeline_label)
-        self.btn_timeline_zoom_out = Gtk.Button(label="−")
-        self.btn_timeline_zoom_out.set_tooltip_text("Zoom out timeline")
-        self.btn_timeline_zoom_out.connect("clicked", lambda *_: self.timeline.zoom_view(1 / 1.5))
-        self.btn_timeline_zoom_in = Gtk.Button(label="+")
-        self.btn_timeline_zoom_in.set_tooltip_text("Zoom in timeline")
-        self.btn_timeline_zoom_in.connect("clicked", lambda *_: self.timeline.zoom_view(1.5))
-        self.btn_timeline_fit = Gtk.Button(label="Fit")
-        self.btn_timeline_fit.set_tooltip_text("Fit the whole timeline in view")
-        self.btn_timeline_fit.connect("clicked", lambda *_: self.timeline.fit_view())
-        for button in (self.btn_timeline_zoom_out, self.btn_timeline_zoom_in, self.btn_timeline_fit):
-            timeline_controls.append(button)
-        left.append(timeline_controls)
-        left.append(self.timeline_scroll)
-
-        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        right.set_margin_end(4)
-
-        right.append(self._section("Video"))
-        row = Gtk.Box(spacing=8)
-        self.btn_open_video = Gtk.Button(label="Open video")
-        self.btn_open_video.connect("clicked", lambda *_: self._pick("video"))
-        row.append(self.btn_open_video)
-        right.append(row)
-
-        right.append(self._section("Fade on this clip"))
-        fade_in_row = Gtk.Box(spacing=8)
-        self.fade_in_check = Gtk.CheckButton(label="Fade in")
-        self.fade_in_check.set_tooltip_text(
-            "Opacity/gain 0→1 at the start of this clip (not a cut transition)"
-        )
-        self.fade_in_check.connect("toggled", self._on_fade_changed)
-        fade_in_row.append(self.fade_in_check)
-        self.fade_in_spin = Gtk.SpinButton.new_with_range(MIN_FADE_S, MAX_FADE_S, 0.05)
-        self.fade_in_spin.set_digits(2)
-        self.fade_in_spin.set_value(DEFAULT_FADE_S)
-        self.fade_in_spin.set_tooltip_text(f"{MIN_FADE_S}–{MAX_FADE_S} seconds")
-        self.fade_in_spin.connect("value-changed", self._on_fade_changed)
-        fade_in_row.append(self.fade_in_spin)
-        fade_in_row.append(Gtk.Label(label="seconds"))
-        right.append(fade_in_row)
-        fade_out_row = Gtk.Box(spacing=8)
-        self.fade_out_check = Gtk.CheckButton(label="Fade out")
-        self.fade_out_check.set_tooltip_text(
-            "Opacity/gain 1→0 at the end of this clip (not a cut transition)"
-        )
-        self.fade_out_check.connect("toggled", self._on_fade_changed)
-        fade_out_row.append(self.fade_out_check)
-        self.fade_out_spin = Gtk.SpinButton.new_with_range(MIN_FADE_S, MAX_FADE_S, 0.05)
-        self.fade_out_spin.set_digits(2)
-        self.fade_out_spin.set_value(DEFAULT_FADE_S)
-        self.fade_out_spin.set_tooltip_text(f"{MIN_FADE_S}–{MAX_FADE_S} seconds")
-        self.fade_out_spin.connect("value-changed", self._on_fade_changed)
-        fade_out_row.append(self.fade_out_spin)
-        fade_out_row.append(Gtk.Label(label="seconds"))
-        right.append(fade_out_row)
-        self.fade_hint = self._wrapping_label("")
-        right.append(self.fade_hint)
-
-        right.append(self._section("Transition after this clip"))
-        self.transition_type = Gtk.DropDown.new_from_strings(
-            ["None", "Dissolve", "White flash"]
-        )
-        self.transition_type.set_tooltip_text(
-            "Applies into the next touching video segment; gaps stay hard cuts"
-        )
-        self.transition_type.connect("notify::selected", self._on_transition_changed)
-        right.append(self.transition_type)
-        transition_dur = Gtk.Box(spacing=8)
-        transition_dur.append(Gtk.Label(label="Duration"))
-        self.transition_spin = Gtk.SpinButton.new_with_range(0.1, 3.0, 0.05)
-        self.transition_spin.set_digits(2)
-        self.transition_spin.set_value(0.5)
-        self.transition_spin.set_tooltip_text("0.1–3.0 seconds")
-        self.transition_spin.connect("value-changed", self._on_transition_changed)
-        transition_dur.append(self.transition_spin)
-        transition_dur.append(Gtk.Label(label="seconds"))
-        right.append(transition_dur)
-        self.transition_hint = self._wrapping_label("")
-        right.append(self.transition_hint)
-        self.cache_hint = self._wrapping_label(
-            "Green = rendered preview; red = raw timeline. Play (Space) starts immediately. "
-            "Render Preview (:rp) bakes transitions."
-        )
-        self.cache_hint.add_css_class("dim-label")
-        right.append(self.cache_hint)
-        self.btn_preview_cancel = Gtk.Button(label="Cancel render")
-        self.btn_preview_cancel.set_sensitive(False)
-        self.btn_preview_cancel.connect("clicked", self._on_cancel_preview_render)
-        right.append(self.btn_preview_cancel)
-        self.compiled_preview_label = self._wrapping_label("")
-        self.compiled_preview_label.add_css_class("dim-label")
-        right.append(self.compiled_preview_label)
-        self.video_label = self._wrapping_label("none")
-        right.append(self.video_label)
-
-        right.append(self._section("Position / scale selected clip"))
-        transform = Gtk.Grid(column_spacing=8, row_spacing=6)
-        self.transform_x_spin = Gtk.SpinButton.new_with_range(-4096, 4096, 1)
-        self.transform_y_spin = Gtk.SpinButton.new_with_range(-4096, 4096, 1)
-        self.transform_scale_spin = Gtk.SpinButton.new_with_range(1.0, 4.0, 0.05)
-        self.transform_x_spin.set_digits(0)
-        self.transform_y_spin.set_digits(0)
-        self.transform_scale_spin.set_digits(2)
-        self.transform_scale_spin.set_value(1.0)
-        for row_i, (label, spin) in enumerate(
-            (
-                ("X", self.transform_x_spin),
-                ("Y", self.transform_y_spin),
-                ("Scale", self.transform_scale_spin),
-            )
-        ):
-            transform.attach(Gtk.Label(label=label, xalign=0), 0, row_i, 1, 1)
-            transform.attach(spin, 1, row_i, 1, 1)
-            spin.connect("value-changed", self._on_transform_changed)
-        self.transform_x_spin.set_tooltip_text(
-            "Move the source clip left or right within the project frame."
-        )
-        self.transform_y_spin.set_tooltip_text(
-            "Move the source clip up or down within the project frame."
-        )
-        self.transform_scale_spin.set_tooltip_text(
-            "Zoom the source clip. 1.00 fills the project frame."
-        )
-        self.btn_transform_reset = Gtk.Button(label="Reset")
-        self.btn_transform_reset.connect("clicked", self._on_transform_reset)
-        transform.attach(self.btn_transform_reset, 2, 0, 1, 3)
-        right.append(transform)
-
-        right.append(self._section("Speed"))
-        speed_row = Gtk.Box(spacing=8)
-        speed_row.append(Gtk.Label(label="Rate", xalign=0))
-        self.speed_spin = Gtk.SpinButton.new_with_range(MIN_SPEED, MAX_SPEED, 0.05)
-        self.speed_spin.set_digits(2)
-        self.speed_spin.set_value(DEFAULT_SPEED)
-        self.speed_spin.set_tooltip_text(
-            "Playback rate for the selected clip(s). "
-            "Faster shortens the timeline; slower lengthens it. "
-            "Export audio pitch follows rate (atempo)."
-        )
-        self.speed_spin.connect("value-changed", self._on_speed_changed)
-        speed_row.append(self.speed_spin)
-        speed_row.append(Gtk.Label(label="×"))
-        self.btn_speed_reset = Gtk.Button(label="1×")
-        self.btn_speed_reset.set_tooltip_text("Reset selected clip(s) to 1×")
-        self.btn_speed_reset.connect("clicked", self._on_speed_reset)
-        speed_row.append(self.btn_speed_reset)
-        right.append(speed_row)
-        self.speed_hint = self._wrapping_label("")
-        self.speed_hint.add_css_class("dim-label")
-        right.append(self.speed_hint)
-
-        right.append(self._section("Audio"))
-        row = Gtk.Box(spacing=8)
-        self.btn_open_audio = Gtk.Button(label="Add audio")
-        self.btn_open_audio.connect("clicked", lambda *_: self._pick("audio"))
-        row.append(self.btn_open_audio)
-        self.btn_fit = Gtk.Button(label="Fit")
-        self.btn_fit.set_sensitive(False)
-        self.btn_fit.set_tooltip_text("Cut the music to the video length")
-        self.btn_fit.connect("clicked", self._on_fit)
-        row.append(self.btn_fit)
-        self.btn_clear_audio = Gtk.Button(label="Clear")
-        self.btn_clear_audio.set_sensitive(False)
-        self.btn_clear_audio.connect("clicked", self._on_clear_audio)
-        row.append(self.btn_clear_audio)
-        right.append(row)
-        self.audio_label = self._wrapping_label(
-            "none — keeps the video’s audio if it has one"
-        )
-        right.append(self.audio_label)
-        self.follow_in = Gtk.CheckButton(label="Audio follows video in-point")
-        self.follow_in.connect("toggled", self._on_follow_in)
-        right.append(self.follow_in)
-
-        right.append(self._section("Audio mix"))
-        self.audio_volume_spins = {}
-        for key, label in (("clip", "Selected clip %"), (1, "A1 volume %"), (2, "A2 volume %")):
-            row = Gtk.Box(spacing=8)
-            row.append(Gtk.Label(label=label, xalign=0))
-            spin = Gtk.SpinButton.new_with_range(0, 200, 1)
-            spin.set_value(100)
-            spin.set_tooltip_text("0 = mute; 100 = original level. Clip and track volumes multiply.")
-            spin.connect("value-changed", self._on_audio_volume_changed, key)
-            self.audio_volume_spins[key] = spin
-            row.append(spin)
-            right.append(row)
-
-        right.append(self._section("Aspect"))
-        aspects = Gtk.Box(spacing=6)
-        self.aspect_buttons: dict[str, Gtk.ToggleButton] = {}
-        group = None
-        for name in ASPECTS:
-            tb = Gtk.ToggleButton(label=name)
-            if group is None:
-                group = tb
-            else:
-                tb.set_group(group)
-            if name == "9:16":
-                tb.set_active(True)
-            tb.connect("toggled", self._on_aspect, name)
-            self.aspect_buttons[name] = tb
-            aspects.append(tb)
-        right.append(aspects)
-
-        right.append(self._section("Resolution"))
-        resolutions = Gtk.Box(spacing=6)
-        self.resolution_buttons: dict[str, Gtk.ToggleButton] = {}
-        res_group = None
-        for name in RESOLUTIONS:
-            label = name.capitalize()
-            tb = Gtk.ToggleButton(label=label)
-            if res_group is None:
-                res_group = tb
-            else:
-                tb.set_group(res_group)
-            if name == DEFAULT_RESOLUTION:
-                tb.set_active(True)
-            tb.connect("toggled", self._on_resolution, name)
-            self.resolution_buttons[name] = tb
-            resolutions.append(tb)
-        right.append(resolutions)
-        self.resolution_size_label = self._wrapping_label("")
-        right.append(self.resolution_size_label)
-        self._refresh_resolution_label()
-
-        right.append(self._section("Trim"))
-        trim = Gtk.Box(spacing=8)
-        trim.append(Gtk.Label(label="In"))
-        self.in_spin = Gtk.SpinButton.new_with_range(0, 99999, 0.05)
-        self.in_spin.set_digits(2)
-        self.in_spin.connect("value-changed", self._on_trim_spin_changed)
-        trim.append(self.in_spin)
-        trim.append(Gtk.Label(label="Out"))
-        self.out_spin = Gtk.SpinButton.new_with_range(0, 99999, 0.05)
-        self.out_spin.set_digits(2)
-        self.out_spin.connect("value-changed", self._on_trim_spin_changed)
-        trim.append(self.out_spin)
-        right.append(trim)
-        row = Gtk.Box(spacing=8)
-        b = Gtk.Button(label="Set in at playhead")
-        b.connect("clicked", self._set_in)
-        row.append(b)
-        b = Gtk.Button(label="Set out at playhead")
-        b.connect("clicked", self._set_out)
-        row.append(b)
-        right.append(row)
-
-        right.append(self._section("Export"))
-        self.export_name = self._wrapping_label("name is assigned on export (.mp4)")
-        self.export_name.add_css_class("dim-label")
-        right.append(self.export_name)
-        self.btn_export = Gtk.Button(label="Export")
-        self.btn_export.add_css_class("suggested-action")
+        self.btn_export = self._hint("e", "export", self._on_export)
         self.btn_export.set_sensitive(False)
-        self.btn_export.connect("clicked", self._on_export)
-        right.append(self.btn_export)
-        self.progress = Gtk.ProgressBar()
-        right.append(self.progress)
-        self.status = self._wrapping_label("")
-        self.status.add_css_class("dim-label")
-        right.append(self.status)
 
-        right.append(self._section("Media"))
-        self.media_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        right.append(self.media_list)
-        self._install_drop(self.media_list)
-
-        scroller = Gtk.ScrolledWindow()
-        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scroller.set_propagate_natural_width(True)
-        scroller.set_min_content_width(320)
-        scroller.set_hexpand(False)
-        scroller.set_hexpand_set(True)
-        scroller.set_child(right)
-
-        root.append(left)
-        root.append(scroller)
+        self._panes: list[Gtk.Frame] = []
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        root.set_margin_top(10)
+        root.set_margin_bottom(4)
+        root.set_margin_start(4)
+        root.set_margin_end(4)
+        root.append(self._build_preview_pane())
+        root.append(self._build_timeline_pane())
+        root.append(self._build_media_pane())
+        root.append(self._build_statusline())
+        self._build_popovers()
+        self.connect("notify::focus-widget", lambda *_: self._sync_pane_focus())
         toolbar.set_content(root)
         self.set_content(toolbar)
         self._closed = False
+        on_theme_change(self._on_theme_change)
         self._shutdown_handler = 0
         self.connect("close-request", self._on_close)
         application = self.get_application()
@@ -2576,6 +2702,10 @@ class EditorWindow(Adw.ApplicationWindow):
             self._exit_keyboard_mode()
             self.timeline.move_navigation_track(delta)
             return True
+        if keyval == Gdk.KEY_plus and not ctrl:
+            # "+" is Shift+= on most layouts, so it cannot wait for the no-modifier block.
+            self.timeline.zoom_view(1.5)
+            return True
         if mods:
             return False
         if keyval in (Gdk.KEY_Escape,):
@@ -2592,6 +2722,26 @@ class EditorWindow(Adw.ApplicationWindow):
             if not self._guard_edit("split"):
                 return True
             self._split_selected_clip()
+            return True
+        if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            self._open_clip_popover()
+            return True
+        if keyval == Gdk.KEY_z:
+            if self.btn_safe_zones.get_sensitive():
+                self.btn_safe_zones.set_active(not self.btn_safe_zones.get_active())
+            return True
+        if keyval == Gdk.KEY_e:
+            if self.btn_export.get_sensitive():
+                self._on_export()
+            return True
+        if keyval in (Gdk.KEY_minus, Gdk.KEY_KP_Subtract):
+            self.timeline.zoom_view(1 / 1.5)
+            return True
+        if keyval == Gdk.KEY_KP_Add:
+            self.timeline.zoom_view(1.5)
+            return True
+        if keyval == Gdk.KEY_equal:
+            self.timeline.fit_view()
             return True
         if keyval not in (Gdk.KEY_space, Gdk.KEY_KP_Space):
             return False
@@ -2636,6 +2786,8 @@ class EditorWindow(Adw.ApplicationWindow):
             self.keyboard_increments[self.keyboard_mode] = self.keyboard_increment
         self.keyboard_mode = ""
         self.keyboard_hint.set_text("")
+        self.keyboard_hint.set_visible(False)
+        self.mode_label.set_text("NORMAL")
 
     def _show_keyboard_mode(self) -> None:
         kind, clips, primary, selected = self._keyboard_target()
@@ -2655,9 +2807,11 @@ class EditorWindow(Adw.ApplicationWindow):
                 increment = f"1 frame ({self._keyboard_fps():g} fps grid)"
             elif self.keyboard_increment == "clip":
                 increment = "clip edges"
+        self.mode_label.set_text(self.keyboard_mode.upper())
+        self.keyboard_hint.set_visible(True)
         self.keyboard_hint.set_text(
-            f"{self.keyboard_mode.upper()} · {kind[:1].upper()}{self.timeline.nav_track} · "
-            f"{target} · {increment} · h/l earlier/later · ↑/↓ increment · Esc exits")
+            f"{kind[:1].upper()}{self.timeline.nav_track} · "
+            f"{target} · {increment} · h/l earlier/later · ↑/↓ increment · esc exits")
 
     def _change_keyboard_increment(self, direction: int) -> None:
         ladder = MOVE_INCREMENTS[:3] if self.keyboard_mode.startswith("trim") else MOVE_INCREMENTS
@@ -2982,7 +3136,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.video_info = None
         self.preview.set_pixbuf(None)
         self.preview.set_media(None)
-        self.video_label.set_text("none")
+        self.video_label.set_text("no clip selected")
         self.btn_play.set_sensitive(False)
         self.btn_export.set_sensitive(False)
         self.clock.set_text("0.00 / 0.00")
@@ -3002,7 +3156,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.btn_clear_audio.set_sensitive(False)
         self.btn_fit.set_sensitive(False)
         self.btn_fit.set_label("Fit")
-        self.audio_label.set_text("none — keeps the video’s audio if it has one")
+        self.audio_label.set_text("no music")
         self.audio_start = 0.0
         self.audio_in = 0.0
         self.audio_out = None
@@ -3013,6 +3167,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self._refresh_media()
 
     def _install_media_list(self, items: list[MediaItem]) -> None:
+        self._clear_visuals()
         self.media = []
         self.media_info = {}
         self.media_thumbs = {}
@@ -3028,6 +3183,7 @@ class EditorWindow(Adw.ApplicationWindow):
             except ProbeError:
                 continue
             self.media_info[src.id] = info
+            self._queue_visuals(src.id)
             if src.kind == "video":
                 try:
                     self.media_thumbs[src.id] = _load_frame(src.path)
@@ -3055,7 +3211,6 @@ class EditorWindow(Adw.ApplicationWindow):
             if getattr(proj, "resolution", DEFAULT_RESOLUTION) in self.resolution_buttons:
                 self.resolution = proj.resolution
                 self.resolution_buttons[proj.resolution].set_active(True)
-                self._refresh_resolution_label()
             self.preview.pan_x = min(1.0, max(0.0, proj.pan_x))
             self.preview.pan_y = min(1.0, max(0.0, proj.pan_y))
             self.preview.queue_draw()
@@ -3197,6 +3352,7 @@ class EditorWindow(Adw.ApplicationWindow):
         return store
 
     def _clear_session(self) -> None:
+        self._clear_visuals()
         self._abandon_preview_render()
         self._stop()
         self._reset_compiled_preview_flags()
@@ -3215,7 +3371,6 @@ class EditorWindow(Adw.ApplicationWindow):
         med = self.resolution_buttons.get(DEFAULT_RESOLUTION)
         if med is not None:
             med.set_active(True)
-        self._refresh_resolution_label()
         if nine is not None and not nine.get_active():
             nine.set_active(True)
         self.preview.pan_x = 0.5
@@ -3239,7 +3394,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.sel_vs: set[int] = set()
         self.sel_as: set[int] = set()
         self.sel_kind = ""
-        self.btn_play.set_label("Play")
+        self.btn_play.text_label.set_text("play")
         self.progress.set_fraction(0)
         self.timeline.set_clips()
         self.timeline.set_playhead(0)
@@ -3338,6 +3493,727 @@ class EditorWindow(Adw.ApplicationWindow):
 
         dialog.save(self, None, done)
 
+    # ── Building blocks ──────────────────────────────────────────────────
+
+    def _hint(
+        self,
+        key: str,
+        text: str,
+        on_click=None,  # noqa: ANN001
+        *,
+        toggle: bool = False,
+        tooltip: str = "",
+    ) -> Gtk.Button:
+        """A key hint (`key` in the key color, then `text`) that is also a button."""
+        btn: Gtk.Button = Gtk.ToggleButton() if toggle else Gtk.Button()
+        btn.add_css_class("hint")
+        box = Gtk.Box(spacing=6)
+        if key:
+            k = Gtk.Label(label=key)
+            k.add_css_class("key")
+            box.append(k)
+        t = Gtk.Label(label=text)
+        box.append(t)
+        btn.set_child(box)
+        btn.text_label = t  # type: ignore[attr-defined]
+        if tooltip:
+            btn.set_tooltip_text(tooltip)
+        if on_click is not None:
+            btn.connect("toggled" if toggle else "clicked", lambda *_: on_click())
+        return btn
+
+    def _pane(self, name: str, *title_parts: Gtk.Widget) -> tuple[Gtk.Frame, Gtk.Box]:
+        """Bordered pane with `name` and key hints set into the top border."""
+        title = Gtk.Box(spacing=4)
+        title.add_css_class("pane-title")
+        lab = Gtk.Label(label=name)
+        lab.add_css_class("pane-name")
+        title.append(lab)
+        for part in title_parts:
+            title.append(part)
+        frame = Gtk.Frame()
+        frame.add_css_class("pane")
+        frame.set_label_widget(title)
+        frame.set_label_align(0.0)
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        body.set_margin_top(4)
+        body.set_margin_bottom(8)
+        body.set_margin_start(10)
+        body.set_margin_end(10)
+        frame.set_child(body)
+        self._panes.append(frame)
+        return frame, body
+
+    def _sync_pane_focus(self) -> None:
+        focus = self.get_focus()
+        for pane in self._panes:
+            inside = focus is not None and (focus is pane or focus.is_ancestor(pane))
+            if inside:
+                pane.add_css_class("focused")
+            else:
+                pane.remove_css_class("focused")
+
+    @staticmethod
+    def _dim(text: str) -> Gtk.Label:
+        lab = Gtk.Label(label=text, xalign=0)
+        lab.add_css_class("dim")
+        return lab
+
+    # ── Panes ────────────────────────────────────────────────────────────
+
+    def _build_preview_pane(self) -> Gtk.Widget:
+        self.aspect_buttons: dict[str, Gtk.ToggleButton] = {}
+        aspects = Gtk.Box()
+        group = None
+        for name in ASPECTS:
+            tb = Gtk.ToggleButton(label=name)
+            tb.add_css_class("hint")
+            tb.add_css_class("choice")
+            if group is None:
+                group = tb
+            else:
+                tb.set_group(group)
+            if name == "9:16":
+                tb.set_active(True)
+            tb.connect("toggled", self._on_aspect, name)
+            self.aspect_buttons[name] = tb
+            aspects.append(tb)
+        self.resolution_buttons: dict[str, Gtk.ToggleButton] = {}
+        resolutions = Gtk.Box()
+        res_group = None
+        for name in RESOLUTIONS:
+            tb = Gtk.ToggleButton(label=name)
+            tb.add_css_class("hint")
+            tb.add_css_class("choice")
+            if res_group is None:
+                res_group = tb
+            else:
+                tb.set_group(res_group)
+            if name == DEFAULT_RESOLUTION:
+                tb.set_active(True)
+            tb.connect("toggled", self._on_resolution, name)
+            self.resolution_buttons[name] = tb
+            resolutions.append(tb)
+        self.btn_safe_zones = self._hint(
+            "z", "safe zones off", lambda: self._on_safe_zones(self.btn_safe_zones),
+            toggle=True,
+            tooltip="Shade where TikTok, Reels and Shorts draw captions and buttons (9:16 only)",
+        )
+        frame, body = self._pane(
+            "preview", aspects, self._dim("·"), resolutions, self._dim("·"), self.btn_safe_zones
+        )
+        frame.set_vexpand(True)
+
+        self.aspect_frame = Gtk.AspectFrame(ratio=9 / 16, obey_child=False)
+        self.aspect_frame.set_hexpand(True)
+        self.aspect_frame.set_vexpand(True)
+        self.preview = CoverPreview()
+        self.preview.on_pan = self._refresh_crop
+        self.preview.on_pan_end = self._on_preview_pan_end
+        self.preview.on_scale = self._on_preview_scale
+        self.aspect_frame.set_child(self.preview)
+        body.append(self.aspect_frame)
+
+        transport = Gtk.Box(spacing=6)
+        self.clock = Gtk.Label(label="0.00 / 0.00", xalign=0)
+        self.clock.add_css_class("clock")
+        transport.append(self.clock)
+        self.compiled_preview_label = Gtk.Label(xalign=0)
+        self.compiled_preview_label.add_css_class("dim")
+        self.compiled_preview_label.set_hexpand(True)
+        self.compiled_preview_label.set_ellipsize(Pango.EllipsizeMode.END)
+        transport.append(self.compiled_preview_label)
+        self.btn_play = self._hint("␣", "play", self._on_play, tooltip="Play / pause (Space)")
+        self.btn_play.set_sensitive(False)
+        transport.append(self.btn_play)
+        self.btn_split = self._hint(
+            "t", "split", self._split_selected_clip,
+            tooltip="Split the selected clip at the playhead",
+        )
+        transport.append(self.btn_split)
+        self.btn_render_preview = self._hint(
+            ":rp", "render", self._on_render_preview,
+            tooltip="Render the timeline with transitions baked in. The bar above the "
+            "tracks turns green where the render is current; red parts play from "
+            "the raw clips.",
+        )
+        transport.append(self.btn_render_preview)
+        self.btn_preview_cancel = self._hint("", "cancel render", self._on_cancel_preview_render)
+        self.btn_preview_cancel.set_sensitive(False)
+        self.btn_preview_cancel.set_visible(False)
+        transport.append(self.btn_preview_cancel)
+        self.crop_label = Gtk.Label(xalign=1)
+        self.crop_label.add_css_class("dim")
+        self.crop_label.set_ellipsize(Pango.EllipsizeMode.START)
+        transport.append(self.crop_label)
+        body.append(transport)
+        return frame
+
+    def _build_timeline_pane(self) -> Gtk.Widget:
+        self.btn_clip_settings = self._hint(
+            "⏎", "clip", lambda: self._open_clip_popover(),
+            tooltip="Exact values for the selected clip (Enter or double-click)",
+        )
+        self.btn_timeline_zoom_out = self._hint(
+            "-", "", lambda: self.timeline.zoom_view(1 / 1.5), tooltip="Zoom out"
+        )
+        self.btn_timeline_zoom_in = self._hint(
+            "+", "zoom", lambda: self.timeline.zoom_view(1.5), tooltip="Zoom in"
+        )
+        self.btn_timeline_fit = self._hint(
+            "=", "fit", lambda: self.timeline.fit_view(), tooltip="Fit the whole timeline"
+        )
+        # h/l and j/k only work from the keyboard, so their hints are labels.
+        clip_nav = self._hint("h/l", "clip")
+        track_nav = self._hint("j/k", "track")
+        for hint in (clip_nav, track_nav):
+            hint.set_can_target(False)
+            hint.set_focusable(False)
+        frame, body = self._pane(
+            "timeline",
+            clip_nav,
+            track_nav,
+            self.btn_clip_settings,
+            self._dim("·"),
+            self.btn_timeline_zoom_out,
+            self.btn_timeline_zoom_in,
+            self.btn_timeline_fit,
+        )
+
+        self.timeline = Timeline()
+        focus = Gtk.EventControllerFocus()
+        focus.connect("leave", lambda *_: self._exit_keyboard_mode())
+        self.timeline.add_controller(focus)
+        self.timeline.on_seek = self._on_timeline_seek
+        self.timeline.on_video_move = self._on_video_move
+        self.timeline.on_audio_move = self._on_audio_move
+        self.timeline.on_video_trim = self._on_video_trim
+        self.timeline.on_audio_trim = self._on_audio_trim
+        self.timeline.on_track_change = self._on_track_change
+        self.timeline.on_navigation_track_change = self._on_navigation_track_change
+        self.timeline.on_place = self._place_clip
+        self.timeline.on_select = self._on_clip_select
+        self.timeline.on_fade = self._on_timeline_fade
+        self.timeline.on_volume = self._on_timeline_volume
+        self.timeline.on_transition = self._on_timeline_transition
+        self.timeline.on_activate = self._on_timeline_activate
+        self.timeline_scroll = Gtk.ScrolledWindow()
+        self.timeline_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        self.timeline_scroll.set_hexpand(True)
+        self.timeline_scroll.set_vexpand(False)
+        self.timeline_scroll.set_min_content_height(Timeline._HEIGHT)
+        self.timeline_scroll.set_child(self.timeline)
+        self.timeline_scroll.connect("notify::width", lambda *_: self.timeline._sync_canvas())
+        body.append(self.timeline_scroll)
+        return frame
+
+    def _build_media_pane(self) -> Gtk.Widget:
+        self.btn_open_video = self._hint("+", "video", lambda: self._pick("video"))
+        self.btn_open_audio = self._hint("+", "audio", lambda: self._pick("audio"))
+        frame, body = self._pane(
+            "media", self.btn_open_video, self.btn_open_audio,
+            self._dim("· drag onto a track"),
+        )
+        row = Gtk.Box(spacing=10)
+        self.media_list = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        media_scroll = Gtk.ScrolledWindow()
+        media_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        media_scroll.set_hexpand(True)
+        media_scroll.set_propagate_natural_height(True)
+        media_scroll.set_child(self.media_list)
+        row.append(media_scroll)
+        self._install_drop(self.media_list)
+
+        music = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        music.set_valign(Gtk.Align.CENTER)
+        self.audio_label = Gtk.Label(label="no music", xalign=0)
+        self.audio_label.add_css_class("dim")
+        self.audio_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        self.audio_label.set_max_width_chars(28)
+        music.append(self.audio_label)
+        buttons = Gtk.Box()
+        self.btn_fit = Gtk.Button(label="fit")
+        self.btn_fit.add_css_class("hint")
+        self.btn_fit.set_sensitive(False)
+        self.btn_fit.set_tooltip_text("Cut the music to the video length")
+        self.btn_fit.connect("clicked", self._on_fit)
+        buttons.append(self.btn_fit)
+        self.btn_clear_audio = Gtk.Button(label="clear")
+        self.btn_clear_audio.add_css_class("hint")
+        self.btn_clear_audio.set_sensitive(False)
+        self.btn_clear_audio.connect("clicked", self._on_clear_audio)
+        buttons.append(self.btn_clear_audio)
+        self.follow_in = Gtk.CheckButton(label="follow in-point")
+        self.follow_in.set_tooltip_text("Start the music at the video's in-point")
+        self.follow_in.connect("toggled", self._on_follow_in)
+        buttons.append(self.follow_in)
+        music.append(buttons)
+        row.append(music)
+        body.append(row)
+        return frame
+
+    def _build_statusline(self) -> Gtk.Widget:
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.command_revealer = Gtk.Revealer()
+        self.command_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_UP)
+        command_box = Gtk.Box(spacing=6)
+        command_box.add_css_class("commandline")
+        colon = Gtk.Label(label=":")
+        colon.add_css_class("key")
+        command_box.append(colon)
+        self.command_entry = Gtk.Entry()
+        self.command_entry.set_hexpand(True)
+        self.command_entry.set_placeholder_text("r916  r43  rp")
+        self.command_entry.connect("activate", self._on_command_activate)
+        command_keys = Gtk.EventControllerKey()
+        command_keys.connect("key-pressed", self._on_command_key_pressed)
+        self.command_entry.add_controller(command_keys)
+        command_box.append(self.command_entry)
+        self.command_revealer.set_child(command_box)
+        outer.append(self.command_revealer)
+
+        line = Gtk.Box()
+        line.add_css_class("statusline")
+        self.mode_label = Gtk.Label(label="NORMAL")
+        self.mode_label.add_css_class("mode")
+        line.append(self.mode_label)
+        self.keyboard_hint = Gtk.Label(xalign=0)
+        self.keyboard_hint.add_css_class("seg")
+        self.keyboard_hint.set_ellipsize(Pango.EllipsizeMode.END)
+        self.keyboard_hint.set_visible(False)
+        line.append(self.keyboard_hint)
+        self.status = Gtk.Label(xalign=0)
+        self.status.add_css_class("seg")
+        self.status.set_hexpand(True)
+        self.status.set_ellipsize(Pango.EllipsizeMode.END)
+        line.append(self.status)
+        self.progress = Gtk.ProgressBar()
+        self.progress.add_css_class("thin")
+        self.progress.set_valign(Gtk.Align.CENTER)
+        self.progress.set_size_request(80, -1)
+        line.append(self.progress)
+        self.export_name = Gtk.Label(label="name is assigned on export", xalign=0)
+        self.export_name.add_css_class("dim")
+        self.export_name.set_ellipsize(Pango.EllipsizeMode.START)
+        self.export_name.set_max_width_chars(36)
+        line.append(self.export_name)
+        line.append(self.btn_export)
+        menu = Gio.Menu()
+        file_menu = Gio.Menu()
+        file_menu.append("New", "win.new-project")
+        file_menu.append("Open project…", "win.open-project")
+        file_menu.append("Save", "win.save")
+        file_menu.append("Save As…", "win.save-as")
+        edit_menu = Gio.Menu()
+        edit_menu.append("Undo", "win.undo")
+        edit_menu.append("Redo", "win.redo")
+        menu.append_section(None, file_menu)
+        menu.append_section(None, edit_menu)
+        mb = Gtk.MenuButton(label="project")
+        mb.add_css_class("hint")
+        mb.set_menu_model(menu)
+        mb.set_tooltip_text("New, open, save (Ctrl+N / Ctrl+O / Ctrl+S)")
+        line.append(mb)
+        outer.append(line)
+        return outer
+
+    # ── Popovers: exact values ───────────────────────────────────────────
+
+    def _popover_grid(self) -> tuple[Gtk.Popover, Gtk.Grid]:
+        pop = Gtk.Popover()
+        pop.add_css_class("clip-pop")
+        pop.set_has_arrow(False)
+        pop.set_autohide(True)
+        pop.set_parent(self.timeline)
+        pop.connect("closed", self._on_popover_closed)
+        grid = Gtk.Grid(column_spacing=10, row_spacing=6)
+        pop.set_child(grid)
+        return pop, grid
+
+    def _on_popover_closed(self, _popover) -> None:
+        if not any(p.get_visible() for p in (self.clip_popover, self.transition_popover)):
+            self.timeline.grab_focus()
+
+    def _build_popovers(self) -> None:
+        self.clip_popover, grid = self._popover_grid()
+        rows = iter(range(1000))
+
+        def field(label: str | Gtk.Widget, *widgets: Gtk.Widget) -> None:
+            row = next(rows)
+            if isinstance(label, str):
+                label = self._dim(label)
+            grid.attach(label, 0, row, 1, 1)
+            box = Gtk.Box(spacing=6)
+            for w in widgets:
+                box.append(w)
+            grid.attach(box, 1, row, 1, 1)
+
+        def note(widget: Gtk.Widget) -> None:
+            grid.attach(widget, 0, next(rows), 2, 1)
+
+        def wrap_dim(text: str = "") -> Gtk.Label:
+            lab = self._wrapping_label(text)
+            lab.add_css_class("dim")
+            lab.set_selectable(False)
+            return lab
+
+        self.video_label = self._wrapping_label("no clip selected")
+        self.video_label.add_css_class("pane-name")
+        self.video_label.set_selectable(False)
+        self.clip_title = self._wrapping_label("no clip selected")
+        self.clip_title.add_css_class("pane-name")
+        self.clip_title.set_selectable(False)
+        note(self.clip_title)
+
+        self.in_spin = Gtk.SpinButton.new_with_range(0, 99999, 0.05)
+        self.in_spin.set_digits(2)
+        self.in_spin.connect("value-changed", self._on_trim_spin_changed)
+        self.out_spin = Gtk.SpinButton.new_with_range(0, 99999, 0.05)
+        self.out_spin.set_digits(2)
+        self.out_spin.connect("value-changed", self._on_trim_spin_changed)
+        self.clip_in_spin = Gtk.SpinButton.new_with_range(0, 99999, 0.05)
+        self.clip_out_spin = Gtk.SpinButton.new_with_range(0, 99999, 0.05)
+        for spin in (self.clip_in_spin, self.clip_out_spin):
+            spin.set_digits(2)
+            spin.connect("value-changed", self._on_clip_trim_changed)
+        self.clip_set_in = self._hint("", "← playhead", lambda: self._set_clip_bound(True),
+                                      tooltip="Set this clip's in-point to the playhead")
+        self.clip_set_out = self._hint("", "← playhead", lambda: self._set_clip_bound(False),
+                                       tooltip="Set this clip's out-point to the playhead")
+        field("in", self.clip_in_spin, self.clip_set_in)
+        field("out", self.clip_out_spin, self.clip_set_out)
+
+        self.speed_spin = Gtk.SpinButton.new_with_range(MIN_SPEED, MAX_SPEED, 0.05)
+        self.speed_spin.set_digits(2)
+        self.speed_spin.set_value(DEFAULT_SPEED)
+        self.speed_spin.set_tooltip_text(
+            "Playback rate. Faster shortens the clip on the timeline; slower lengthens it."
+        )
+        self.speed_spin.connect("value-changed", self._on_speed_changed)
+        self.btn_speed_reset = self._hint("", "1×", self._on_speed_reset,
+                                          tooltip="Reset to normal speed")
+        field("speed", self.speed_spin, self._dim("×"), self.btn_speed_reset)
+        self.speed_hint = wrap_dim()
+        note(self.speed_hint)
+
+        self.transform_x_spin = Gtk.SpinButton.new_with_range(-4096, 4096, 1)
+        self.transform_y_spin = Gtk.SpinButton.new_with_range(-4096, 4096, 1)
+        self.transform_scale_spin = Gtk.SpinButton.new_with_range(1.0, 4.0, 0.05)
+        self.transform_scale_spin.set_digits(2)
+        self.transform_scale_spin.set_value(1.0)
+        self.transform_scale_spin.set_tooltip_text(
+            "1.00 fills the frame. Scroll on the preview to change it."
+        )
+        for spin in (self.transform_x_spin, self.transform_y_spin, self.transform_scale_spin):
+            spin.connect("value-changed", self._on_transform_changed)
+        self.btn_transform_reset = self._hint("", "reset", self._on_transform_reset)
+        field("x / y", self.transform_x_spin, self.transform_y_spin)
+        field("scale", self.transform_scale_spin, self._dim("×"), self.btn_transform_reset)
+
+        self.fade_in_check = Gtk.CheckButton(label="in")
+        self.fade_in_check.connect("toggled", self._on_fade_changed)
+        self.fade_in_spin = Gtk.SpinButton.new_with_range(MIN_FADE_S, MAX_FADE_S, 0.05)
+        self.fade_in_spin.set_digits(2)
+        self.fade_in_spin.set_value(DEFAULT_FADE_S)
+        self.fade_in_spin.connect("value-changed", self._on_fade_changed)
+        self.fade_out_check = Gtk.CheckButton(label="out")
+        self.fade_out_check.connect("toggled", self._on_fade_changed)
+        self.fade_out_spin = Gtk.SpinButton.new_with_range(MIN_FADE_S, MAX_FADE_S, 0.05)
+        self.fade_out_spin.set_digits(2)
+        self.fade_out_spin.set_value(DEFAULT_FADE_S)
+        self.fade_out_spin.connect("value-changed", self._on_fade_changed)
+        field("fade", self.fade_in_check, self.fade_in_spin)
+        field("", self.fade_out_check, self.fade_out_spin)
+        self.fade_hint = wrap_dim()
+        note(self.fade_hint)
+
+        self.audio_volume_spins = {}
+        for key, label in (("clip", "volume"), (1, "A1 track"), (2, "A2 track")):
+            spin = Gtk.SpinButton.new_with_range(0, 200, 1)
+            spin.set_value(100)
+            spin.set_tooltip_text("0 mutes, 100 is the original level. Clip and track volumes multiply.")
+            spin.connect("value-changed", self._on_audio_volume_changed, key)
+            self.audio_volume_spins[key] = spin
+            field(label, spin, self._dim("%"))
+        note(self._dim("esc closes"))
+
+        self.transition_popover, tgrid = self._popover_grid()
+        self.transition_type = Gtk.DropDown.new_from_strings(["None", "Dissolve", "White flash"])
+        self.transition_type.connect("notify::selected", self._on_transition_changed)
+        self.transition_spin = Gtk.SpinButton.new_with_range(0.1, 3.0, 0.05)
+        self.transition_spin.set_digits(2)
+        self.transition_spin.set_value(0.5)
+        self.transition_spin.connect("value-changed", self._on_transition_changed)
+        heading = Gtk.Label(label="transition to next clip", xalign=0)
+        heading.add_css_class("pane-name")
+        tgrid.attach(heading, 0, 0, 2, 1)
+        tgrid.attach(self._dim("type"), 0, 1, 1, 1)
+        tgrid.attach(self.transition_type, 1, 1, 1, 1)
+        tgrid.attach(self._dim("length"), 0, 2, 1, 1)
+        length = Gtk.Box(spacing=6)
+        length.append(self.transition_spin)
+        length.append(self._dim("s"))
+        tgrid.attach(length, 1, 2, 1, 1)
+        self.transition_hint = wrap_dim()
+        tgrid.attach(self.transition_hint, 0, 3, 2, 1)
+
+    def _trim_target(self) -> tuple[str, int, ClipInst | None]:
+        kind = self._selected_clip_kind()
+        index = self.sel_v if kind == "video" else self.sel_a
+        clips = self.video_clips if kind == "video" else self.audio_clips
+        if kind and 0 <= index < len(clips):
+            return kind, index, clips[index]
+        return kind, index, None
+
+    def _sync_clip_trim_controls(self) -> None:
+        if not hasattr(self, "clip_in_spin"):
+            return
+        kind, index, clip = self._trim_target()
+        linked = kind == "audio" and self.timeline.audio_kind == "source"
+        if linked and 0 <= index < len(self.timeline.aclips):
+            clip = self.timeline.aclips[index]
+        loading = self._loading
+        self._loading = True
+        try:
+            enabled = clip is not None and not linked and not self._busy_rendering() and not self._editing_locked()
+            duration = self._media_dur(clip.media_id) if clip is not None else 0.0
+            self.clip_in_spin.set_value(clip.in_s if clip else 0)
+            self.clip_out_spin.set_value((clip.out_s or duration) if clip else 0)
+            item = self._clip_item(clip, kind) if clip is not None else None
+            self.clip_title.set_text(item.path.name if item else "no clip selected")
+            hint = "Linked soundtrack: trim the video clip, or detach audio using a timeline edit." if linked else None
+            for control in (self.clip_in_spin, self.clip_out_spin, self.clip_set_in, self.clip_set_out):
+                control.set_sensitive(enabled)
+                control.set_tooltip_text(hint)
+        finally:
+            self._loading = loading
+
+    def _on_clip_trim_changed(self, spin) -> None:
+        if self._loading:
+            return
+        kind, index, clip = self._trim_target()
+        if clip is None or self._busy_rendering() or not self._guard_edit("trim"):
+            self._sync_clip_trim_controls()
+            return
+        duration = self._media_dur(clip.media_id) or max(clip.out_s, clip.in_s + .05)
+        if duration < .05:
+            return
+        inn = min(self.clip_in_spin.get_value(), duration - .05)
+        out = min(duration, max(inn + .05, self.clip_out_spin.get_value()))
+        if spin is self.clip_out_spin and out <= clip.in_s:
+            out = min(duration, clip.in_s + .05)
+            inn = clip.in_s
+        self._flush_checkpoint()
+        self._checkpoint()
+        self._stop()
+        if kind == "audio":
+            self._on_audio_trim(index, inn, out, True)
+        else:
+            self._on_video_trim(index, inn, out, True)
+        self._sync_clip_trim_controls()
+
+    def _set_clip_bound(self, is_in: bool) -> None:
+        kind, _index, clip = self._trim_target()
+        if clip is None or self._busy_rendering() or not self._guard_edit("trim"):
+            return
+        source_time = self._source_time(clip, self._timeline_now(), self._media_dur(clip.media_id))
+        (self.clip_in_spin if is_in else self.clip_out_spin).set_value(source_time)
+
+    def _open_clip_popover(self, kind: str | None = None, index: int | None = None) -> None:
+        kind = kind or self._selected_clip_kind()
+        if not kind:
+            self._set_status("Select a clip first")
+            return
+        if index is None:
+            index = self.sel_v if kind == "video" else self.sel_a
+        rect = self.timeline.clip_rect(kind, index)
+        if rect is None:
+            return
+        self._sync_clip_trim_controls()
+        self.transition_popover.popdown()
+        self.clip_popover.set_pointing_to(rect)
+        self.clip_popover.set_position(Gtk.PositionType.TOP)
+        self.clip_popover.popup()
+
+    def _open_transition_popover(self, index: int) -> None:
+        rect = self.timeline.cut_rect(index)
+        if rect is None:
+            return
+        self.clip_popover.popdown()
+        self.transition_popover.set_pointing_to(rect)
+        self.transition_popover.set_position(Gtk.PositionType.TOP)
+        self.transition_popover.popup()
+
+    # ── Direct edits from the timeline and preview ───────────────────────
+
+    def _on_timeline_activate(self, kind: str, index: int) -> None:
+        self._open_clip_popover(kind, index)
+
+    def _on_timeline_transition(self, index: int) -> None:
+        self._open_transition_popover(index)
+
+    def _on_timeline_fade(
+        self, kind: str, index: int, fade_in: float, fade_out: float, final: bool
+    ) -> None:
+        if not self._guard_edit("fade"):
+            return
+        clips = self.video_clips if kind == "video" else self.audio_clips
+        if not 0 <= index < len(clips):
+            return
+        clip = clips[index]
+        src = float(self._src_durs().get(clip.media_id) or 0.0)
+        clip.fade_in_s, clip.fade_out_s = clamp_clip_fades(
+            normalize_fade_s(fade_in) if fade_in > 0 else 0.0,
+            normalize_fade_s(fade_out) if fade_out > 0 else 0.0,
+            clip.timeline_len(src),
+        )
+        self._sync_fade_controls()
+        if final:
+            self._sync_timeline_clips()
+            self._schedule_autosave()
+            self._checkpoint()
+        else:
+            self.timeline.queue_draw()
+
+    def _on_timeline_volume(self, kind: str, index: int, volume: float, final: bool) -> None:
+        if not self._guard_edit("audio_volume"):
+            return
+        clips = self.audio_clips if kind == "audio" else self.video_clips
+        if not 0 <= index < len(clips):
+            return
+        clips[index].volume = normalize_volume(volume)
+        if not final:
+            self.timeline.queue_draw()
+            return
+        was_playing = self.playing
+        playhead = self._timeline_now() if was_playing else self.timeline.playhead
+        self._stop()
+        self._sync_audio_volume_controls()
+        self._sync_timeline_clips()
+        self._checkpoint()
+        self._schedule_autosave()
+        if was_playing:
+            self._begin_timeline_play(playhead)
+
+    def _on_preview_scale(self, steps: float) -> None:
+        """Scroll on the preview scales the clip under the playhead (1.00–4.00)."""
+        if self._selected_video_clip() is None:
+            return
+        value = self.transform_scale_spin.get_value() * (1.05 ** -steps)
+        self.transform_scale_spin.set_value(max(1.0, min(4.0, value)))
+
+    def _on_safe_zones(self, btn: Gtk.ToggleButton) -> None:
+        btn.text_label.set_text("safe zones on" if btn.get_active() else "safe zones off")
+        self.preview.set_safe_zones(btn.get_active() and self.aspect in SAFE_ZONE_ASPECTS)
+
+    def _sync_safe_zones(self) -> None:
+        if not hasattr(self, "btn_safe_zones"):
+            return
+        supported = self.aspect in SAFE_ZONE_ASPECTS
+        self.btn_safe_zones.set_sensitive(supported)
+        self.preview.set_safe_zones(self.btn_safe_zones.get_active() and supported)
+
+    @staticmethod
+    def _visual_key(path: Path) -> tuple[str, int, int] | None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return str(path), stat.st_mtime_ns, stat.st_size
+
+    def _clear_visuals(self) -> None:
+        self.timeline.filmstrips.clear()
+        self.timeline.waves.clear()
+        running = self.__dict__.get("_visual_running", set())
+        pending = self.__dict__.get("_visual_pending", {})
+        for key in list(pending):
+            if key not in running:
+                pending.pop(key)
+
+    def _queue_visuals(self, mid: str) -> None:
+        """Deduplicate file jobs and run at most two FFmpeg workers per window."""
+        if self._closed:
+            return
+        item = self._media_by_id(mid)
+        info = self.media_info.get(mid) or {}
+        if item is None or (key := self._visual_key(item.path)) is None:
+            return
+        cache = self.__dict__.setdefault("_visual_cache", {})
+        if key in cache:
+            strip, wave = cache[key]
+            if strip is not None:
+                self.timeline.filmstrips[mid] = strip
+            if wave is not None:
+                self.timeline.waves[mid] = wave
+            self.timeline.queue_draw()
+            return
+        pending = self.__dict__.setdefault("_visual_pending", {})
+        pending.setdefault(key, (item.path, bool(info.get("has_video")),
+                                 bool(info.get("has_audio")), float(info.get("duration") or 0)))
+        self._start_visual_jobs()
+
+    def _start_visual_jobs(self) -> None:
+        running = self.__dict__.setdefault("_visual_running", set())
+        pending = self.__dict__.setdefault("_visual_pending", {})
+        if self._closed:
+            return
+        for key, task in list(pending.items()):
+            if len(running) >= 2:
+                break
+            if key in running:
+                continue
+            running.add(key)
+            threading.Thread(target=self._build_visuals, args=(key, task), daemon=True).start()
+
+    def _build_visuals(self, key, task) -> None:
+        path, want_strip, want_wave, duration = task
+        strip = wave = None
+        try:
+            if want_strip:
+                strip = _load_filmstrip(path, duration)
+        except (OSError, ProbeError, subprocess.SubprocessError, GLib.Error):
+            pass
+        try:
+            if want_wave:
+                wave = _load_waveform(path)
+        except (OSError, ProbeError, subprocess.SubprocessError, GLib.Error):
+            pass
+        GLib.idle_add(self._visuals_ready, key, strip, wave)
+
+    def _visuals_ready(self, key, strip, wave) -> bool:
+        self._visual_running.discard(key)
+        self._visual_pending.pop(key, None)
+        if self._closed:
+            return False
+        # A worker may finish after New/Open/Undo reused m1 for a different file.
+        # Match current file identity, never the media id captured at submission.
+        cache = self.__dict__.setdefault("_visual_cache", {})
+        cache[key] = (strip, wave)
+        while len(cache) > 16:
+            cache.pop(next(iter(cache)))
+        for item in self.media:
+            if self._visual_key(item.path) != key:
+                continue
+            if strip is not None:
+                self.timeline.filmstrips[item.id] = strip
+            if wave is not None:
+                self.timeline.waves[item.id] = wave
+        self.timeline.queue_draw()
+        self._start_visual_jobs()
+        return False
+
+    def _on_theme_change(self) -> None:
+        """Cairo/snapshot drawing reads the palette at draw time; repaint it."""
+        if self._closed:
+            return
+        self.timeline.queue_draw()
+        self.preview.queue_draw()
+        child = self.media_list.get_first_child()
+        while child is not None:
+            if isinstance(child, MediaCard):
+                child._swatch.queue_draw()
+            child = child.get_next_sibling()
+
     @staticmethod
     def _wrapping_label(text: str) -> Gtk.Label:
         # wrap=True alone only breaks on spaces; paths have none, so the
@@ -3350,11 +4226,6 @@ class EditorWindow(Adw.ApplicationWindow):
         lab.set_width_chars(24)
         lab.set_max_width_chars(36)
         lab.set_selectable(True)
-        return lab
-
-    def _section(self, title: str) -> Gtk.Label:
-        lab = Gtk.Label(label=title, xalign=0)
-        lab.add_css_class("heading")
         return lab
 
     def _media_by_id(self, mid: str) -> MediaItem | None:
@@ -3455,6 +4326,7 @@ class EditorWindow(Adw.ApplicationWindow):
 
     def _set_status(self, text: str) -> None:
         self.status.set_text(text)
+        self.status.set_tooltip_text(text or None)
 
     def _edit_dur(self) -> float:
         return max(0.0, self.out_spin.get_value() - self.in_spin.get_value())
@@ -3519,6 +4391,9 @@ class EditorWindow(Adw.ApplicationWindow):
         if self._closed:
             return False
         self._closed = True
+        off_theme_change(self._on_theme_change)
+        self._clear_visuals()
+        self.__dict__.get("_visual_cache", {}).clear()
         application = self.get_application()
         if application is not None and self._shutdown_handler:
             application.disconnect(self._shutdown_handler)
@@ -3531,6 +4406,11 @@ class EditorWindow(Adw.ApplicationWindow):
             self._ckpt_src = 0
         self._flush_autosave()
         self._dispose_media()
+        # Popovers are parented to the timeline, which does not unparent them.
+        for name in ("clip_popover", "transition_popover"):
+            pop = getattr(self, name, None)
+            if pop is not None and pop.get_parent() is not None:
+                pop.unparent()
         return False
 
     def _refresh_crop(self) -> None:
@@ -3621,6 +4501,7 @@ class EditorWindow(Adw.ApplicationWindow):
         return self._speed_target_clips()
 
     def _sync_audio_volume_controls(self) -> None:
+        self._sync_clip_trim_controls()
         if not hasattr(self, "audio_volume_spins"):
             return
         loading = self._loading
@@ -3874,7 +4755,10 @@ class EditorWindow(Adw.ApplicationWindow):
             self.media_list.remove(child)
             child = nxt
         if not self.media:
-            lab = Gtk.Label(label="none — drop files or Shift+E from Eagle", xalign=0)
+            lab = Gtk.Label(
+                label="Drop video or audio here, or press Shift+E in Eagle Browse.", xalign=0
+            )
+            lab.set_valign(Gtk.Align.CENTER)
             lab.add_css_class("dim-label")
             lab.set_wrap(True)
             self.media_list.append(lab)
@@ -3919,17 +4803,17 @@ class EditorWindow(Adw.ApplicationWindow):
         self.btn_fit.set_sensitive(bool(self.audio_path))
         self._sync_timeline_clips()
         if not self.audio_path:
-            self.btn_fit.set_label("Fit")
+            self.btn_fit.set_label("fit")
             self._schedule_autosave()
             self._schedule_checkpoint()
             return
         name = self.audio_path.name
         dur = float(self.audio_info["duration"]) if self.audio_info else 0.0
         if self.audio_fit and longer:
-            self.btn_fit.set_label(f"Fit {v:.2f}s")
+            self.btn_fit.set_label(f"fit {v:.2f}s")
             self.audio_label.set_text(f"{name} · {dur:.2f}s cut to {v:.2f}s")
         else:
-            self.btn_fit.set_label("Fit")
+            self.btn_fit.set_label("fit")
             self.audio_label.set_text(f"{name} · {dur:.2f}s")
             if self.audio_fit and not longer:
                 self.audio_fit = False
@@ -4327,10 +5211,12 @@ class EditorWindow(Adw.ApplicationWindow):
         if existing is not None:
             mid = existing.id
             self.media_info[mid] = info
+            self._queue_visuals(mid)
         else:
             mid = next_media_id(self.media)
             self.media.append(MediaItem(id=mid, path=path, kind=kind))
             self.media_info[mid] = info
+            self._queue_visuals(mid)
             if kind == "video":
                 try:
                     self.media_thumbs[mid] = _load_frame(path)
@@ -4414,7 +5300,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.aspect = name
         w, h = dest_size(name, self.resolution)
         self.aspect_frame.set_ratio(w / h)
-        self._refresh_resolution_label()
+        self._sync_safe_zones()
         clip = self._video_at(self.timeline.playhead)
         if clip is not None:
             self.preview.set_transform(
@@ -4430,7 +5316,6 @@ class EditorWindow(Adw.ApplicationWindow):
             return
         self.resolution = name
         w, h = dest_size(self.aspect, self.resolution)
-        self._refresh_resolution_label()
         clip = self._video_at(self.timeline.playhead)
         if clip is not None:
             self.preview.set_transform(
@@ -4438,15 +5323,6 @@ class EditorWindow(Adw.ApplicationWindow):
             )
         self._refresh_crop()
         self._checkpoint()
-
-    def _refresh_resolution_label(self) -> None:
-        if not hasattr(self, "resolution_size_label"):
-            return
-        try:
-            w, h = dest_size(self.aspect, self.resolution)
-            self.resolution_size_label.set_text(f"{w}×{h}")
-        except ValueError:
-            self.resolution_size_label.set_text("")
 
     def _set_in(self, *_args: object) -> None:
         if not self._guard_edit("set_in_out"):
@@ -5335,7 +6211,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.playing = False
         self._clip_playing = False
         self._audio_pending = False
-        self.btn_play.set_label("Play")
+        self.btn_play.text_label.set_text("play")
         self._stop_preview_audio()
         if self._seek_audio_src:
             GLib.source_remove(self._seek_audio_src)
@@ -5412,7 +6288,7 @@ class EditorWindow(Adw.ApplicationWindow):
             m.play()
             self.playing = True
             self._clip_playing = True
-            self.btn_play.set_label("Pause")
+            self.btn_play.text_label.set_text("pause")
             self._syncing_scrub = True
             self.timeline.set_playhead(t)
             self._syncing_scrub = False
@@ -5575,6 +6451,7 @@ class EditorWindow(Adw.ApplicationWindow):
             self.btn_preview_full.set_sensitive(has_video and not busy and not locked)
         if hasattr(self, "btn_preview_cancel"):
             self.btn_preview_cancel.set_sensitive(self._preview_rendering)
+            self.btn_preview_cancel.set_visible(self._preview_rendering)
         if hasattr(self, "btn_render_preview"):
             self.btn_render_preview.set_sensitive(has_video and not busy and not locked)
         if hasattr(self, "btn_back_edit_preview"):
@@ -5857,7 +6734,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self._apply_timeline_frame(t, start_media=True)
         self._start_preview_audio(t)
         self.playing = True
-        self.btn_play.set_label("Pause")
+        self.btn_play.text_label.set_text("pause")
         if self._tick is not None:
             GLib.source_remove(self._tick)
         self._tick = GLib.timeout_add(50, self._on_tick)
@@ -6119,6 +6996,7 @@ class EditorApp(Adw.Application):
 
     def _ensure_window(self) -> EditorWindow:
         apply_omarchy_theme()
+        install_app_css()
         win = self.props.active_window
         if win is None:
             win = EditorWindow(application=self)
