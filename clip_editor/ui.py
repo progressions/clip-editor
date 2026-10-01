@@ -428,20 +428,13 @@ class Timeline(Gtk.DrawingArea):
         self.add_controller(drop)
 
     def _recompute_span(self) -> None:
+        # Timeline bounds follow the edit, not the full-source ghost outlines.
+        # _clip_times accounts for source in/out points, placement, and speed.
         ends = [0.0]
-        for c in self.vclips:
-            _t0, t1 = self._clip_times(c, self._clip_src_dur(c, "v"))
-            ends.append(t1)
-            # Full-media ghost footprint at this speed (in=0..src_dur).
-            d = self._clip_src_dur(c, "v")
-            if d > 0:
-                ends.append(c.start + d / c.playback_speed())
-        for c in self.aclips:
-            _t0, t1 = self._clip_times(c, self._clip_src_dur(c, "a"))
-            ends.append(t1)
-            d = self._clip_src_dur(c, "a")
-            if d > 0:
-                ends.append(c.start + d / c.playback_speed())
+        for clips, lane in ((self.vclips, "v"), (self.aclips, "a")):
+            for clip in clips:
+                _t0, t1 = self._clip_times(clip, self._clip_src_dur(clip, lane))
+                ends.append(t1)
         self.duration = max(ends)
         self.set_sensitive(
             self.duration > 0.04
