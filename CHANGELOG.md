@@ -7,6 +7,11 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Fixed
+
+- Plain `=` and `-` zoom the focused timeline without Shift; `+` and keypad add/subtract also work. Fit moves to `F`, with updated key hints.
+- Space toggles playback from any focused editor control, with key-repeat protection.
+
 ## [0.14.0] — 2026-10-01
 
 ### Changed
