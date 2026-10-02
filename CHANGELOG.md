@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.14.2] — 2026-10-02
+
 ### Added
 
 - Keyboard shortcut reference in the current themed popover style, opened with the status line's `? help` hint or `?` on the timeline. Includes zoom, clip settings, playback, project, and editing shortcuts; `Esc` dismisses help without changing the active edit mode or selection (PR #34).
@@ -186,7 +188,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 - Initial packaged release of the native GTK clip editor for Buffer-safe H.264/AAC exports.
 
-[Unreleased]: https://github.com/progressions/clip-editor/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/progressions/clip-editor/compare/v0.14.2...HEAD
+[0.14.2]: https://github.com/progressions/clip-editor/compare/v0.14.1...v0.14.2
+[0.14.1]: https://github.com/progressions/clip-editor/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/progressions/clip-editor/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/progressions/clip-editor/compare/v0.12.3...v0.13.0
 [0.12.3]: https://github.com/progressions/clip-editor/compare/v0.12.2...v0.12.3
