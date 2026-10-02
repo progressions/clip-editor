@@ -134,10 +134,16 @@ file.
 
 ## Project files
 
+Click **? help** in the status line, or press `?` with the timeline focused, to
+open the scrollable keyboard reference. It includes the current zoom, clip
+settings, playback, project, and editing shortcuts. `?` toggles help from the
+timeline; `Esc` closes help before exiting an edit mode or clearing selection.
+Opening or closing help preserves the current mode and selection.
+
 Timeline shortcuts run only while the timeline has keyboard focus (click it
 or reach it with Tab). Text fields, inspector controls, menus, and dialogs keep
 their native keys, including text undo. Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y edit the
-project history only from the timeline. Save and Open remain application-wide.
+project history only from the timeline. Space playback, Save, and Open remain application-wide.
 The colon command entry owns typing until Enter or Esc returns focus to the
 timeline.
 

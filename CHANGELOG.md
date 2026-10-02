@@ -7,6 +7,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- Keyboard shortcut reference in the current themed popover style, opened with the status line's `? help` hint or `?` on the timeline. Includes zoom, clip settings, playback, project, and editing shortcuts; `Esc` dismisses help without changing the active edit mode or selection (PR #34).
+
 ## [0.14.1] — 2026-10-01
 
 ### Fixed

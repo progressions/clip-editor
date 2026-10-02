@@ -16,12 +16,13 @@ class KeyboardEditingTest(unittest.TestCase):
     def setUp(self):
         for name in ('_restore_autosave', '_schedule_autosave', '_schedule_checkpoint',
                      '_load_media', '_apply_timeline_frame', '_refresh_cache_bar',
-                     '_install_media_list'):
+                     '_install_media_list', '_flush_autosave'):
             patcher = patch.object(EditorWindow, name, return_value=False)
             patcher.start()
             self.addCleanup(patcher.stop)
         self.win = EditorWindow()
         self.addCleanup(self.win.destroy)
+        self.addCleanup(self.win._on_close)
         self.win.media = [MediaItem(id='v', path=Path('/tmp/keyboard-fixture.mp4'), kind='video')]
         self.win.media_info = {'v': {'duration': 20, 'has_audio': True, 'width': 320, 'height': 240}}
         self.win.video_path = self.win.media[0].path
@@ -144,3 +145,59 @@ class KeyboardEditingTest(unittest.TestCase):
         self.win._on_undo()
         self.assertEqual(self.win.audio_clips, [])
         self.assertTrue(self.win.use_video_soundtrack)
+
+    def test_question_opens_and_closes_help_without_changing_mode_or_history(self):
+        before = [c.copy() for c in self.win.video_clips]
+        self.key(Gdk.KEY_m)
+        history_len = len(self.win._history)
+        self.key(Gdk.KEY_question)
+        self.assertTrue(self.win.keyboard_help.get_visible())
+        self.assertEqual(self.win.keyboard_mode, 'move')
+        self.assertEqual(self.win.video_clips, before)
+        self.assertEqual(len(self.win._history), history_len)
+        self.assertIn('Timeline navigation', self.win.keyboard_help_body.get_text())
+        self.key(Gdk.KEY_Escape)
+        self.assertFalse(self.win.keyboard_help.get_visible())
+        self.assertEqual(self.win.keyboard_mode, 'move')
+        self.key(Gdk.KEY_question)
+        self.assertTrue(self.win.keyboard_help.get_visible())
+        self.key(Gdk.KEY_question)
+        self.assertFalse(self.win.keyboard_help.get_visible())
+
+    def test_clickable_help_preserves_timeline_focus_and_mode(self):
+        self.key(Gdk.KEY_m)
+        self.assertFalse(self.win.btn_keyboard_help.get_focus_on_click())
+        self.assertFalse(self.win.btn_keyboard_help.get_focusable())
+        self.win.btn_keyboard_help.emit('clicked')
+        self.assertTrue(self.win.keyboard_help.get_visible())
+        self.assertIs(self.win.get_focus(), self.win.timeline)
+        self.assertEqual(self.win.keyboard_mode, 'move')
+        self.assertEqual(self.win.sel_vs, {0})
+        self.assertTrue(self.win.keyboard_help.has_css_class('clip-pop'))
+        self.win.btn_keyboard_help.emit('clicked')
+        self.assertFalse(self.win.keyboard_help.get_visible())
+
+    def test_help_lists_current_shortcuts_and_does_not_capture_text_input(self):
+        self.key(Gdk.KEY_question)
+        text = self.win.keyboard_help_body.get_text()
+        for hint in ('Space', 'any editor control', 'zoom in', 'fit timeline',
+                     'Enter', 'safe zones', 'export', 'Ctrl+Shift+S', 'rp'):
+            self.assertIn(hint, text)
+        self.key(Gdk.KEY_Escape)
+        self.win.command_entry.grab_focus()
+        self.assertFalse(self.key(Gdk.KEY_question))
+        self.assertFalse(self.win.keyboard_help.get_visible())
+        self.win.btn_keyboard_help.emit('clicked')
+        self.assertTrue(self.win.keyboard_help.get_visible())
+        self.assertTrue(self.key(Gdk.KEY_Escape))
+        self.assertFalse(self.win.keyboard_help.get_visible())
+        self.assertTrue(self.win.command_entry.has_focus() or
+                        self.win.get_focus().is_ancestor(self.win.command_entry))
+
+    def test_shift_question_and_close_cleanup(self):
+        self.assertTrue(self.win._on_key_pressed(
+            None, Gdk.KEY_question, 0, Gdk.ModifierType.SHIFT_MASK))
+        self.assertTrue(self.win.keyboard_help.get_visible())
+        self.assertLessEqual(self.win.keyboard_help_scroll.get_min_content_height(), 440)
+        self.win._on_close()
+        self.assertIsNone(self.win.keyboard_help.get_parent())

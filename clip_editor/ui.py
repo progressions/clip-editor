@@ -2542,6 +2542,8 @@ class EditorWindow(Adw.ApplicationWindow):
         self.connect("notify::focus-widget", lambda *_: self._sync_pane_focus())
         toolbar.set_content(root)
         self.set_content(toolbar)
+        self.keyboard_help = self._build_keyboard_help()
+        self.keyboard_help.set_parent(self.timeline)
         self._closed = False
         on_theme_change(self._on_theme_change)
         self._shutdown_handler = 0
@@ -2604,6 +2606,81 @@ class EditorWindow(Adw.ApplicationWindow):
         self.command_revealer.set_reveal_child(False)
         self.timeline.grab_focus()
 
+    def _build_keyboard_help(self) -> Gtk.Popover:
+        popover = Gtk.Popover()
+        popover.add_css_class("clip-pop")
+        popover.set_autohide(False)
+        popover.set_focusable(False)
+        popover.set_has_arrow(False)
+        popover.set_position(Gtk.PositionType.TOP)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        content.set_margin_top(16)
+        content.set_margin_bottom(16)
+        content.set_margin_start(18)
+        content.set_margin_end(18)
+
+        title = Gtk.Label(label="Keyboard shortcuts", xalign=0)
+        title.add_css_class("title-3")
+        content.append(title)
+
+        body = Gtk.Label(xalign=0)
+        body.set_wrap(True)
+        body.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        body.set_markup(
+            "<b>Editor-wide</b>\n"
+            "Space   play / pause from any editor control\n"
+            "Ctrl+N / Ctrl+O   new / open project\n"
+            "Ctrl+S / Ctrl+Shift+S   save / save as\n\n"
+            "<b>Timeline navigation</b>\n"
+            "Click the timeline to use the shortcuts below.\n"
+            "h / l   select previous / next clip\n"
+            "Shift+h / Shift+l   extend selection\n"
+            "j / k   move between video and audio tracks\n"
+            "= / +   zoom in     -   zoom out     f   fit timeline\n"
+            "Enter   open selected clip settings\n"
+            "z   toggle safe zones     e   export\n"
+            ":   command line (r916, r43, rp)\n\n"
+            "<b>Keyboard editing</b>\n"
+            "m   move selected clips\n"
+            "r   ripple-reorder a clip or contiguous group\n"
+            "[ / ]   trim the selected clip's left / right edge\n"
+            "s   seek the playhead\n"
+            "h / l   apply the active edit or seek increment\n"
+            "Up / Down   change the active increment\n"
+            "t   split the selected clip at the playhead\n"
+            "Delete   remove the selected clip\n"
+            "Ctrl+Z   undo     Ctrl+Shift+Z / Ctrl+Y   redo\n\n"
+            "<b>Help and modes</b>\n"
+            "?   show / hide this help\n"
+            "Esc   close help first; then exit mode or clear selection\n\n"
+            "Edits target the active video or audio track.\n"
+            "Opening help leaves the current mode and selection unchanged."
+        )
+        body.set_selectable(False)
+        self.keyboard_help_body = body
+        content.append(body)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_focusable(False)
+        scroll.set_min_content_width(320)
+        scroll.set_min_content_height(240)
+        scroll.set_child(content)
+        self.keyboard_help_scroll = scroll
+        popover.set_child(scroll)
+        return popover
+
+    def _toggle_keyboard_help(self) -> None:
+        if self.keyboard_help.get_visible():
+            self.keyboard_help.popdown()
+        else:
+            # Keep the reference scrollable inside smaller editor windows.
+            self.keyboard_help_scroll.set_min_content_height(
+                min(440, max(160, self.get_height() - 120))
+            )
+            self.keyboard_help.popup()
+
     def _on_command_key_pressed(
         self, _controller: Gtk.EventControllerKey, keyval: int, _code: int, _state: int
     ) -> bool:
@@ -2647,6 +2724,10 @@ class EditorWindow(Adw.ApplicationWindow):
                 self._space_held = True
                 self._on_play()
             return True
+        keyboard_help = getattr(self, "keyboard_help", None)
+        if keyboard_help is not None and keyboard_help.get_visible() and not mods and keyval == Gdk.KEY_Escape:
+            self._toggle_keyboard_help()
+            return True
         # Timeline is a leaf widget: exact ownership also excludes inspector
         # entries, buttons, popovers, dialogs, and the colon command entry.
         if self.get_focus() is not self.timeline:
@@ -2655,6 +2736,9 @@ class EditorWindow(Adw.ApplicationWindow):
         ctrl = bool(mods & Gdk.ModifierType.CONTROL_MASK)
         shift = bool(mods & Gdk.ModifierType.SHIFT_MASK)
         extra = mods & ~(Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK)
+        if not ctrl and not extra and keyval == Gdk.KEY_question:
+            self._toggle_keyboard_help()
+            return True
         if extra:
             return False
         if not mods and keyval == Gdk.KEY_m:
@@ -3815,6 +3899,14 @@ class EditorWindow(Adw.ApplicationWindow):
         mb.set_menu_model(menu)
         mb.set_tooltip_text("New, open, save (Ctrl+N / Ctrl+O / Ctrl+S)")
         line.append(mb)
+        self.btn_keyboard_help = self._hint(
+            "?", "help", self._toggle_keyboard_help,
+            tooltip="Keyboard shortcuts (? with the timeline focused)",
+        )
+        # Clicking the reference must not leave the active keyboard edit mode.
+        self.btn_keyboard_help.set_focusable(False)
+        self.btn_keyboard_help.set_focus_on_click(False)
+        line.append(self.btn_keyboard_help)
         outer.append(line)
         return outer
 
@@ -4408,7 +4500,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self._flush_autosave()
         self._dispose_media()
         # Popovers are parented to the timeline, which does not unparent them.
-        for name in ("clip_popover", "transition_popover"):
+        for name in ("clip_popover", "transition_popover", "keyboard_help"):
             pop = getattr(self, name, None)
             if pop is not None and pop.get_parent() is not None:
                 pop.unparent()
