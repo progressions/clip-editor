@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from clip_editor.eagle import inbox_dir
 from clip_editor.server import _pick_native
-from clip_editor.theme import build_css
+from clip_editor.theme import PALETTE, build_css
 
 
 class InstalledRuntimeTest(unittest.TestCase):
@@ -54,6 +54,28 @@ class InstalledRuntimeTest(unittest.TestCase):
         for name in ("destructive", "success", "warning", "error"):
             self.assertIn(f"--{name}-fg-color:", text)
         self.assertIn("@define-color accent_fg_color", text)
+
+    def test_unnamed_status_colors_are_matched_by_hue(self) -> None:
+        # Omarchy themes often omit red/green and reorder ANSI slots; this
+        # palette puts purple in color2 and green in color6.
+        colors = {
+            "accent": "#d7accd", "background": "#121212", "foreground": "#d7accd",
+            "color1": "#ff4da6", "color2": "#8673d4", "color4": "#7ea7c9",
+            "color6": "#8adb8a",
+        }
+        build_css(colors)
+        self.assertEqual(PALETTE["green"], "#8adb8a")
+        self.assertEqual(PALETTE["blue"], "#7ea7c9")
+        self.assertEqual(PALETTE["red"], "#ff4da6")
+
+    def test_surfaces_are_derived_when_theme_only_sets_background(self) -> None:
+        build_css({"background": "#121212", "foreground": "#d7accd"})
+        self.assertNotEqual(PALETTE["lighter_background"], PALETTE["background"])
+        self.assertNotEqual(PALETTE["muted"], PALETTE["foreground"])
+
+    def test_named_theme_colors_still_win(self) -> None:
+        build_css({"green": "#00ff00", "color6": "#8adb8a"})
+        self.assertEqual(PALETTE["green"], "#00ff00")
 
 
 if __name__ == "__main__":

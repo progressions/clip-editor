@@ -201,9 +201,15 @@ def rebase_clips_for_window(
         new_out = o1 - float(c.start)
         new_start = float(c.start) - t0
         ttype, tdur = normalize_transition(c.transition, c.transition_s)
+        fade_in_s = float(getattr(c, "fade_in_s", 0.0) or 0.0)
+        fade_out_s = float(getattr(c, "fade_out_s", 0.0) or 0.0)
         # Drop the outgoing transition if we truncated the clip's end.
         if abs(o1 - used1) > 0.02:
             ttype, tdur = TRANSITION_NONE, 0.0
+            fade_out_s = 0.0
+        # Drop fade-in if we truncated the clip's start.
+        if abs(o0 - used0) > 0.02:
+            fade_in_s = 0.0
         out.append(
             ClipInst(
                 start=new_start,
@@ -214,9 +220,12 @@ def rebase_clips_for_window(
                 transform_y=c.transform_y,
                 scale=c.scale,
                 track=c.track,
+                volume=c.volume,
                 transition=ttype,
                 transition_s=tdur,
                 speed=c.playback_speed(),
+                fade_in_s=fade_in_s,
+                fade_out_s=fade_out_s,
             )
         )
     return out
@@ -266,9 +275,12 @@ def render_fingerprint(
                 "transform_y": round(float(c.transform_y), 6),
                 "scale": round(float(c.scale), 6),
                 "track": int(c.track),
+                "volume": round(float(c.volume), 6),
                 "transition": c.transition,
                 "transition_s": round(float(c.transition_s), 6),
                 "speed": round(float(c.playback_speed()), 6),
+                "fade_in_s": round(float(getattr(c, "fade_in_s", 0.0) or 0.0), 6),
+                "fade_out_s": round(float(getattr(c, "fade_out_s", 0.0) or 0.0), 6),
             }
             for c in video_clips
         ],
@@ -279,7 +291,10 @@ def render_fingerprint(
                 "out_s": round(float(c.out_s), 6),
                 "media_id": c.media_id,
                 "track": int(c.track),
+                "volume": round(float(c.volume), 6),
                 "speed": round(float(c.playback_speed()), 6),
+                "fade_in_s": round(float(getattr(c, "fade_in_s", 0.0) or 0.0), 6),
+                "fade_out_s": round(float(getattr(c, "fade_out_s", 0.0) or 0.0), 6),
             }
             for c in audio_clips
         ],
@@ -568,6 +583,7 @@ COMPILED_BLOCKED_ACTIONS = frozenset(
         "speed",
         "transition",
         "audio_route",
+        "audio_volume",
         "media_place",
         "undo",
         "redo",

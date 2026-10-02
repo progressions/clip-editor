@@ -11,6 +11,7 @@ class KeyboardOwnershipTest(unittest.TestCase):
     def make_window(self, timeline_focus=True):
         timeline = SimpleNamespace(
             move_clip_selection=Mock(), move_navigation_track=Mock(),
+            zoom_view=Mock(), fit_view=Mock(),
         )
         return SimpleNamespace(
             timeline=timeline,
@@ -28,7 +29,7 @@ class KeyboardOwnershipTest(unittest.TestCase):
     def test_other_controls_keep_timeline_and_history_keys(self):
         win = self.make_window(False)
         for key in (Gdk.KEY_h, Gdk.KEY_j, Gdk.KEY_k, Gdk.KEY_l,
-                    Gdk.KEY_t, Gdk.KEY_colon, Gdk.KEY_space,
+                    Gdk.KEY_t, Gdk.KEY_colon, Gdk.KEY_equal, Gdk.KEY_minus,
                     Gdk.KEY_Delete, Gdk.KEY_Escape):
             self.assertFalse(self.key(win, key))
         for key in (Gdk.KEY_z, Gdk.KEY_y):
@@ -37,6 +38,34 @@ class KeyboardOwnershipTest(unittest.TestCase):
         win._on_redo.assert_not_called()
         win._guard_edit.assert_not_called()
         win.timeline.move_clip_selection.assert_not_called()
+
+    def test_zoom_keys_without_shift_and_plus_aliases(self):
+        win = self.make_window()
+        for key, mods, factor in (
+            (Gdk.KEY_equal, 0, 1.5),
+            (Gdk.KEY_minus, 0, 1 / 1.5),
+            (Gdk.KEY_plus, Gdk.ModifierType.SHIFT_MASK, 1.5),
+            (Gdk.KEY_KP_Add, 0, 1.5),
+            (Gdk.KEY_KP_Subtract, 0, 1 / 1.5),
+        ):
+            with self.subTest(key=key):
+                win.timeline.zoom_view.reset_mock()
+                self.assertTrue(self.key(win, key, mods))
+                win.timeline.zoom_view.assert_called_once_with(factor)
+        win.timeline.fit_view.assert_not_called()
+        self.assertTrue(self.key(win, Gdk.KEY_f))
+        win.timeline.fit_view.assert_called_once()
+
+    def test_space_plays_outside_timeline_once_per_press(self):
+        win = self.make_window(False)
+        for key in (Gdk.KEY_space, Gdk.KEY_KP_Space):
+            win._on_play.reset_mock()
+            self.assertTrue(self.key(win, key))
+            self.assertTrue(self.key(win, key))
+            win._on_play.assert_called_once()
+            EditorWindow._on_key_released(win, None, key, 0, 0)
+        for modifier in (Gdk.ModifierType.CONTROL_MASK, Gdk.ModifierType.ALT_MASK):
+            self.assertFalse(self.key(win, Gdk.KEY_space, modifier))
 
     def test_timeline_dispatch_and_rendered_preview_guard(self):
         win = self.make_window()
@@ -98,8 +127,12 @@ class KeyboardOwnershipTest(unittest.TestCase):
         try:
             for widget in controls:
                 widget.grab_focus()
-                for key in (Gdk.KEY_t, Gdk.KEY_Delete, Gdk.KEY_space, Gdk.KEY_h):
+                for key in (Gdk.KEY_t, Gdk.KEY_Delete, Gdk.KEY_equal, Gdk.KEY_minus, Gdk.KEY_h):
                     self.assertFalse(controller.emit('key-pressed', key, 0, 0))
+                win._on_play.reset_mock()
+                self.assertTrue(controller.emit('key-pressed', Gdk.KEY_space, 0, 0))
+                win._on_play.assert_called_once()
+                EditorWindow._on_key_released(win, None, Gdk.KEY_space, 0, 0)
                 self.assertFalse(controller.emit('key-pressed', Gdk.KEY_z, 0,
                                                  Gdk.ModifierType.CONTROL_MASK))
             timeline.grab_focus()

@@ -7,6 +7,86 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- Keyboard shortcut reference in the current themed popover style, opened with the status line's `? help` hint or `?` on the timeline. Includes zoom, clip settings, playback, project, and editing shortcuts; `Esc` dismisses help without changing the active edit mode or selection (PR #34).
+
+## [0.14.1] — 2026-10-01
+
+### Fixed
+
+- Plain `=` and `-` zoom the focused timeline without Shift; `+` and keypad add/subtract also work. Fit moves to `F`, with updated key hints.
+- Space toggles playback from any focused editor control, with key-repeat protection.
+
+## [0.14.0] — 2026-10-01
+
+### Changed
+
+- New Omarchy-style interface: bordered panes like Hyprland windows (focused pane gets the accent border), terminal font, key hints in place of buttons, and a statusline with the keyboard mode, status, export target and project menu. The header bar and sidebar are gone; the media bin is a strip under the timeline.
+- Clip settings (trim, speed, frame, fades, clip and track volume) are in a popover: Enter or double-click a clip. Transitions open from the diamond at a cut.
+- Colors come from the active Omarchy theme, including derived surfaces, hue-matched status colors and btop's key-hint color; the window repaints when the theme changes.
+
+### Added
+
+- Timeline filmstrips on video clips and waveforms on audio clips.
+- Drag fade knobs to set fades and the line across an audio clip to set its volume.
+- Scroll on the preview to scale the selected clip.
+- Safe-zone overlay for 9:16 (`z`): shades where TikTok, Reels and Shorts draw their interface.
+- Timeline keys: `Enter` clip settings, `z` safe zones, `e` export, `-` / `+` zoom, `=` fit.
+
+### Fixed
+
+- Audio trim fields and playhead buttons edit the selected audio clip, with undo/redo and source-duration limits.
+- Small fade/volume drags are committed; cancelled drags restore their original values. Clicking a fade knob keeps the clip selected.
+- Filmstrip and waveform jobs are deduplicated, limited to two concurrent workers, and matched to current media after project switches. Closing a window releases its theme listener and visual cache.
+- Closing a settings popover no longer steals focus from another open popover.
+
+## [0.13.0] — 2026-10-01
+
+### Added
+
+- Independent clip and A1/A2 track volume controls (0–200%) for simultaneous audio mixing. Clip and track gains multiply and apply to playback, rendered previews, and exports (PR #45).
+- Project format 8 persists volumes with undo/redo and preview-cache invalidation. Older projects default to 100% volume.
+
+### Changed
+
+- Add audio preserves the video soundtrack as editable A1 clips and places new audio on the free layer. When both layers are occupied, new files stay in the media bin for explicit placement.
+- Mixing no longer automatically halves overlapping audio layers; the selected clip and track volumes determine their levels.
+
+## [0.12.3] — 2026-10-01
+
+### Fixed
+
+- Dragging the playhead near either visible timeline edge scrolls and seeks into hidden time, including back to 0:00. Holding the pointer at the edge continues scrolling; release, cancellation, or hiding the timeline stops it. Rendered previews support the same behavior (PR #43).
+
+## [0.12.2] — 2026-10-01
+
+### Fixed
+
+- Timeline zoom-out continues below Fit, shrinking clips and showing more empty time after them. Repeated clicks preserve the selected scale, and Fit restores the full-project view (PR #41).
+
+## [0.12.1] — 2026-10-01
+
+### Fixed
+
+- Timeline Fit uses edited clip endpoints across video and audio tracks, including trims, placement, and playback speed. Full-source ghost outlines no longer enlarge the view.
+
+## [0.12.0] — 2026-10-01
+
+### Added
+
+- Timeline −, +, and Fit controls. Zoom preserves the visible center; Fit shows all video and audio clips and adapts to the available width. Ruler ticks gain detail when zooming.
+
+### Fixed
+
+- Explicitly close GTK media pipelines when replacing media or exiting. Application shutdown now runs cleanup as well as window close, preventing decoder workers from continuing into process teardown.
+
+## [0.11.0] — 2026-09-13
+
+### Added
+
+- Clip fade in / fade out with set duration ([#567](https://app.fizzy.do/6109848/cards/567)): per-clip opacity/gain fades (0.1–3.0s), timeline markers, inspector toggles, FFmpeg `fade`/`afade` in preview and export. Distinct from per-cut Dissolve / White flash (#487). Project format version 7.
+
 ## [0.10.0] — 2026-09-05
 
 ### Added
@@ -106,7 +186,14 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 - Initial packaged release of the native GTK clip editor for Buffer-safe H.264/AAC exports.
 
-[Unreleased]: https://github.com/progressions/clip-editor/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/progressions/clip-editor/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/progressions/clip-editor/compare/v0.13.0...v0.14.0
+[0.13.0]: https://github.com/progressions/clip-editor/compare/v0.12.3...v0.13.0
+[0.12.3]: https://github.com/progressions/clip-editor/compare/v0.12.2...v0.12.3
+[0.12.2]: https://github.com/progressions/clip-editor/compare/v0.12.1...v0.12.2
+[0.12.1]: https://github.com/progressions/clip-editor/compare/v0.12.0...v0.12.1
+[0.12.0]: https://github.com/progressions/clip-editor/compare/v0.11.0...v0.12.0
+[0.11.0]: https://github.com/progressions/clip-editor/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/progressions/clip-editor/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/progressions/clip-editor/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/progressions/clip-editor/compare/v0.8.0...v0.9.0

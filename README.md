@@ -1,6 +1,6 @@
 # Clip editor
 
-Local Ginger tool: open a video, optionally replace its audio, cover-crop to a
+Local Ginger tool: open a video, mix two audio layers, cover-crop to a
 social aspect, export one Buffer-safe H.264/AAC MP4.
 
 Not a kdenlive clone. No titles or codec menus.
@@ -134,10 +134,16 @@ file.
 
 ## Project files
 
+Click **? help** in the status line, or press `?` with the timeline focused, to
+open the scrollable keyboard reference. It includes the current zoom, clip
+settings, playback, project, and editing shortcuts. `?` toggles help from the
+timeline; `Esc` closes help before exiting an edit mode or clearing selection.
+Opening or closing help preserves the current mode and selection.
+
 Timeline shortcuts run only while the timeline has keyboard focus (click it
 or reach it with Tab). Text fields, inspector controls, menus, and dialogs keep
 their native keys, including text undo. Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y edit the
-project history only from the timeline. Save and Open remain application-wide.
+project history only from the timeline. Space playback, Save, and Open remain application-wide.
 The colon command entry owns typing until Enter or Esc returns focus to the
 timeline.
 
@@ -198,3 +204,38 @@ Drop a ``.clip.json`` onto the window to open it.
 
 Open a (usually 1:1) gen, add a music or driver track, set 9:16, drag the
 subject into frame, Export.
+
+### Timeline zoom
+
+Use **−** and **+** above the timeline to zoom out or in around the visible
+center. With the timeline focused, plain **=** zooms in and plain **-** zooms out;
+no Shift is needed. **+** and the keypad add/subtract keys also work. **F** fits
+the timeline. **Space** toggles playback from any focused editor control.
+Zoom out continues past the point where all clips fit, leaving more
+empty timeline space after them. **Fit** uses the edited video and audio clip endpoints (including trims,
+playback speed, and gaps), rather than the full source-file lengths, and
+returns the horizontal scroll to the start. Fit continues to adapt when the
+window is resized or the timeline changes. These controls change only the view;
+clip timings, trims, and export settings are unaffected. While dragging the
+playhead or ruler, hold the pointer near either visible edge to scroll and seek
+into the hidden portion of the timeline, including back to 0:00.
+
+
+### Mixing audio layers
+
+**Add audio** places a file on the free audio layer, A1 or A2. If the video has
+its own soundtrack, adding audio keeps that soundtrack as editable clips on A1
+and places the new audio on A2. Both layers play together. Once both layers are
+occupied, new files stay in the media bin; drag them to a lane and time to place
+them. Overlapping clips on the same lane still use the most recently placed clip.
+
+Under **Audio mix**, select a clip and set **Selected clip %**, or adjust
+**A1 volume %** and **A2 volume %** for every clip on that layer. Values range
+from 0 (mute) through 100 (original level) to 200. Clip and track volumes multiply:
+a 50% clip on a 50% track plays at 25%. Layers are added without automatically
+turning either one down; lower their volumes to balance the mix.
+
+Volumes apply to playback, rendered previews, and exports, and are saved with
+the project and undo history. Changing volume during playback resumes at the
+current position with the updated mix. Projects saved by this version use format
+8; older projects load with all volumes at 100%.
