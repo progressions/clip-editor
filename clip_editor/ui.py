@@ -27,6 +27,8 @@ from clip_editor.aspects import (
     DEFAULT_RESOLUTION,
     RESOLUTIONS,
     cover_crop,
+    cover_source_placement,
+    resize_source_from_corner,
     dest_size,
 )
 from clip_editor.commands import parse_command
@@ -304,10 +306,14 @@ class CoverPreview(Gtk.Widget):
         self.transform_scale = 1.0
         self.output_width = 1080
         self.output_height = 1920
+        self.layers: list[tuple[ClipInst, Gdk.Paintable, int, int]] = []
+        self.selected_clip: ClipInst | None = None
+        self.on_pan_begin = None
         self.on_pan = None
         self.on_pan_end = None
+        self.on_pan_cancel = None
         self.on_scale = None
-        self._drag_pan = (0.5, 0.5)
+        self._drag_active = False
         self._texture: Gdk.Texture | None = None
         self._media: Gtk.MediaFile | None = None
         self._inv_id = 0
@@ -322,10 +328,14 @@ class CoverPreview(Gtk.Widget):
         drag.connect("drag-begin", self._drag_begin)
         drag.connect("drag-update", self._drag_update)
         drag.connect("drag-end", self._drag_end)
+        drag.connect("cancel", self._drag_cancel)
         self.add_controller(drag)
         scroll = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.VERTICAL)
         scroll.connect("scroll", self._on_scroll)
         self.add_controller(scroll)
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", self._on_transform_motion)
+        self.add_controller(motion)
 
     def _on_scroll(self, _c: Gtk.EventControllerScroll, _dx: float, dy: float) -> bool:
         if self.read_only or not callable(self.on_scale):
@@ -383,33 +393,88 @@ class CoverPreview(Gtk.Widget):
         w, h = self.get_width(), self.get_height()
         if w <= 0 or h <= 0:
             return
-        r, g, b = theme_rgb("dark_background", (0.0, 0.0, 0.0))
+        r, g, b = 0.0, 0.0, 0.0
         bg = Gdk.RGBA()
         bg.red, bg.green, bg.blue, bg.alpha = r, g, b, 1.0
         snapshot.append_color(bg, Graphene.Rect().init(0, 0, w, h))
-        p = self._paintable()
-        if p is None:
-            return
-        iw = int(p.get_intrinsic_width() or 0)
-        ih = int(p.get_intrinsic_height() or 0)
-        if iw <= 0 or ih <= 0:
-            return
-        tx = self.transform_x * w / self.output_width
-        ty = self.transform_y * h / self.output_height
-        # Draw the full source as a layer and clip it to the project frame.
-        # X/Y therefore pan the source under the viewport, rather than moving
-        # a pre-cropped project-shaped raster and exposing the background.
-        cover = max(w / iw, h / ih)
-        factor = cover * max(1.0, self.transform_scale)
-        sw, sh = iw * factor, ih * factor
-        x = min(0.0, max(w - sw, (w - sw) * self.pan_x + tx))
-        y = min(0.0, max(h - sh, (h - sh) * self.pan_y + ty))
-        snapshot.push_clip(Graphene.Rect().init(0, 0, w, h))
-        snapshot.translate(Graphene.Point().init(x, y))
-        p.snapshot(snapshot, sw, sh)
-        snapshot.pop()
+        layers = [] if self.blank else self.layers
+        if layers:
+            for clip, paintable, iw, ih in layers:
+                self._snapshot_layer(snapshot, paintable, iw, ih, clip.transform_x,
+                                     clip.transform_y, clip.scale, w, h)
+        else:
+            p = self._paintable()
+            if p is not None:
+                self._snapshot_layer(snapshot, p, int(p.get_intrinsic_width() or 0),
+                                     int(p.get_intrinsic_height() or 0), self.transform_x,
+                                     self.transform_y, self.transform_scale, w, h)
         if self.safe_zones:
             self._snapshot_safe_zones(snapshot, w, h)
+        self._snapshot_selection(snapshot)
+
+    def _snapshot_layer(self, snapshot, paintable, iw, ih, tx, ty, scale, w, h) -> None:
+        if min(iw, ih) <= 0:
+            return
+        box = cover_source_placement(iw, ih, self.output_width, self.output_height,
+                                     self.pan_x, self.pan_y, tx, ty, scale)
+        ux, uy = w / self.output_width, h / self.output_height
+        snapshot.save()
+        snapshot.push_clip(Graphene.Rect().init(0, 0, w, h))
+        snapshot.translate(Graphene.Point().init(box.x * ux, box.y * uy))
+        paintable.snapshot(snapshot, box.w * ux, box.h * uy)
+        snapshot.pop()
+        snapshot.restore()
+
+    def _selection_box(self) -> tuple[float, float, float, float] | None:
+        if self.read_only or self.blank or self.selected_clip is None:
+            return None
+        layers = self.layers or [(self.selected_clip, None, *getattr(self, "selected_source_size", (0, 0)))]
+        for clip, _paintable, iw, ih in layers:
+            if min(iw, ih) <= 0 or clip is not self.selected_clip:
+                continue
+            box = cover_source_placement(iw, ih, self.output_width, self.output_height,
+                                         self.pan_x, self.pan_y, clip.transform_x,
+                                         clip.transform_y, clip.scale)
+            w, h = self.get_width(), self.get_height()
+            ux, uy = w / self.output_width, h / self.output_height
+            left, top = max(6, box.x * ux), max(6, box.y * uy)
+            right, bottom = min(w - 6, (box.x + box.w) * ux), min(h - 6, (box.y + box.h) * uy)
+            if right > left and bottom > top:
+                return left, top, right, bottom
+        return None
+
+    def _hit_transform(self, x: float, y: float) -> str:
+        box = self._selection_box()
+        if box is None:
+            return ""
+        left, top, right, bottom = box
+        for corner, hx, hy in (("nw", left, top), ("ne", right, top),
+                               ("sw", left, bottom), ("se", right, bottom)):
+            if abs(x - hx) <= 9 and abs(y - hy) <= 9:
+                return corner
+        return "move" if left <= x <= right and top <= y <= bottom else ""
+
+    def _on_transform_motion(self, _controller, x: float, y: float) -> None:
+        if self._drag_active:
+            return
+        hit = self._hit_transform(x, y)
+        cursor = {"nw": "nwse-resize", "se": "nwse-resize", "ne": "nesw-resize",
+                  "sw": "nesw-resize", "move": "grab"}.get(hit, "default")
+        self.set_cursor_from_name(cursor)
+
+    def _snapshot_selection(self, snapshot) -> None:
+        box = self._selection_box()
+        if box is None:
+            return
+        left, top, right, bottom = box
+        color = Gdk.RGBA()
+        color.red, color.green, color.blue = theme_rgb("accent", (1., 1., 1.))
+        color.alpha = 1
+        for x, y, w, h in ((left, top, right-left, 2), (left, bottom-2, right-left, 2),
+                            (left, top, 2, bottom-top), (right-2, top, 2, bottom-top)):
+            snapshot.append_color(color, Graphene.Rect().init(x, y, w, h))
+        for x, y in ((left, top), (right, top), (left, bottom), (right, bottom)):
+            snapshot.append_color(color, Graphene.Rect().init(x-5, y-5, 10, 10))
 
     def set_safe_zones(self, on: bool) -> None:
         if self.safe_zones == on:
@@ -439,48 +504,34 @@ class CoverPreview(Gtk.Widget):
         for rx, ry, rw, rh in ((0, top, w, 1), (0, bottom - 1, w, 1)):
             snapshot.append_color(edge, Graphene.Rect().init(rx, ry, rw, rh))
 
-    def _overflow(self) -> tuple[float, float]:
-        p = self._paintable()
-        w, h = self.get_width(), self.get_height()
-        if p is None or w <= 0 or h <= 0:
-            return 0.0, 0.0
-        pw = int(p.get_intrinsic_width() or 0)
-        ph = int(p.get_intrinsic_height() or 0)
-        if pw <= 0 or ph <= 0:
-            return 0.0, 0.0
-        src_a = pw / ph
-        dst_a = w / h
-        scale = max(1.0, self.transform_scale)
-        if src_a > dst_a:
-            return pw * (h / ph) * scale - w, 0.0
-        return 0.0, ph * (w / pw) * scale - h
-
-    def _drag_begin(self, *_args: object) -> None:
-        if self.read_only:
-            return
-        self._drag_pan = (self.pan_x, self.pan_y)
-        self.set_cursor_from_name("grabbing")
+    def _drag_begin(self, _gesture=None, x: float | None = None, y: float | None = None) -> None:
+        mode = self._hit_transform(x, y) if x is not None and y is not None else "move"
+        self._drag_active = (
+            bool(mode) and not self.read_only
+            and callable(self.on_pan_begin)
+            and bool(self.on_pan_begin(mode))
+        )
+        if self._drag_active:
+            self.set_cursor_from_name("grabbing")
 
     def _drag_update(self, _g: Gtk.GestureDrag, dx: float, dy: float) -> None:
-        if self.read_only:
-            return
-        ox, oy = self._overflow()
-        px, py = self._drag_pan
-        if ox > 1:
-            self.pan_x = min(1.0, max(0.0, px - dx / ox))
-        if oy > 1:
-            self.pan_y = min(1.0, max(0.0, py - dy / oy))
-        self.queue_draw()
-        if callable(self.on_pan):
-            self.on_pan()
+        if self._drag_active and not self.read_only and callable(self.on_pan):
+            self.on_pan(dx, dy)
 
     def _drag_end(self, *_args: object) -> None:
-        if self.read_only:
-            self.set_cursor_from_name("default")
-            return
-        self.set_cursor_from_name("grab")
-        if callable(self.on_pan_end):
+        active = self._drag_active
+        self._drag_active = False
+        self.set_cursor_from_name("default" if self.read_only else "grab")
+        if active and callable(self.on_pan_end):
             self.on_pan_end()
+
+    def _drag_cancel(self, *_args: object) -> None:
+        active = self._drag_active
+        self._drag_active = False
+        self.set_cursor_from_name("default")
+        if active and callable(self.on_pan_cancel):
+            self.on_pan_cancel()
+
 
 
 def _rgb_luminance(color: tuple[float, float, float]) -> float:
@@ -2517,6 +2568,9 @@ class EditorWindow(Adw.ApplicationWindow):
         self._tick: int | None = None
         self._prep_handler: int = 0
         self._space_held = False
+        self._preview_drag_clip: ClipInst | None = None
+        self._layer_media: dict[int, tuple[Gtk.MediaFile, int, int]] = {}
+        self._raw_layer_ids: tuple[int, ...] = ()
         self._history: list[Project] = []
         self._hist_i = -1
         self._ckpt_src: int = 0
@@ -3073,9 +3127,67 @@ class EditorWindow(Adw.ApplicationWindow):
                 and self._hist_i < len(self._history) - 1
             )
 
+    def _on_preview_pan_begin(self, mode: str = "move") -> bool:
+        """Start a per-clip translation, using the selected source, not a proxy."""
+        self._preview_drag_clip = None
+        clip = self._selected_video_clip()
+        if clip is None or self._busy_rendering() or not self._guard_edit("transform"):
+            return False
+        info = self.media_info.get(clip.media_id) or self.video_info or {}
+        sw, sh = int(info.get("width") or 0), int(info.get("height") or 0)
+        vw, vh = self.preview.get_width(), self.preview.get_height()
+        if min(sw, sh, vw, vh) <= 0:
+            return False
+        dw, dh = dest_size(self.aspect, self.resolution)
+        self._preview_drag_origin = (clip.transform_x, clip.transform_y, clip.scale)
+        self._preview_drag_mode = mode
+        self._preview_drag_source = (sw, sh, dw, dh)
+        self._preview_drag_units = (dw / vw, dh / vh)
+        self._stop()
+        self._preview_drag_clip = clip
+        self._apply_timeline_frame(self.timeline.playhead, start_media=False, edit_clip=clip)
+        return True
+
+    def _on_preview_pan(self, dx: float, dy: float) -> None:
+        clip = self._preview_drag_clip
+        if (clip is None or clip is not self._selected_video_clip()
+                or self._busy_rendering() or self._editing_locked()):
+            return
+        x, y, scale = self._preview_drag_origin
+        ux, uy = self._preview_drag_units
+        if dx == 0 and dy == 0:
+            clip.transform_x, clip.transform_y, clip.scale = x, y, scale
+        elif self._preview_drag_mode == "move":
+            clip.transform_x = min(4096, max(-4096, x + dx * ux))
+            clip.transform_y = min(4096, max(-4096, y + dy * uy))
+        else:
+            sw, sh, dw, dh = self._preview_drag_source
+            clip.transform_x, clip.transform_y, clip.scale = resize_source_from_corner(
+                sw, sh, dw, dh, self.preview.pan_x, self.preview.pan_y, x, y, scale,
+                self._preview_drag_mode, dx * ux, dy * uy,
+            )
+        clip.transform_x = min(4096, max(-4096, clip.transform_x))
+        clip.transform_y = min(4096, max(-4096, clip.transform_y))
+        self._sync_transform_controls()
+        dw, dh = dest_size(self.aspect, self.resolution)
+        self.preview.set_transform(clip.transform_x, clip.transform_y, clip.scale, dw, dh)
+
+    def _on_preview_pan_cancel(self) -> None:
+        clip = self._preview_drag_clip
+        if clip is None:
+            return
+        clip.transform_x, clip.transform_y, clip.scale = self._preview_drag_origin
+        self._preview_drag_clip = None
+        self._sync_transform_controls()
+        self.preview.queue_draw()
+
     def _on_preview_pan_end(self, *_args: object) -> None:
+        if self._preview_drag_clip is None:
+            return
+        self._preview_drag_clip = None
         self._checkpoint()
         self._refresh_cache_bar()
+        self._schedule_autosave()
 
     def _checkpoint(self, *_args: object) -> None:
         if self._loading or self._applying_history or self._editing_locked():
@@ -3700,8 +3812,10 @@ class EditorWindow(Adw.ApplicationWindow):
         self.aspect_frame.set_hexpand(True)
         self.aspect_frame.set_vexpand(True)
         self.preview = CoverPreview()
-        self.preview.on_pan = self._refresh_crop
+        self.preview.on_pan_begin = self._on_preview_pan_begin
+        self.preview.on_pan = self._on_preview_pan
         self.preview.on_pan_end = self._on_preview_pan_end
+        self.preview.on_pan_cancel = self._on_preview_pan_cancel
         self.preview.on_scale = self._on_preview_scale
         self.aspect_frame.set_child(self.preview)
         body.append(self.aspect_frame)
@@ -4005,11 +4119,11 @@ class EditorWindow(Adw.ApplicationWindow):
 
         self.transform_x_spin = Gtk.SpinButton.new_with_range(-4096, 4096, 1)
         self.transform_y_spin = Gtk.SpinButton.new_with_range(-4096, 4096, 1)
-        self.transform_scale_spin = Gtk.SpinButton.new_with_range(1.0, 4.0, 0.05)
+        self.transform_scale_spin = Gtk.SpinButton.new_with_range(0.05, 4.0, 0.05)
         self.transform_scale_spin.set_digits(2)
         self.transform_scale_spin.set_value(1.0)
         self.transform_scale_spin.set_tooltip_text(
-            "1.00 fills the frame. Scroll on the preview to change it."
+            "1.00 fills the frame; smaller values reveal lower tracks. Drag a preview corner to resize."
         )
         for spin in (self.transform_x_spin, self.transform_y_spin, self.transform_scale_spin):
             spin.connect("value-changed", self._on_transform_changed)
@@ -4209,11 +4323,11 @@ class EditorWindow(Adw.ApplicationWindow):
             self._begin_timeline_play(playhead)
 
     def _on_preview_scale(self, steps: float) -> None:
-        """Scroll on the preview scales the clip under the playhead (1.00–4.00)."""
+        """Scroll on the preview scales the selected clip (0.05–4.00)."""
         if self._selected_video_clip() is None:
             return
         value = self.transform_scale_spin.get_value() * (1.05 ** -steps)
-        self.transform_scale_spin.set_value(max(1.0, min(4.0, value)))
+        self.transform_scale_spin.set_value(max(0.05, min(4.0, value)))
 
     def _on_safe_zones(self, btn: Gtk.ToggleButton) -> None:
         btn.text_label.set_text("safe zones on" if btn.get_active() else "safe zones off")
@@ -4558,6 +4672,10 @@ class EditorWindow(Adw.ApplicationWindow):
 
     def _sync_transform_controls(self) -> None:
         clip = self._selected_video_clip()
+        self.preview.selected_clip = clip
+        info = (self.media_info.get(clip.media_id) or self.video_info or {}) if clip else {}
+        self.preview.selected_source_size = (int(info.get("width") or 0), int(info.get("height") or 0))
+        self.preview.queue_draw()
         enabled = clip is not None and not self._editing_locked()
         controls = (
             self.transform_x_spin,
@@ -4588,8 +4706,10 @@ class EditorWindow(Adw.ApplicationWindow):
             return
         clip.transform_x = self.transform_x_spin.get_value()
         clip.transform_y = self.transform_y_spin.get_value()
-        clip.scale = max(1.0, self.transform_scale_spin.get_value())
-        self._apply_timeline_frame(self.timeline.playhead, start_media=False)
+        clip.scale = max(0.05, self.transform_scale_spin.get_value())
+        self._stop()
+        self._refresh_cache_bar()
+        self._apply_timeline_frame(self.timeline.playhead, start_media=False, edit_clip=clip)
         self._schedule_checkpoint()
         self._schedule_autosave()
 
@@ -4897,6 +5017,7 @@ class EditorWindow(Adw.ApplicationWindow):
             audio_clips=self._render_clips("audio"),
             src_durs=self._src_durs(),
             aspect=self.aspect,
+            resolution=self.resolution,
             pan_x=self.preview.pan_x,
             pan_y=self.preview.pan_y,
             audio_follows_in=self.follow_in.get_active(),
@@ -5491,6 +5612,8 @@ class EditorWindow(Adw.ApplicationWindow):
                 clip.transform_x, clip.transform_y, clip.scale, w, h
             )
         self._refresh_crop()
+        self._refresh_cache_bar()
+        self._apply_timeline_frame(self.timeline.playhead, start_media=False)
         self._checkpoint()
 
     def _set_in(self, *_args: object) -> None:
@@ -5676,6 +5799,9 @@ class EditorWindow(Adw.ApplicationWindow):
         self._sync_transition_controls()
         self._sync_audio_volume_controls()
         self._sync_fade_controls()
+        clip = self._selected_video_clip()
+        if clip is not None and not self.playing:
+            self._apply_timeline_frame(self.timeline.playhead, start_media=False, edit_clip=clip)
 
     def _place_clip(self, kind: str, t: float, media_id: str = "", track: int | None = None) -> None:
         if not self._guard_edit("media_place"):
@@ -6101,14 +6227,79 @@ class EditorWindow(Adw.ApplicationWindow):
                 end = max(end, c1)
         return end
 
+    def _videos_at(self, t: float) -> list[ClipInst]:
+        visible: dict[int, ClipInst] = {}
+        for clip in self.video_clips:
+            dur = self._media_dur(clip.media_id) or float((self.video_info or {}).get("duration") or 0)
+            t0, t1 = self._clip_span(clip, dur)
+            if t0 <= t < t1:
+                visible[int(clip.track)] = clip
+        return [visible[track] for track in sorted(visible)]
+
     def _video_at(self, t: float) -> ClipInst | None:
-        hit = None
-        dur = float((self.video_info or {}).get("duration") or 0)
-        for c in sorted(self.video_clips, key=lambda clip: int(clip.track)):
-            t0, t1 = self._clip_span(c, dur)
-            if t0 - 0.02 <= t < t1:
-                hit = c
-        return hit
+        clips = self._videos_at(t)
+        return clips[-1] if clips else None
+
+    def _clear_preview_layers(self) -> None:
+        self.preview.layers = []
+        self._raw_layer_ids = ()
+        for media, invalidate, prepared in self._layer_media.values():
+            media.disconnect(invalidate)
+            if prepared:
+                media.disconnect(prepared)
+            media.pause()
+            media.clear()
+        self._layer_media.clear()
+
+    def _sync_preview_layers(self, t: float, *, start_media: bool) -> None:
+        clips = self._videos_at(t)
+        wanted = {id(clip) for clip in clips[:-1]}
+        for key in set(self._layer_media) - wanted:
+            media, invalidate, prepared = self._layer_media.pop(key)
+            media.disconnect(invalidate)
+            if prepared:
+                media.disconnect(prepared)
+            media.pause()
+            media.clear()
+        layers = []
+        for clip in clips:
+            info = self.media_info.get(clip.media_id) or self.video_info or {}
+            iw, ih = int(info.get("width") or 0), int(info.get("height") or 0)
+            if min(iw, ih) <= 0:
+                continue
+            if clip is clips[-1]:
+                media = self._vmedia
+            else:
+                key = id(clip)
+                item = self._clip_item(clip, "video")
+                if item is None:
+                    continue
+                if key not in self._layer_media:
+                    media = Gtk.MediaFile.new_for_filename(str(item.path))
+                    media.set_loop(False)
+                    media.set_muted(True)
+                    invalidate = media.connect("invalidate-contents", lambda *_: self.preview.queue_draw())
+                    self._layer_media[key] = (media, invalidate, 0)
+                media, invalidate, prepared = self._layer_media[key]
+                if prepared:
+                    media.disconnect(prepared)
+                source = self._source_time(clip, t, float(info.get("duration") or 0))
+                def seek(*_args, player=media, offset=source, play=start_media):
+                    if self._closed or not player.is_prepared():
+                        return
+                    player.seek(int(offset * 1_000_000))
+                    player.play() if play and self.playing else player.pause()
+                prepared = 0
+                if media.is_prepared():
+                    seek()
+                else:
+                    prepared = media.connect("notify::prepared", seek)
+                self._layer_media[key] = (media, invalidate, prepared)
+            if media is not None:
+                layers.append((clip, media, iw, ih))
+        self.preview.layers = layers
+        self._raw_layer_ids = tuple(id(clip) for clip in clips)
+        self.preview.queue_draw()
 
     def _cached_playback_available(self, timeline_t: float) -> bool:
         """Whether this playhead position can safely use the baked proxy."""
@@ -6133,6 +6324,7 @@ class EditorWindow(Adw.ApplicationWindow):
         if path is None:
             return False
         self._stop_preview_audio()
+        self._clear_preview_layers()
         self._load_media(path)
         if self._vmedia is None:
             return False
@@ -6174,13 +6366,24 @@ class EditorWindow(Adw.ApplicationWindow):
                 m.play()
         return True
 
-    def _apply_timeline_frame(self, timeline_t: float, *, start_media: bool) -> None:
-        if not self._compiled_mode and self._cached_playback_available(timeline_t):
+    def _apply_timeline_frame(
+        self, timeline_t: float, *, start_media: bool, edit_clip: ClipInst | None = None
+    ) -> None:
+        # Seek inside the selection before transforming, including at a cut.
+        # A baked frame cannot show live changes to individual layers.
+        if edit_clip is not None:
+            duration = self._media_dur(edit_clip.media_id) or float((self.video_info or {}).get("duration") or 0)
+            t0, t1 = self._clip_span(edit_clip, duration)
+            if not t0 <= timeline_t < t1:
+                timeline_t = max(0, t0)
+                self.timeline.set_playhead(timeline_t)
+        if edit_clip is None and not self._compiled_mode and self._cached_playback_available(timeline_t):
             if self._show_playthrough(timeline_t, start_media=start_media):
                 return
         self._playthrough_playing = False
         clip = self._video_at(timeline_t)
         if clip is None or self._vmedia is None:
+            self._clear_preview_layers()
             dw, dh = dest_size(self.aspect, self.resolution)
             self.preview.set_transform(0.0, 0.0, 1.0, dw, dh)
             self.preview.set_blank(True)
@@ -6202,14 +6405,12 @@ class EditorWindow(Adw.ApplicationWindow):
         dur = float(info.get("duration") or 0)
         source = self._source_time(clip, timeline_t, dur)
         self.preview.set_media(self._vmedia)
+        self._sync_preview_layers(timeline_t, start_media=start_media)
         if start_media:
             self._play_media_at(source)
             self._clip_playing = True
         else:
-            try:
-                self._vmedia.seek(int(source * 1_000_000))
-            except GLib.Error:
-                pass
+            self._play_media_at(source, start_media=False)
             self.preview.queue_draw()
 
     def _start_preview_audio(self, timeline_t: float) -> None:
@@ -6337,6 +6538,7 @@ class EditorWindow(Adw.ApplicationWindow):
         return False
 
     def _dispose_media(self) -> None:
+        self._clear_preview_layers()
         if self._vmedia is not None and self._prep_handler:
             try:
                 self._vmedia.disconnect(self._prep_handler)
@@ -6362,33 +6564,39 @@ class EditorWindow(Adw.ApplicationWindow):
         self._vmedia = media
         self._vmedia_path = path
 
-    def _play_media_at(self, t: float) -> None:
+    def _play_media_at(self, t: float, *, start_media: bool = True) -> None:
         m = self._vmedia
         if m is None:
             return
         def go(*_a: object) -> bool:
-            # Gtk.Picture is video-only; sound goes through ffplay/mpv.
+            if self._closed or not m.is_prepared():
+                return False
+            # The preview is video-only; sound goes through ffplay/mpv.
             m.set_muted(True)
             m.set_volume(0.0)
             try:
                 m.seek(int(max(0.0, t) * 1_000_000))
             except GLib.Error:
                 pass
-            m.play()
+            m.play() if start_media and self.playing else m.pause()
             return False
 
-        if m.is_prepared():
-            go()
-            return
         if self._prep_handler:
             try:
                 m.disconnect(self._prep_handler)
             except (TypeError, RuntimeError):
                 pass
-        self._prep_handler = m.connect("notify::prepared", go)
-        m.play()
+        self._prep_handler = 0
+        if m.is_prepared():
+            go()
+        else:
+            self._prep_handler = m.connect("notify::prepared", go)
+            if start_media:
+                m.play()
 
     def _stop(self) -> None:
+        for media, _invalidate, _prepared in self._layer_media.values():
+            media.pause()
         self.playing = False
         self._clip_playing = False
         self._audio_pending = False
@@ -6549,6 +6757,9 @@ class EditorWindow(Adw.ApplicationWindow):
         elif not self._clip_playing:
             self._video_play_clip = vclip
             self._apply_timeline_frame(t, start_media=True)
+        elif tuple(id(c) for c in self._videos_at(t)) != self._raw_layer_ids:
+            self._video_play_clip = vclip
+            self._apply_timeline_frame(t, start_media=True)
         elif vclip is not prev_v:
             if self._continuous_with(prev_v, vclip, vdur):
                 self._video_play_clip = vclip
@@ -6603,6 +6814,7 @@ class EditorWindow(Adw.ApplicationWindow):
     ) -> str:
         return render_fingerprint(
             aspect=self.aspect,
+            resolution=self.resolution,
             pan_x=self.preview.pan_x,
             pan_y=self.preview.pan_y,
             audio_follows_in=self.follow_in.get_active(),
@@ -6822,6 +7034,7 @@ class EditorWindow(Adw.ApplicationWindow):
         video = self.video_path
         audio = self.audio_path
         aspect = self.aspect
+        resolution = self.resolution
         pan_x, pan_y = self.preview.pan_x, self.preview.pan_y
         follows = self.follow_in.get_active()
         use_soundtrack = self.use_video_soundtrack
@@ -6851,6 +7064,7 @@ class EditorWindow(Adw.ApplicationWindow):
                     out,
                     audio=audio,
                     aspect=aspect,
+                    resolution=resolution,
                     pan_x=pan_x,
                     pan_y=pan_y,
                     in_s=0.0,
@@ -6921,9 +7135,9 @@ class EditorWindow(Adw.ApplicationWindow):
         self.timeline.set_playhead(t)
         self._syncing_scrub = False
         self.clock.set_text(f"{t:.2f} / {end:.2f}")
+        self.playing = True
         self._apply_timeline_frame(t, start_media=True)
         self._start_preview_audio(t)
-        self.playing = True
         self.btn_play.text_label.set_text("pause")
         if self._tick is not None:
             GLib.source_remove(self._tick)
@@ -6990,6 +7204,7 @@ class EditorWindow(Adw.ApplicationWindow):
         video = self.video_path
         audio = self.audio_path
         aspect = self.aspect
+        resolution = self.resolution
         pan_x, pan_y = self.preview.pan_x, self.preview.pan_y
         follows = self.follow_in.get_active()
         use_soundtrack = self.use_video_soundtrack
@@ -7016,6 +7231,7 @@ class EditorWindow(Adw.ApplicationWindow):
                     out,
                     audio=audio,
                     aspect=aspect,
+                    resolution=resolution,
                     pan_x=pan_x,
                     pan_y=pan_y,
                     in_s=0.0,

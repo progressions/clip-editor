@@ -9,7 +9,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
-from clip_editor.aspects import cover_crop, cover_source_placement, normalize_resolution
+from clip_editor.aspects import cover_crop, cover_source_placement, dest_size, normalize_resolution
 from clip_editor.eagle import inbox_dir
 from clip_editor.preview import (
     FINAL_PROFILE,
@@ -25,6 +25,7 @@ from clip_editor.project import (
     MediaItem,
     apply_legacy_crossfade,
     atempo_chain,
+    clamp_clip_fades,
     normalize_speed,
     normalize_transition,
 )
@@ -499,8 +500,6 @@ def _append_clip_fades(
     Video fades go through rgb24 with an explicit black so the frame reaches
     true black (yuv420p studio-range fades can look like dark gray).
     """
-    from clip_editor.project import clamp_clip_fades
-
     fi, fo = clamp_clip_fades(fade_in_s, fade_out_s, timeline_dur)
     if fi <= 0.0 and fo <= 0.0:
         return
@@ -744,7 +743,7 @@ def _join_parts(
         out_label = f"{kind}join{i}"
         xfade = _xfade_name(ttype) if transition > 0.001 else None
         if xfade is not None:
-            if kind == "video":
+            if kind.startswith("video"):
                 offset = max(0.0, duration - transition)
                 filters.append(
                     f"{current}{label}xfade=transition={xfade}:"
@@ -767,7 +766,7 @@ def _join_parts(
                 }
             )
         else:
-            if kind == "video":
+            if kind.startswith("video"):
                 filters.append(f"{current}{label}concat=n=2:v=1:a=0[{out_label}]")
             else:
                 filters.append(f"{current}{label}concat=n=2:v=0:a=1[{out_label}]")
@@ -839,6 +838,11 @@ def _build_cmd_many(
         vwork.append(cc)
     if crossfade_s and float(crossfade_s) > 0.001:
         apply_legacy_crossfade(vwork, float(crossfade_s))
+    vflats = {
+        track: _flatten_clips([c for c in vwork if int(c.track) == track], durs)
+        for track in (1, 2)
+    }
+    vflats = {track: rows for track, rows in vflats.items() if rows}
     vflat = _flatten_clips(vwork, durs if durs else src_dur)
     if not vflat:
         raise ExportError("no video on the timeline")
@@ -865,6 +869,7 @@ def _build_cmd_many(
         out_dur = max(out_dur, aflat[-1][1])
     out_dur = max(out_dur, 0.05)
     v_parts = _timeline_parts(vflat, out_dur)
+    v_parts_by_track = {track: _timeline_parts(rows, out_dur) for track, rows in vflats.items()}
     a_parts_by_track = {
         track: _timeline_parts(aflat, out_dur) for track, aflat in aflats.items()
     }
@@ -885,8 +890,9 @@ def _build_cmd_many(
         inputs.append(path)
         return idx_of[mid]
 
-    for row in vflat:
-        add_input(str(row[4]))
+    for rows in vflats.values():
+        for row in rows:
+            add_input(str(row[4]))
     for aflat in aflats.values():
         for row in aflat:
             add_input(str(row[4]))
@@ -898,7 +904,7 @@ def _build_cmd_many(
     if fps < 1:
         fps = 30.0
 
-    v_mids = [str(p[3]) for p in v_parts if p[0] == "seg"]
+    v_mids = [str(p[3]) for parts in v_parts_by_track.values() for p in parts if p[0] == "seg"]
     v_idx_count = Counter(idx_of.get(mid, 0) for mid in v_mids)
     filters: list[str] = []
     v_split_at = {i: 0 for i in v_idx_count}
@@ -908,128 +914,83 @@ def _build_cmd_many(
                 f"[{i}:v]split={n}" + "".join(f"[vin{i}_{k}]" for k in range(n))
             )
 
-    v_labs: list[str] = []
-    for i, part in enumerate(v_parts):
-        lab = "v" if len(v_parts) == 1 else f"vs{i}"
-        if part[0] == "gap":
-            d = float(part[1])
-            filters.append(
-                f"color=c=black:s={dw}x{dh}:r={fps:.4f}:d={d:.6f},"
-                f"format=yuv420p,fps={fps:.4f},settb=AVTB,"
-                f"setpts=PTS-STARTPTS,setsar=1[{lab}]"
-            )
-        else:
-            sinn, sdur, mid = float(part[1]), float(part[2]), str(part[3])
-            tx, ty = float(part[4]), float(part[5])
-            clip_scale = max(0.05, float(part[6]))
-            speed = _part_speed(part)
-            ii = idx_of.get(mid, 0)
-            info = probes.get(mid) or src
-            dur = float(info.get("duration") or src_dur or 0)
-            try:
-                iw, ih = int(info.get("width") or src_w), int(info.get("height") or src_h)
-            except (TypeError, ValueError):
-                iw, ih = src_w, src_h
-            this_crop = cover_crop(iw, ih, dw, dh, pan_x, pan_y) if iw >= 2 and ih >= 2 else crop
-            transformed = (
-                abs(tx) > 0.0001
-                or abs(ty) > 0.0001
-                or abs(clip_scale - 1.0) > 0.0001
-            )
-            reverse = bool(part[13]) if len(part) > 13 else False
-            if reverse:
-                sinn = max(0.0, dur - sinn - sdur)
-            chain = []
-            if _trim_needed(sinn, sdur, dur):
-                chain.append(f"trim=start={sinn:.6f}:duration={sdur:.6f}")
-            if reverse:
-                chain.append("reverse")
-            if abs(speed - 1.0) > 1e-6:
-                chain.append(f"setpts=(PTS-STARTPTS)/{speed:.6f}")
-            else:
-                chain.append("setpts=PTS-STARTPTS")
-            if transformed:
-                placement = cover_source_placement(
-                    iw, ih, dw, dh, pan_x, pan_y, tx, ty, clip_scale
-                )
-                # Transform the full source layer, then crop it to the project
-                # frame by overlaying it.  Cropping first would turn X/Y into
-                # movement of a 9:16 raster and reveal a black margin.
-                chain.append(f"scale={placement.w}:{placement.h}:flags=lanczos")
-            else:
-                chain += [
-                    this_crop.as_ffmpeg(),
-                    f"scale={dw}:{dh}:flags=lanczos",
-                ]
-            chain += [
-                f"fps={fps:.4f}",
-                "settb=AVTB",
-                "setsar=1",
-                "format=yuv420p",
-            ]
-            fade_in_s, fade_out_s = _part_fades(part)
-            tl_dur = _part_duration(part)
-            if v_idx_count[ii] > 1:
-                k = v_split_at[ii]
-                v_split_at[ii] = k + 1
-                pad = f"[vin{ii}_{k}]"
-            else:
-                pad = f"[{ii}:v]"
-            if transformed:
-                fg = f"vfg{i}"
-                bg = f"vbg{i}"
-                pre = f"vpre{i}"
-                xexpr = str(placement.x)
-                yexpr = str(placement.y)
-                filters.append(f"{pad}{','.join(chain)}[{fg}]")
-                filters.append(
-                    f"color=c=black:s={dw}x{dh}:r={fps:.4f}:d={tl_dur:.6f},"
-                    f"format=yuv420p[{bg}]"
-                )
-                # Compose first, then fade the full frame to black (#567).
-                filters.append(
-                    f"[{bg}][{fg}]overlay=x={xexpr}:y={yexpr}:"
-                    f"shortest=1:eof_action=pass,fps={fps:.4f},"
-                    f"settb=AVTB,setpts=PTS-STARTPTS[{pre}]"
-                )
-                fade_chain: list[str] = []
-                _append_clip_fades(
-                    fade_chain,
-                    kind="video",
-                    timeline_dur=tl_dur,
-                    fade_in_s=fade_in_s,
-                    fade_out_s=fade_out_s,
-                )
-                if fade_chain:
-                    filters.append(f"[{pre}]{','.join(fade_chain)}[{lab}]")
-                else:
-                    filters.append(f"[{pre}]null[{lab}]")
-            else:
-                # Intra-clip fades on the finished frame before join (#567).
-                # Outgoing #487 xfade still applies at the cut afterward.
-                _append_clip_fades(
-                    chain,
-                    kind="video",
-                    timeline_dur=tl_dur,
-                    fade_in_s=fade_in_s,
-                    fade_out_s=fade_out_s,
-                )
-                filters.append(f"{pad}{','.join(chain)}[{lab}]")
-        v_labs.append(f"[{lab}]")
-    video_duration = out_dur
-    v_joins = _join_transitions_for_parts(v_parts)
+    frame_w, frame_h = dest_size(aspect, resolution)
+    video_outputs: list[str] = []
+    video_duration = 0.0
     v_applied: list[dict[str, Any]] = []
-    if len(v_labs) > 1:
-        v_label, video_duration, v_applied = _join_parts(
-            filters,
-            v_parts,
-            v_labs,
-            kind="video",
-            join_transitions=v_joins,
+    for track, parts in sorted(v_parts_by_track.items()):
+        labels: list[str] = []
+        for i, part in enumerate(parts):
+            lab = f"v{track}s{i}"
+            tl_dur = _part_duration(part)
+            canvas = (
+                f"color=c=black@0.0:s={dw}x{dh}:r={fps:.4f}:d={tl_dur:.6f},"
+                "format=yuva420p,settb=AVTB,setpts=PTS-STARTPTS,setsar=1"
+            )
+            if part[0] == "gap":
+                filters.append(f"{canvas}[{lab}]")
+            else:
+                sinn, sdur, mid = float(part[1]), float(part[2]), str(part[3])
+                tx, ty, clip_scale = map(float, part[4:7])
+                speed = _part_speed(part)
+                ii = idx_of.get(mid, 0)
+                info = probes.get(mid) or src
+                iw, ih = int(info.get("width") or src_w), int(info.get("height") or src_h)
+                placement = cover_source_placement(
+                    iw, ih, dw, dh, pan_x, pan_y,
+                    tx * dw / frame_w, ty * dh / frame_h, clip_scale,
+                )
+                reverse = bool(part[13]) if len(part) > 13 else False
+                if reverse:
+                    duration = float(info.get("duration") or src_dur or 0)
+                    sinn = max(0.0, duration - sinn - sdur)
+                chain = [
+                    f"trim=start={sinn:.6f}:duration={sdur:.6f}",
+                    *(["reverse"] if reverse else []),
+                    f"setpts=(PTS-STARTPTS)/{speed:.6f}",
+                    f"scale={placement.w}:{placement.h}:flags=lanczos",
+                    f"fps={fps:.4f}", "settb=AVTB", "setsar=1", "format=yuva420p",
+                ]
+                fi, fo = _part_fades(part)
+                fi, fo = clamp_clip_fades(fi, fo, tl_dur)
+                # Fade layer opacity, so lower tracks remain visible.
+                if fi > 0:
+                    chain.append(f"fade=t=in:st=0:d={fi:.6f}:alpha=1")
+                if fo > 0:
+                    chain.append(f"fade=t=out:st={max(0, tl_dur-fo):.6f}:"
+                                 f"d={max(.001, fo-1/fps):.6f}:alpha=1")
+                if v_idx_count[ii] > 1:
+                    k = v_split_at[ii]
+                    v_split_at[ii] += 1
+                    pad = f"[vin{ii}_{k}]"
+                else:
+                    pad = f"[{ii}:v]"
+                filters.append(f"{pad}{','.join(chain)}[{lab}fg]")
+                filters.append(f"{canvas}[{lab}bg]")
+                filters.append(
+                    f"[{lab}bg][{lab}fg]overlay=x={placement.x}:y={placement.y}:"
+                    f"shortest=1:eof_action=pass:format=auto,format=yuva420p[{lab}]"
+                )
+            labels.append(f"[{lab}]")
+        joined, duration, applied = _join_parts(
+            filters, parts, labels, kind=f"video{track}",
+            join_transitions=_join_transitions_for_parts(parts),
         )
-        if v_label != "[v]":
-            filters.append(f"{v_label}null[v]")
-    v_cut_by_t = _transitions_by_boundary_time(v_parts, v_joins)
+        video_duration = max(video_duration, duration)
+        v_applied.extend(applied)
+        video_outputs.append(joined)
+    filters.append(
+        f"color=c=black:s={dw}x{dh}:r={fps:.4f}:d={video_duration:.6f},"
+        "format=yuv420p,settb=AVTB[canvas]"
+    )
+    background = "[canvas]"
+    for i, layer in enumerate(video_outputs):
+        lab = "v" if i == len(video_outputs) - 1 else f"composite{i}"
+        filters.append(f"{background}{layer}overlay=eof_action=pass:repeatlast=0:"
+                       f"format=auto,format=yuv420p[{lab}]")
+        background = f"[{lab}]"
+    # Source audio retains the established top-visible-track routing.
+    v_cut_by_t = _transitions_by_boundary_time(v_parts, _join_transitions_for_parts(v_parts))
 
     have_audio = bool(a_parts_by_track) and (use_replacement or use_source_audio)
     if have_audio:

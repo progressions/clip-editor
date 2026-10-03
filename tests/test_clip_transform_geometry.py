@@ -18,17 +18,17 @@ class ClipTransformGeometryTest(unittest.TestCase):
         self.assertLessEqual(moved_right.x, 0)
         self.assertGreaterEqual(moved_right.x + moved_right.w, 576)
 
-    def test_translation_is_clamped_to_source_edges(self) -> None:
+    def test_translation_can_reveal_background(self) -> None:
         placement = cover_source_placement(
             1024, 1024, 576, 1024, transform_x=9999
         )
-        self.assertEqual(placement.x, 0)
+        self.assertEqual(placement.x, -224 + 9999)
         placement = cover_source_placement(
             1024, 1024, 576, 1024, transform_x=-9999
         )
-        self.assertEqual(placement.x, 576 - 1024)
+        self.assertEqual(placement.x, -224 - 9999)
 
-    def test_scale_never_shrinks_below_cover(self) -> None:
+    def test_scale_allows_smaller_overlays(self) -> None:
         placement = cover_source_placement(1024, 1024, 576, 1024, scale=0.5)
-        self.assertEqual((placement.w, placement.h), (1024, 1024))
+        self.assertEqual((placement.w, placement.h), (512, 512))
 

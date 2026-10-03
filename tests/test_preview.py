@@ -160,6 +160,7 @@ class FingerprintAndCacheTest(unittest.TestCase):
             kind="full",
         )
         h0 = render_fingerprint(**base)
+        self.assertNotEqual(h0, render_fingerprint(**dict(base, resolution="low")))
         changed = dict(base)
         changed["pan_x"] = 0.6
         self.assertNotEqual(h0, render_fingerprint(**changed))

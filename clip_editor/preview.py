@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from clip_editor.aspects import dest_size, even
+from clip_editor.aspects import dest_size, even, normalize_resolution
 from clip_editor.eagle import inbox_dir
 from clip_editor.project import (
     TRANSITION_NONE,
@@ -245,6 +245,7 @@ def render_fingerprint(
     media: list[MediaItem],
     kind: str,
     window: tuple[float, float] | None = None,
+    resolution: str = "medium",
 ) -> str:
     """Stable hash of every field that changes the rendered pixels/audio."""
     media_rows = []
@@ -255,6 +256,8 @@ def render_fingerprint(
             path = str(m.path)
         media_rows.append({"id": m.id, "kind": m.kind, "path": path})
     payload: dict[str, Any] = {
+        "compositor_version": 2,
+        "resolution": normalize_resolution(resolution),
         "aspect": aspect,
         "pan_x": round(float(pan_x), 6),
         "pan_y": round(float(pan_y), 6),
@@ -414,6 +417,7 @@ def build_timeline_segments(
     use_video_soundtrack: bool,
     audio_offset: float,
     media: list[MediaItem],
+    resolution: str = "medium",
 ) -> list[TimelineSegment]:
     """Cover used video ranges with fingerprintable segments.
 
@@ -457,6 +461,7 @@ def build_timeline_segments(
             audio_clips=a_touch,
             media=media,
             kind="seg",
+            resolution=resolution,
             window=(render_t0, render_t1),
         )
         segs.append(

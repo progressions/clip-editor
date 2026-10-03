@@ -205,6 +205,17 @@ Drop a ``.clip.json`` onto the window to open it.
 Open a (usually 1:1) gen, add a music or driver track, set 9:16, drag the
 subject into frame, Export.
 
+### Position and resize clips
+
+Select a video clip on the timeline to show its outline in the preview. Drag
+inside the outline to move it on both axes, or drag a corner to resize while
+keeping its proportions. The selected clip remains the target even when the
+other video track overlaps it. Frame settings also provide X, Y and Scale.
+
+Scale supports 5–400%. Smaller clips reveal the track underneath: V2 appears
+over V1, with black wherever neither track covers the frame. Preview caches
+and exports use the same layer placement. Each preview drag is one undo step.
+
 ### Timeline zoom
 
 Use **−** and **+** above the timeline to zoom out or in around the visible
