@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-10-03
+
 ### Added
 
 - Drag the selected video clip inside the preview to move it in X/Y; use corner handles to resize proportionally, with one undo step per drag. Selection remains the edit target at adjacent cuts and on overlapping tracks.
