@@ -201,7 +201,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 - Initial packaged release of the native GTK clip editor for Buffer-safe H.264/AAC exports.
 
-[Unreleased]: https://github.com/progressions/clip-editor/compare/v0.14.2...HEAD
+[Unreleased]: https://github.com/progressions/clip-editor/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/progressions/clip-editor/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/progressions/clip-editor/compare/v0.14.2...v0.15.0
 [0.14.2]: https://github.com/progressions/clip-editor/compare/v0.14.1...v0.14.2
 [0.14.1]: https://github.com/progressions/clip-editor/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/progressions/clip-editor/compare/v0.13.0...v0.14.0
