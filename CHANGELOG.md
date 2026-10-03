@@ -7,6 +7,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- Reverse selected video clips from the clip controls while keeping their trimmed range, timeline placement, and speed. Linked sound reverses with the video; direction is preserved by splitting, undo/redo, saved projects, rendered playback, and export. Projects now use format version 9.
+
 ## [0.15.0] — 2026-10-03
 
 ### Added

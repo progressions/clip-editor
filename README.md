@@ -250,3 +250,19 @@ Volumes apply to playback, rendered previews, and exports, and are saved with
 the project and undo history. Changing volume during playback resumes at the
 current position with the updated mix. Projects saved by this version use format
 8; older projects load with all volumes at 100%.
+
+### Reverse a clip
+
+Select a video clip, open its clip controls, and enable **Reverse** beside Speed.
+Multiple selected video clips can be reversed together. The trimmed source range,
+timeline position, speed, and duration are preserved. Linked video sound reverses
+with the picture; separate audio tracks keep their own direction.
+
+The timeline marks reversed clips with ↶ and reverses their filmstrip and waveform.
+Play renders a preview when needed, then starts playback automatically. Trimming,
+splitting, fades, transitions, undo/redo, and export retain the clip's direction.
+Trim points on a reversed clip are measured from the end of its source. Disable
+Reverse to restore forward playback.
+
+Projects now save format version 9, including each clip's direction; older
+projects load with forward playback. Original media files are never modified.

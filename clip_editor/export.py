@@ -55,7 +55,7 @@ def _flatten_clips(
     """Return timeline/source bounds, media id, transform, transition, speed, fades.
 
     Row: ``(t0, t1, sinn, sout, mid, tx, ty, scale, transition, transition_s,
-    speed, fade_in_s, fade_out_s, volume)``.
+    speed, fade_in_s, fade_out_s, volume, reverse)``.
     ``t1 - t0`` is timeline length ``(sout - sinn) / speed``. Later clips
     overwrite earlier ones on overlap, matching playback.
     """
@@ -106,6 +106,7 @@ def _flatten_clips(
             st_fi = float(row[11]) if len(row) > 11 else 0.0
             st_fo = float(row[12]) if len(row) > 12 else 0.0
             st_volume = float(row[13]) if len(row) > 13 else 1.0
+            st_reverse = bool(row[14]) if len(row) > 14 else False
             if st1 <= t0 + 0.001 or st0 >= t1 - 0.001:
                 nxt.append(
                     (
@@ -123,6 +124,7 @@ def _flatten_clips(
                         st_fi,
                         st_fo,
                         st_volume,
+                        st_reverse,
                     )
                 )
                 continue
@@ -147,6 +149,7 @@ def _flatten_clips(
                         st_fi,
                         0.0,
                         st_volume,
+                        st_reverse,
                     )
                 )
             if st1 > t1 + 0.001:
@@ -169,6 +172,7 @@ def _flatten_clips(
                         0.0,
                         st_fo,
                         st_volume,
+                        st_reverse,
                     )
                 )
         nxt.append(
@@ -187,6 +191,7 @@ def _flatten_clips(
                 fade_in_s,
                 fade_out_s,
                 float(c.volume),
+                c.reverse,
             )
         )
         segs = nxt
@@ -267,7 +272,8 @@ def build_cmd(
         audio_clips is not None and len(audio_clips) > 1
     )
     if any(
-        abs(float(c.volume) - 1.0) > 0.0001
+        c.reverse
+        or abs(float(c.volume) - 1.0) > 0.0001
         or abs(float(c.transform_x)) > 0.0001
         or abs(float(c.transform_y)) > 0.0001
         or abs(float(c.scale) - 1.0) > 0.0001
@@ -277,7 +283,8 @@ def build_cmd(
     ):
         many = True
     if any(
-        abs(float(c.volume) - 1.0) > 0.0001
+        c.reverse
+        or abs(float(c.volume) - 1.0) > 0.0001
         or float(getattr(c, "fade_in_s", 0.0) or 0.0) > 0.0
         or float(getattr(c, "fade_out_s", 0.0) or 0.0) > 0.0
         for c in (audio_clips or [])
@@ -424,7 +431,7 @@ def _timeline_parts(flat: list[tuple], out_dur: float) -> list[tuple]:
     """Build gap/seg parts.
 
     Seg: ``(seg, sinn, source_len, mid, tx, ty, scale, ttype, tdur, speed,
-    fade_in_s, fade_out_s, volume)``.
+    fade_in_s, fade_out_s, volume, reverse)``.
     """
     parts: list[tuple] = []
     t = 0.0
@@ -461,6 +468,7 @@ def _timeline_parts(flat: list[tuple], out_dur: float) -> list[tuple]:
                 fade_in_s,
                 fade_out_s,
                 float(row[13]) if len(row) > 13 else 1.0,
+                bool(row[14]) if len(row) > 14 else False,
             )
         )
         t = t1
@@ -932,8 +940,13 @@ def _build_cmd_many(
                     iw, ih, dw, dh, pan_x, pan_y,
                     tx * dw / frame_w, ty * dh / frame_h, clip_scale,
                 )
+                reverse = bool(part[13]) if len(part) > 13 else False
+                if reverse:
+                    duration = float(info.get("duration") or src_dur or 0)
+                    sinn = max(0.0, duration - sinn - sdur)
                 chain = [
                     f"trim=start={sinn:.6f}:duration={sdur:.6f}",
+                    *(["reverse"] if reverse else []),
                     f"setpts=(PTS-STARTPTS)/{speed:.6f}",
                     f"scale={placement.w}:{placement.h}:flags=lanczos",
                     f"fps={fps:.4f}", "settb=AVTB", "setsar=1", "format=yuva420p",
@@ -1005,6 +1018,9 @@ def _build_cmd_many(
                     sinn, sdur, mid = float(part[1]), float(part[2]), str(part[3])
                     speed = _part_speed(part)
                     ii = idx_of.get(mid, 0)
+                    reverse = bool(part[13]) if len(part) > 13 else False
+                    if reverse:
+                        sinn = max(0.0, durs.get(mid, src_dur) - sinn - sdur)
                     off = max(0.0, float(audio_offset or 0.0))
                     if a_idx_count[ii] > 1:
                         k = a_split_at[ii]
@@ -1015,6 +1031,7 @@ def _build_cmd_many(
                     # Pitch follows rate (atempo); documented default for #531.
                     achain = [
                         f"atrim=start={sinn + off:.6f}:duration={sdur:.6f}",
+                        *(["areverse"] if reverse else []),
                         "asetpts=PTS-STARTPTS",
                         *atempo_chain(speed),
                         f"volume={float(part[12]) if len(part) > 12 else 1.0:.6f}",

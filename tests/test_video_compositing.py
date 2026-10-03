@@ -95,3 +95,15 @@ class VideoCompositingTest(unittest.TestCase):
         self.assert_blue(self.pixel(output, .3, 300, 300))
         self.assert_red(self.pixel(output, .3, 50, 50))
         self.assert_red(self.pixel(output, 1.5, 300, 300))
+
+    def test_reversed_upper_layer_keeps_trim_placement_and_transparency(self):
+        # Reverse only the first second of blue, retaining its .5s placement.
+        upper = ClipInst(start=.5, out_s=1, media_id='blue', track=2,
+                         scale=.5, transform_x=180)
+        upper.set_reverse(True, 2)
+        output = self.render([ClipInst(out_s=2, media_id='red'), upper],
+                             name='reverse-overlay')
+        self.assert_red(self.pixel(output, .2, 500, 300))
+        self.assert_blue(self.pixel(output, .8, 500, 300))
+        self.assert_red(self.pixel(output, .8, 100, 300))
+        self.assert_red(self.pixel(output, 1.8, 500, 300))

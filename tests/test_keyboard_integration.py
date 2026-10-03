@@ -39,6 +39,68 @@ class KeyboardEditingTest(unittest.TestCase):
     def key(self, key):
         return self.win._on_key_pressed(None, key, 0, 0)
 
+    def test_reverse_selected_clips_and_undo_redo(self):
+        w = self.win
+        w.sel_vs = {0, 1}
+        spans = [c.used_times(20) for c in w.video_clips]
+        w._sync_speed_controls()
+        w.reverse_check.set_active(True)
+        self.assertTrue(all(c.reverse for c in w.video_clips))
+        self.assertEqual([c.used_times(20) for c in w.video_clips], spans)
+        self.assertEqual(len(w._history), 2)
+        self.assertTrue(all(c.reverse for c in w.timeline.aclips))
+        w._on_undo()
+        self.assertFalse(any(c.reverse for c in w.video_clips))
+        w._on_redo()
+        self.assertTrue(all(c.reverse for c in w.video_clips))
+        self.assertEqual([c.used_times(20) for c in w.video_clips], spans)
+
+    def test_reverse_full_source_creates_history_and_preserves_external_audio(self):
+        w = self.win
+        w.video_clips = [ClipInst(out_s=20, media_id='v')]
+        w.audio_clips = [ClipInst(start=0, out_s=20, media_id='v')]
+        w.sel_a = 0
+        w.follow_in.set_active(True)
+        w._refresh_fit()
+        w._checkpoint()
+        old_key = w._snapshot_key()
+        w.reverse_check.set_active(True)
+        self.assertNotEqual(old_key, w._snapshot_key())
+        self.assertFalse(w.audio_clips[0].reverse)
+        self.assertEqual(w.audio_clips[0].used_times(20), (0, 20))
+        w._on_undo()
+        self.assertFalse(w.video_clips[0].reverse)
+
+    def test_reversing_trimmed_video_does_not_move_following_audio(self):
+        w = self.win
+        w.video_clips = [ClipInst(start=2, in_s=1, out_s=5, media_id='v')]
+        w.audio_clips = [ClipInst(start=2, out_s=20, media_id='v')]
+        w.sel_a = 0
+        w.follow_in.set_active(True)
+        w._refresh_fit()
+        span = w.audio_clips[0].used_times(20)
+        w.reverse_check.set_active(True)
+        self.assertEqual(w.audio_clips[0].used_times(20), span)
+
+    def test_reverse_play_requests_render_before_native_playback(self):
+        w = self.win
+        w.video_clips[0].set_reverse(True, 20)
+        with patch.object(w, '_start_playthrough_render') as render:
+            w._begin_timeline_play(1)
+        render.assert_called_once()
+        self.assertEqual(w._play_after_render, 1)
+        self.assertFalse(w.playing)
+
+    def test_reverse_seek_maps_to_source_and_trim_maps_to_playback_order(self):
+        w = self.win
+        c = w.video_clips[0]
+        c.set_reverse(True, 20)
+        self.assertAlmostEqual(w._source_time(c, 1, 20), 4 - 1 / 30)
+        w._sync_timeline_clips()
+        w.timeline.set_playhead(1)
+        w._set_clip_bound(True)
+        self.assertAlmostEqual(w.video_clips[0].in_s, 16)
+
     def test_move_and_undo_are_atomic_and_escape_preserves_selection(self):
         self.key(Gdk.KEY_m)
         self.assertEqual(self.win.keyboard_mode, 'move')

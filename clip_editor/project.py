@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 FORMAT = "clip-editor-project"
-VERSION = 8
+VERSION = 9
 SUFFIX = ".clip.json"
 STATE_DIR = Path.home() / ".local" / "state" / "clip-editor"
 AUTOSAVE_PATH = STATE_DIR / "autosave.clip.json"
@@ -183,6 +183,21 @@ class ClipInst:
     fade_in_s: float = 0.0
     fade_out_s: float = 0.0
     volume: float = 1.0
+    # In/out are measured in playback order: from the source's end when reversed.
+    reverse: bool = False
+
+    def set_reverse(self, enabled: bool, src_dur: float) -> None:
+        """Mirror trim coordinates while preserving the used source and placement."""
+        if enabled == self.reverse:
+            return
+        if not math.isfinite(src_dur) or src_dur <= 0:
+            raise ValueError("Source duration is needed to reverse a clip")
+        inn = max(0.0, min(self.in_s, src_dur))
+        out = min(self.out_s, src_dur) if self.out_s > inn else src_dur
+        timeline_start = self.start + inn
+        self.in_s, self.out_s = src_dur - out, src_dur - inn
+        self.start = timeline_start - self.in_s
+        self.reverse = enabled
 
     def used(self) -> tuple[float, float]:
         inn = max(0.0, float(self.in_s))
@@ -229,6 +244,7 @@ class ClipInst:
             transition=self.transition,
             transition_s=self.transition_s,
             speed=self.playback_speed(),
+            reverse=self.reverse,
             fade_in_s=normalize_fade_s(self.fade_in_s),
             fade_out_s=normalize_fade_s(self.fade_out_s),
         )
@@ -269,6 +285,7 @@ class ClipInst:
             transition=self.transition,
             transition_s=self.transition_s,
             speed=self.playback_speed(),
+            reverse=self.reverse,
             fade_in_s=0.0,
             fade_out_s=normalize_fade_s(self.fade_out_s),
         )
@@ -301,6 +318,8 @@ def clip_to_dict(c: ClipInst) -> dict:
     speed = c.playback_speed()
     if abs(speed - DEFAULT_SPEED) > 0.0001:
         d["speed"] = speed
+    if c.reverse:
+        d["reverse"] = True
     fi = normalize_fade_s(c.fade_in_s)
     fo = normalize_fade_s(c.fade_out_s)
     if fi > 0.0:
@@ -340,6 +359,7 @@ def clip_from_dict(data: object) -> ClipInst | None:
         transition=ttype,
         transition_s=tdur,
         speed=speed,
+        reverse=data.get("reverse") is True,
         fade_in_s=fade_in_s,
         fade_out_s=fade_out_s,
         volume=normalize_volume(data.get("volume", 1.0)),

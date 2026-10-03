@@ -197,9 +197,9 @@ def rebase_clips_for_window(
         o1 = min(used1, t1)
         if o1 <= o0 + 0.04:
             continue
-        new_in = o0 - float(c.start)
-        new_out = o1 - float(c.start)
-        new_start = float(c.start) - t0
+        new_in = _inn + (o0 - used0) * c.playback_speed()
+        new_out = _inn + (o1 - used0) * c.playback_speed()
+        new_start = o0 - t0 - new_in
         ttype, tdur = normalize_transition(c.transition, c.transition_s)
         fade_in_s = float(getattr(c, "fade_in_s", 0.0) or 0.0)
         fade_out_s = float(getattr(c, "fade_out_s", 0.0) or 0.0)
@@ -224,6 +224,7 @@ def rebase_clips_for_window(
                 transition=ttype,
                 transition_s=tdur,
                 speed=c.playback_speed(),
+                reverse=c.reverse,
                 fade_in_s=fade_in_s,
                 fade_out_s=fade_out_s,
             )
@@ -282,6 +283,7 @@ def render_fingerprint(
                 "transition": c.transition,
                 "transition_s": round(float(c.transition_s), 6),
                 "speed": round(float(c.playback_speed()), 6),
+                "reverse": c.reverse,
                 "fade_in_s": round(float(getattr(c, "fade_in_s", 0.0) or 0.0), 6),
                 "fade_out_s": round(float(getattr(c, "fade_out_s", 0.0) or 0.0), 6),
             }
@@ -296,6 +298,7 @@ def render_fingerprint(
                 "track": int(c.track),
                 "volume": round(float(c.volume), 6),
                 "speed": round(float(c.playback_speed()), 6),
+                "reverse": c.reverse,
                 "fade_in_s": round(float(getattr(c, "fade_in_s", 0.0) or 0.0), 6),
                 "fade_out_s": round(float(getattr(c, "fade_out_s", 0.0) or 0.0), 6),
             }
@@ -586,6 +589,7 @@ COMPILED_BLOCKED_ACTIONS = frozenset(
         "track",
         "transform",
         "speed",
+        "reverse",
         "transition",
         "audio_route",
         "audio_volume",
