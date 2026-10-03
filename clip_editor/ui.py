@@ -2000,6 +2000,8 @@ class Timeline(Gtk.DrawingArea):
         while x < x1:
             frac = (x + slot / 2 - x0) / max(1.0, x1 - x0)
             src_t = inn + min(1.0, max(0.0, frac)) * (out - inn)
+            if c.reverse:
+                src_t = src - src_t
             idx = min(frames - 1, max(0, int(src_t / src * frames)))
             cr.save()
             cr.rectangle(x, y, slot, h)
@@ -2038,6 +2040,8 @@ class Timeline(Gtk.DrawingArea):
         per_px = (out - inn) / span
         while x < x1:
             a = inn + (x - x0) * per_px
+            if c.reverse:
+                a = max(0.0, src - a - per_px * step)
             i0 = int(a * rate)
             i1 = max(i0 + 1, int((a + per_px * step) * rate))
             chunk = peaks[i0:i1]
@@ -2198,7 +2202,8 @@ class Timeline(Gtk.DrawingArea):
             cr.set_line_width(3.0 if primary else 2.0 if selected else 1.5)
             cr.stroke()
             name = self.clip_names.get(c.media_id) or self.video_name
-            self._draw_tab(cr, x0, x1, cy, Path(name).stem if name else "",
+            label = (("↶ " if c.reverse else "") + Path(name).stem) if name else ""
+            self._draw_tab(cr, x0, x1, cy, label,
                            accent if selected else muted, on_accent if selected else bg)
 
         # Audio clips: tinted body, waveform, volume line
@@ -3031,6 +3036,7 @@ class EditorWindow(Adw.ApplicationWindow):
                     round(float(c.fade_in_s), 3),
                     round(float(c.fade_out_s), 3),
                     round(float(c.volume), 4),
+                    c.reverse,
                 )
                 for c in p.video_clips
             ),
@@ -3044,6 +3050,7 @@ class EditorWindow(Adw.ApplicationWindow):
                     round(float(c.fade_in_s), 3),
                     round(float(c.fade_out_s), 3),
                     round(float(c.volume), 4),
+                    c.reverse,
                 )
                 for c in p.audio_clips
             ),
@@ -3986,6 +3993,13 @@ class EditorWindow(Adw.ApplicationWindow):
         self.btn_speed_reset = self._hint("", "1×", self._on_speed_reset,
                                           tooltip="Reset to normal speed")
         field("speed", self.speed_spin, self._dim("×"), self.btn_speed_reset)
+        self.reverse_check = Gtk.CheckButton(label="Reverse")
+        self.reverse_check.set_tooltip_text(
+            "Play selected video clips backwards, including their linked sound. "
+            "Keeps the trimmed range and timeline placement."
+        )
+        self.reverse_check.connect("toggled", self._on_reverse_changed)
+        field("direction", self.reverse_check)
         self.speed_hint = wrap_dim()
         note(self.speed_hint)
 
@@ -4074,7 +4088,10 @@ class EditorWindow(Adw.ApplicationWindow):
             self.clip_out_spin.set_value((clip.out_s or duration) if clip else 0)
             item = self._clip_item(clip, kind) if clip is not None else None
             self.clip_title.set_text(item.path.name if item else "no clip selected")
-            hint = "Linked soundtrack: trim the video clip, or detach audio using a timeline edit." if linked else None
+            hint = "Linked soundtrack: trim the video clip, or detach audio using a timeline edit." if linked else (
+                "Trim points are measured from the end of the source while reversed."
+                if clip is not None and clip.reverse else None
+            )
             for control in (self.clip_in_spin, self.clip_out_spin, self.clip_set_in, self.clip_set_out):
                 control.set_sensitive(enabled)
                 control.set_tooltip_text(hint)
@@ -4109,7 +4126,10 @@ class EditorWindow(Adw.ApplicationWindow):
         kind, _index, clip = self._trim_target()
         if clip is None or self._busy_rendering() or not self._guard_edit("trim"):
             return
-        source_time = self._source_time(clip, self._timeline_now(), self._media_dur(clip.media_id))
+        # Trim fields use playback-order coordinates, including reversed clips.
+        source_time = clip.in_s + (
+            self._timeline_now() - clip.used_times()[0]
+        ) * clip.playback_speed()
         (self.clip_in_spin if is_in else self.clip_out_spin).set_value(source_time)
 
     def _open_clip_popover(self, kind: str | None = None, index: int | None = None) -> None:
@@ -4456,6 +4476,12 @@ class EditorWindow(Adw.ApplicationWindow):
         return self.timeline.playhead
 
     def _playhead(self) -> float:
+        if 0 <= self.sel_v < len(self.video_clips):
+            clip = self.video_clips[self.sel_v]
+            if clip.reverse:
+                return max(clip.in_s, min(clip.out_s, clip.in_s + (
+                    self._timeline_now() - clip.used_times()[0]
+                ) * clip.playback_speed()))
         if self.playing and self._clip_playing and self._vmedia is not None and self._vmedia.is_prepared():
             ts = self._vmedia.get_timestamp()
             if ts >= 0:
@@ -4658,7 +4684,51 @@ class EditorWindow(Adw.ApplicationWindow):
             clip.track = 1
             self.audio_clips.append(clip)
 
+    def _sync_reverse_control(self) -> None:
+        if not hasattr(self, "reverse_check"):
+            return
+        clips = self._speed_target_clips() if self.sel_kind == "video" else []
+        loading = self._loading
+        self._loading = True
+        try:
+            self.reverse_check.set_inconsistent(
+                bool(clips) and any(c.reverse != clips[0].reverse for c in clips)
+            )
+            self.reverse_check.set_active(bool(clips) and clips[0].reverse)
+            self.reverse_check.set_sensitive(
+                bool(clips) and not self._busy_rendering() and not self._editing_locked()
+            )
+        finally:
+            self._loading = loading
+
+    def _on_reverse_changed(self, *_args: object) -> None:
+        if self._loading:
+            return
+        if self._busy_rendering() or not self._guard_edit("reverse"):
+            self._sync_reverse_control()
+            return
+        clips = self._speed_target_clips() if self.sel_kind == "video" else []
+        if not clips:
+            return
+        durations = [self._media_dur(c.media_id) or float(
+            (self.video_info or {}).get("duration") or 0) for c in clips]
+        if any(d <= 0 for d in durations):
+            self._set_status("Source duration is needed to reverse a clip")
+            self._sync_reverse_control()
+            return
+        self._flush_checkpoint()
+        self._checkpoint()
+        self._stop()
+        for clip, duration in zip(clips, durations):
+            clip.set_reverse(self.reverse_check.get_active(), duration)
+        self._sync_timeline_clips()
+        self._sync_speed_controls()
+        self._apply_timeline_frame(self.timeline.playhead, start_media=False)
+        self._checkpoint()
+        self._schedule_autosave()
+
     def _sync_speed_controls(self) -> None:
+        self._sync_reverse_control()
         clips = self._speed_target_clips()
         enabled = bool(clips) and not self.exporting and not self._editing_locked()
         was_loading = self._loading
@@ -4738,8 +4808,14 @@ class EditorWindow(Adw.ApplicationWindow):
         if self.follow_in.get_active() and self.audio_clips and self.video_clips:
             vs = self.video_clips[self.sel_v] if 0 <= self.sel_v < len(self.video_clips) else self.video_clips[0]
             if 0 <= self.sel_a < len(self.audio_clips):
-                self.audio_clips[self.sel_a].start = vs.start
-                self.audio_start = vs.start
+                # Following audio is anchored to the forward source origin.
+                # Mirroring reverse trim coordinates must not move that audio.
+                anchor_start = vs.start
+                if vs.reverse:
+                    duration = self._media_dur(vs.media_id) or vdur
+                    anchor_start += vs.in_s - (duration - vs.out_s)
+                self.audio_clips[self.sel_a].start = anchor_start
+                self.audio_start = anchor_start
         source_aclips: list[ClipInst] = []
         if self.audio_clips:
             aname = self.audio_path.name if self.audio_path else "audio"
@@ -5881,6 +5957,13 @@ class EditorWindow(Adw.ApplicationWindow):
             src = min(src, out)
         if src_dur > 0:
             src = min(src, src_dur)
+        if c.reverse:
+            # Seek the last frame inside the half-open source range.
+            item = self._clip_item(c, "video")
+            info = self.media_info.get(item.id, {}) if item else (self.video_info or {})
+            fps = float(info.get("fps") or 30)
+            src = src_dur - src - 1.0 / max(1.0, fps)
+            src = max(src_dur - out, src)
         return max(0.0, src)
 
     def _audio_tracks_at(self, timeline_t: float) -> tuple[ClipInst | None, ClipInst | None]:
@@ -6037,6 +6120,11 @@ class EditorWindow(Adw.ApplicationWindow):
                 return False
         except OSError:
             return False
+        if (any(c.reverse for c in self.video_clips + self.audio_clips)
+                and self._playthrough_hash == self._current_render_fingerprint(kind="play")):
+            # Use the full proxy through video gaps too: detached reversed
+            # soundtrack clips can continue across those gaps.
+            return True
         return playback_source(timeline_t, self._cache_segments) == "cache"
 
     def _show_playthrough(self, timeline_t: float, *, start_media: bool) -> bool:
@@ -6528,6 +6616,7 @@ class EditorWindow(Adw.ApplicationWindow):
         )
 
     def _sync_compiled_preview_controls(self) -> None:
+        self._sync_reverse_control()
         self._sync_audio_volume_controls()
         busy = self._busy_rendering()
         locked = self._editing_locked()
@@ -6812,6 +6901,14 @@ class EditorWindow(Adw.ApplicationWindow):
         threading.Thread(target=work, daemon=True).start()
 
     def _begin_timeline_play(self, t: float) -> None:
+        # Native GTK playback only runs forwards. Reuse the rendered timeline
+        # for reversed clips so video, linked sound, and transitions agree.
+        if any(c.reverse for c in self.video_clips + self.audio_clips):
+            if (self._playthrough_path is None or not self._playthrough_path.exists()
+                    or self._playthrough_hash != self._current_render_fingerprint(kind="play")):
+                self._play_after_render = t
+                self._start_playthrough_render()
+                return
         end = self._program_end()
         t = min(max(0.0, t), end)
         self._play_t0 = t
