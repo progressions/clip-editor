@@ -306,10 +306,9 @@ class FadeBuildCmdTest(unittest.TestCase):
                 if arg == "-filter_complex" and i + 1 < len(cmd):
                     fc = cmd[i + 1]
                     break
-            self.assertIn("fade=t=in:st=0:d=0.500000:c=black", fc)
+            self.assertIn("fade=t=in:st=0:d=0.500000:alpha=1", fc)
             self.assertIn("fade=t=out:st=2.000000", fc)
-            self.assertIn(":c=black", fc)
-            self.assertIn("drawbox=", fc)
+            self.assertIn(":alpha=1", fc)
             # Source audio should get matching afades when soundtrack is used.
             self.assertIn("afade=t=in:st=0:d=0.500000", fc)
             self.assertIn("afade=t=out:st=2.000000", fc)

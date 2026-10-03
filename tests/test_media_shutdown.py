@@ -14,7 +14,7 @@ class MediaShutdownTest(unittest.TestCase):
         calls.attach_mock(media, 'media')
         calls.attach_mock(preview, 'preview')
         win = SimpleNamespace(_vmedia=media, _vmedia_path='video.mp4',
-                              _prep_handler=42, preview=preview)
+                              _prep_handler=42, preview=preview, _clear_preview_layers=Mock())
         EditorWindow._dispose_media(win)
         self.assertIsNone(win._vmedia)
         self.assertIsNone(win._vmedia_path)

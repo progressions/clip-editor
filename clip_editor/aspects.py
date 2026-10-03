@@ -61,27 +61,21 @@ def cover_source_placement(
     transform_y: float = 0.0,
     scale: float = 1.0,
 ) -> SourcePlacement:
-    """Place the full source over a destination without revealing its background.
+    """Place a source layer in output pixels, allowing smaller overlays.
 
-    ``transform_x`` and ``transform_y`` move the *source layer* in output
-    pixels.  They do not move an already cropped output frame.  Scale is a
-    cover multiplier, so values below 1 are treated as 1: a clip can zoom in
-    but cannot be zoomed out far enough to leave an empty edge.
+    Scale 1 covers the frame. Smaller scales reveal lower tracks; X/Y are
+    unrestricted translations relative to the project's crop-pan origin.
     """
     if min(src_w, src_h, dest_w, dest_h) <= 0:
         raise ValueError("source and destination dimensions must be positive")
     pan_x = min(1.0, max(0.0, float(pan_x)))
     pan_y = min(1.0, max(0.0, float(pan_y)))
     cover = max(dest_w / src_w, dest_h / src_h)
-    factor = cover * max(1.0, float(scale))
+    factor = cover * max(0.05, float(scale))
     w = max(2, even(round(src_w * factor)))
     h = max(2, even(round(src_h * factor)))
-    # The initial position honors the project's crop pan. Clamp the translated
-    # layer to the frame so X/Y never uncover a black margin.
     x = int(round((dest_w - w) * pan_x + float(transform_x)))
     y = int(round((dest_h - h) * pan_y + float(transform_y)))
-    x = min(0, max(dest_w - w, x))
-    y = min(0, max(dest_h - h, y))
     return SourcePlacement(w, h, x, y)
 
 
@@ -168,3 +162,20 @@ def dest_size(aspect: str, resolution: str | None = None) -> tuple[int, int]:
     dw = even(int(round(fw * scale)))
     dh = even(int(round(fh * scale)))
     return max(2, dw), max(2, dh)
+
+
+def resize_source_from_corner(
+    src_w: int, src_h: int, dest_w: int, dest_h: int,
+    pan_x: float, pan_y: float, x: float, y: float, scale: float,
+    corner: str, dx: float, dy: float,
+) -> tuple[float, float, float]:
+    """Aspect-locked resize in output pixels, keeping the opposite corner fixed."""
+    old = cover_source_placement(src_w, src_h, dest_w, dest_h, pan_x, pan_y, x, y, scale)
+    sx = -1 if 'w' in corner else 1
+    sy = -1 if 'n' in corner else 1
+    ratio = 1 + (sx * dx * old.w + sy * dy * old.h) / (old.w**2 + old.h**2)
+    new_scale = min(4.0, max(.05, scale * ratio))
+    new = cover_source_placement(src_w, src_h, dest_w, dest_h, pan_x, pan_y, 0, 0, new_scale)
+    left = old.x + old.w - new.w if sx < 0 else old.x
+    top = old.y + old.h - new.h if sy < 0 else old.y
+    return left - (dest_w - new.w) * pan_x, top - (dest_h - new.h) * pan_y, new_scale
