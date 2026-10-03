@@ -7,6 +7,11 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- Drag the selected video clip inside the preview to move it in X/Y; use corner handles to resize proportionally, with one undo step per drag. Selection remains the edit target at adjacent cuts and on overlapping tracks.
+- Scale clips down to 5% for smaller overlays. V2 composites over V1 in the preview and export, revealing the lower track or black background around transformed clips. Existing preview caches are invalidated for the new compositor.
+
 ## [0.14.2] — 2026-10-02
 
 ### Added
