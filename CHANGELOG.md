@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-10-04
+
 ### Added
 
 - Searchable media browser: press b from the timeline or click browse in the media pane. Filter by filename/path, choose with arrow keys, and press Enter to place at the playhead on the displayed track. The selection scrolls into view; Esc returns to the timeline.
@@ -205,7 +207,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 - Initial packaged release of the native GTK clip editor for Buffer-safe H.264/AAC exports.
 
-[Unreleased]: https://github.com/progressions/clip-editor/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/progressions/clip-editor/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/progressions/clip-editor/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/progressions/clip-editor/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/progressions/clip-editor/compare/v0.14.2...v0.15.0
 [0.14.2]: https://github.com/progressions/clip-editor/compare/v0.14.1...v0.14.2
