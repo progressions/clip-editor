@@ -266,3 +266,16 @@ Reverse to restore forward playback.
 
 Projects now save format version 9, including each clip's direction; older
 projects load with forward playback. Original media files are never modified.
+
+### Browse media with the keyboard
+
+Press **b** with the timeline focused, or click **b browse** in the media pane.
+The larger browser lists every project media file, including files beyond the
+visible strip. Type part of a filename or path to filter, use **↑ / ↓** to select,
+and press **Enter** to place the file at the playhead. **Esc** returns to the
+timeline without placing anything.
+
+The browser shows the destination track before placement. It uses the active
+track when its type matches the file; otherwise video goes to V1 and audio to A1.
+Placement follows the same overlap behavior as dragging a file onto that track
+and can be undone normally.

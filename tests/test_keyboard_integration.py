@@ -101,6 +101,65 @@ class KeyboardEditingTest(unittest.TestCase):
         w._set_clip_bound(True)
         self.assertAlmostEqual(w.video_clips[0].in_s, 16)
 
+    def test_media_browser_search_places_at_playhead_on_active_track_and_undo(self):
+        w = self.win
+        w.timeline.nav_kind, w.timeline.nav_track = 'video', 2
+        w.timeline.set_playhead(3)
+        w._open_media_browser()
+        w.media_search.set_text('keyboard-fixture')
+        self.assertTrue(w._on_media_browser_key(None, Gdk.KEY_Return, 0, 0))
+        self.assertEqual(len(w.video_clips), 3)
+        placed = w.video_clips[-1]
+        self.assertEqual((placed.media_id, placed.track, placed.start), ('v', 2, 3))
+        w._on_undo()
+        self.assertEqual(len(w.video_clips), 2)
+
+    def test_media_browser_filter_no_results_and_render_lock_do_not_place(self):
+        w = self.win
+        w._open_media_browser()
+        w.media_search.set_text('does-not-exist')
+        w._on_media_browser_key(None, Gdk.KEY_Return, 0, 0)
+        self.assertEqual(len(w.video_clips), 2)
+        self.assertIsNone(w.media_browser_list.get_selected_row())
+        w.media_search.set_text('')
+        w._filter_media_browser()
+        w.exporting = True
+        w._on_media_browser_key(None, Gdk.KEY_Return, 0, 0)
+        self.assertEqual(len(w.video_clips), 2)
+        w.exporting = False
+        w._on_media_browser_key(None, Gdk.KEY_Escape, 0, 0)
+
+    def test_media_browser_keyboard_reaches_items_beyond_visible_rows(self):
+        import time
+        from clip_editor.ui import GLib
+        w = self.win
+        w.media = [MediaItem(f'v{i}', Path(f'/tmp/video-{i:02}.mp4'), 'video')
+                   for i in range(40)]
+        w.present()
+        context = GLib.MainContext.default()
+        deadline = time.monotonic() + .4
+        while time.monotonic() < deadline:
+            while context.pending():
+                context.iteration(False)
+            time.sleep(.005)
+        w.timeline.grab_focus()
+        self.assertTrue(self.key(Gdk.KEY_b))
+        for _ in range(30):
+            w._on_media_browser_key(None, Gdk.KEY_Down, 0, 0)
+        context = GLib.MainContext.default()
+        deadline = time.monotonic() + .4
+        while time.monotonic() < deadline:
+            while context.pending():
+                context.iteration(False)
+            time.sleep(.005)
+        self.assertEqual(w.media_browser_list.get_selected_row().media_id, 'v30')
+        self.assertGreater(w.media_browser_scroll.get_vadjustment().get_value(), 0)
+        w.media_search.set_text('video-39')
+        w._filter_media_browser()
+        self.assertEqual(w.media_browser_list.get_selected_row().media_id, 'v39')
+        w._on_media_browser_key(None, Gdk.KEY_Escape, 0, 0)
+        self.assertEqual(len(w.video_clips), 2)
+
     def test_move_and_undo_are_atomic_and_escape_preserves_selection(self):
         self.key(Gdk.KEY_m)
         self.assertEqual(self.win.keyboard_mode, 'move')

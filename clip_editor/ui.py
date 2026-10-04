@@ -2698,6 +2698,7 @@ class EditorWindow(Adw.ApplicationWindow):
             "j / k   move between video and audio tracks\n"
             "= / +   zoom in     -   zoom out     f   fit timeline\n"
             "Enter   open selected clip settings\n"
+            "b   browse media: type to filter, ↑/↓ select, Enter place, Esc close\n"
             "z   toggle safe zones     e   export\n"
             ":   command line (r916, r43, rp)\n\n"
             "<b>Keyboard editing</b>\n"
@@ -2800,6 +2801,9 @@ class EditorWindow(Adw.ApplicationWindow):
             return True
         if extra:
             return False
+        if not mods and keyval == Gdk.KEY_b:
+            self._open_media_browser()
+            return True
         if not mods and keyval == Gdk.KEY_m:
             self._enter_keyboard_mode("move")
             return True
@@ -3916,8 +3920,12 @@ class EditorWindow(Adw.ApplicationWindow):
     def _build_media_pane(self) -> Gtk.Widget:
         self.btn_open_video = self._hint("+", "video", lambda: self._pick("video"))
         self.btn_open_audio = self._hint("+", "audio", lambda: self._pick("audio"))
+        self.btn_browse_media = self._hint(
+            "b", "browse", self._open_media_browser,
+            tooltip="Search all project media and place a clip with the keyboard",
+        )
         frame, body = self._pane(
-            "media", self.btn_open_video, self.btn_open_audio,
+            "media", self.btn_browse_media, self.btn_open_video, self.btn_open_audio,
             self._dim("· drag onto a track"),
         )
         row = Gtk.Box(spacing=10)
@@ -4640,7 +4648,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self._flush_autosave()
         self._dispose_media()
         # Popovers are parented to the timeline, which does not unparent them.
-        for name in ("clip_popover", "transition_popover", "keyboard_help"):
+        for name in ("clip_popover", "transition_popover", "keyboard_help", "media_browser"):
             pop = getattr(self, name, None)
             if pop is not None and pop.get_parent() is not None:
                 pop.unparent()
@@ -5076,6 +5084,145 @@ class EditorWindow(Adw.ApplicationWindow):
                     media_id=m.id,
                 )
             self.media_list.append(card)
+
+    def _open_media_browser(self) -> None:
+        if not hasattr(self, "media_browser"):
+            pop = self.media_browser = Gtk.Popover()
+            pop.set_parent(self.btn_browse_media)
+            pop.set_position(Gtk.PositionType.TOP)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            for side in ("top", "bottom", "start", "end"):
+                getattr(box, f"set_margin_{side}")(12)
+            self.media_search = Gtk.SearchEntry()
+            self.media_search.set_placeholder_text("Search project media")
+            self.media_search.connect("search-changed", lambda *_: self._filter_media_browser())
+            box.append(self.media_search)
+            self.media_browser_hint = Gtk.Label(xalign=0)
+            self.media_browser_hint.add_css_class("dim-label")
+            box.append(self.media_browser_hint)
+            self.media_browser_list = Gtk.ListBox()
+            self.media_browser_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+            self.media_browser_list.set_activate_on_single_click(False)
+            self.media_browser_list.connect("row-selected", lambda *_: self._media_browser_selection())
+            self.media_browser_list.connect("row-activated", lambda *_: self._place_browser_media())
+            scroll = self.media_browser_scroll = Gtk.ScrolledWindow()
+            scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scroll.set_min_content_width(440)
+            scroll.set_min_content_height(280)
+            scroll.set_child(self.media_browser_list)
+            scroll.get_vadjustment().connect(
+                "changed", lambda *_: self._media_browser_selection()
+            )
+            box.append(scroll)
+            pop.set_child(box)
+            keys = Gtk.EventControllerKey()
+            keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+            keys.connect("key-pressed", self._on_media_browser_key)
+            pop.add_controller(keys)
+            pop.connect("closed", lambda *_: self.timeline.grab_focus())
+        self.media_search.set_text("")
+        self._filter_media_browser()
+        self._media_browser_selection()
+        self.media_browser.popup()
+        self.media_search.grab_focus()
+
+    def _filter_media_browser(self) -> None:
+        query = self.media_search.get_text().casefold().split()
+        state = (tuple(query), tuple((m.id, str(m.path)) for m in self.media))
+        if state == getattr(self, "_browser_filter_state", None):
+            return
+        self._browser_filter_state = state
+        selected = self.media_browser_list.get_selected_row()
+        previous = getattr(selected, "media_id", None)
+        row = self.media_browser_list.get_first_child()
+        while row is not None:
+            next_row = row.get_next_sibling()
+            self.media_browser_list.remove(row)
+            row = next_row
+        words = query
+        selected_row = None
+        self._browser_media_ids = []
+        for item in self.media:
+            if not all(word in str(item.path).casefold() for word in words):
+                continue
+            row = Gtk.ListBoxRow()
+            row.media_id = item.id
+            label = Gtk.Label(label=f"{item.kind.title()} · {item.path.name}", xalign=0)
+            label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+            label.set_max_width_chars(65)
+            label.set_margin_top(8)
+            label.set_margin_bottom(8)
+            label.set_margin_start(8)
+            label.set_margin_end(8)
+            row.set_child(label)
+            row.set_tooltip_text(str(item.path))
+            self.media_browser_list.append(row)
+            self._browser_media_ids.append(item.id)
+            if selected_row is None or item.id == previous:
+                selected_row = row
+        self.media_browser_list.select_row(selected_row)
+        self._media_browser_selection()
+
+    def _browser_destination(self, item: MediaItem) -> int:
+        return self.timeline.nav_track if self.timeline.nav_kind == item.kind else 1
+
+    def _media_browser_selection(self) -> None:
+        row = self.media_browser_list.get_selected_row()
+        item = self._media_by_id(row.media_id) if row is not None else None
+        if item is None:
+            self.media_browser_hint.set_text("No matching media · Esc to return")
+            return
+        lane = ("V" if item.kind == "video" else "A") + str(self._browser_destination(item))
+        self.media_browser_hint.set_text(
+            f"↑/↓ select · Enter place on {lane} at {self.timeline.playhead:.2f}s · Esc return"
+        )
+        # Selection stays in the search entry while the list follows its cursor.
+        def reveal() -> bool:
+            if row.get_parent() is None or row is not self.media_browser_list.get_selected_row():
+                return False
+            ok, bounds = row.compute_bounds(self.media_browser_list)
+            if ok:
+                adj = self.media_browser_scroll.get_vadjustment()
+                top, bottom = bounds.get_y(), bounds.get_y() + bounds.get_height()
+                if top < adj.get_value():
+                    adj.set_value(top)
+                elif bottom > adj.get_value() + adj.get_page_size():
+                    adj.set_value(bottom - adj.get_page_size())
+            return False
+        GLib.idle_add(reveal)
+
+    def _on_media_browser_key(self, _controller, keyval, _code, state) -> bool:
+        if state & Gtk.accelerator_get_default_mod_mask():
+            return False
+        if keyval == Gdk.KEY_Escape:
+            self.media_browser.popdown()
+            return True
+        if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            # SearchEntry emits search-changed with a delay; apply current text.
+            self._filter_media_browser()
+            self._place_browser_media()
+            return True
+        if keyval in (Gdk.KEY_Up, Gdk.KEY_Down):
+            self._filter_media_browser()
+            row = self.media_browser_list.get_selected_row()
+            index = row.get_index() if row else 0
+            index = max(0, min(len(self._browser_media_ids) - 1,
+                               index + (1 if keyval == Gdk.KEY_Down else -1)))
+            self.media_browser_list.select_row(self.media_browser_list.get_row_at_index(index))
+            return True
+        return False
+
+    def _place_browser_media(self) -> None:
+        row = self.media_browser_list.get_selected_row()
+        item = self._media_by_id(row.media_id) if row is not None else None
+        if item is None or self._busy_rendering() or not self._guard_edit("media_place"):
+            return
+        self._stop()
+        self._flush_checkpoint()
+        self._checkpoint()
+        self._place_clip(item.kind, self.timeline.playhead, item.id,
+                         track=self._browser_destination(item))
+        self.media_browser.popdown()
 
     def _on_trim_spin_changed(self, *_args: object) -> None:
         """Inspector In/Out only; do not run this on timeline click/trim."""

@@ -7,6 +7,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- Searchable media browser: press b from the timeline or click browse in the media pane. Filter by filename/path, choose with arrow keys, and press Enter to place at the playhead on the displayed track. The selection scrolls into view; Esc returns to the timeline.
+
 ## [0.16.0] — 2026-10-03
 
 ### Added
