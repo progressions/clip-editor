@@ -34,7 +34,7 @@ def _add_export_args(p: argparse.ArgumentParser) -> None:
         "--resolution",
         default=DEFAULT_RESOLUTION,
         choices=list(RESOLUTIONS),
-        help="export resolution preset: low=720 / medium=1080 / high=1440 short edge",
+        help="export resolution preset: low=720 / medium=1080 / high=1440 / 2160=2160 (4K UHD) short edge",
     )
     p.add_argument("--pan-x", type=float, default=0.5, help="0=left 1=right (default 0.5)")
     p.add_argument("--pan-y", type=float, default=0.5, help="0=top 1=bottom (default 0.5)")
