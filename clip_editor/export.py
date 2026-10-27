@@ -6,6 +6,7 @@ import os
 import subprocess
 import threading
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -26,6 +27,7 @@ from clip_editor.project import (
     apply_legacy_crossfade,
     atempo_chain,
     clamp_clip_fades,
+    normalize_grain_strength,
     normalize_speed,
     normalize_transition,
 )
@@ -55,7 +57,7 @@ def _flatten_clips(
     """Return timeline/source bounds, media id, transform, transition, speed, fades.
 
     Row: ``(t0, t1, sinn, sout, mid, tx, ty, scale, transition, transition_s,
-    speed, fade_in_s, fade_out_s, volume, reverse)``.
+    speed, fade_in_s, fade_out_s, volume, reverse, grain_strength)``.
     ``t1 - t0`` is timeline length ``(sout - sinn) / speed``. Later clips
     overwrite earlier ones on overlap, matching playback.
     """
@@ -107,6 +109,7 @@ def _flatten_clips(
             st_fo = float(row[12]) if len(row) > 12 else 0.0
             st_volume = float(row[13]) if len(row) > 13 else 1.0
             st_reverse = bool(row[14]) if len(row) > 14 else False
+            st_grain = normalize_grain_strength(row[15]) if len(row) > 15 else 0.0
             if st1 <= t0 + 0.001 or st0 >= t1 - 0.001:
                 nxt.append(
                     (
@@ -125,6 +128,7 @@ def _flatten_clips(
                         st_fo,
                         st_volume,
                         st_reverse,
+                        st_grain,
                     )
                 )
                 continue
@@ -150,6 +154,7 @@ def _flatten_clips(
                         0.0,
                         st_volume,
                         st_reverse,
+                        st_grain,
                     )
                 )
             if st1 > t1 + 0.001:
@@ -173,6 +178,7 @@ def _flatten_clips(
                         st_fo,
                         st_volume,
                         st_reverse,
+                        st_grain,
                     )
                 )
         nxt.append(
@@ -192,6 +198,7 @@ def _flatten_clips(
                 fade_out_s,
                 float(c.volume),
                 c.reverse,
+                normalize_grain_strength(c.grain_strength),
             )
         )
         segs = nxt
@@ -273,6 +280,7 @@ def build_cmd(
     )
     if any(
         c.reverse
+        or normalize_grain_strength(c.grain_strength) > 0.0
         or abs(float(c.volume) - 1.0) > 0.0001
         or abs(float(c.transform_x)) > 0.0001
         or abs(float(c.transform_y)) > 0.0001
@@ -431,7 +439,7 @@ def _timeline_parts(flat: list[tuple], out_dur: float) -> list[tuple]:
     """Build gap/seg parts.
 
     Seg: ``(seg, sinn, source_len, mid, tx, ty, scale, ttype, tdur, speed,
-    fade_in_s, fade_out_s, volume, reverse)``.
+    fade_in_s, fade_out_s, volume, reverse, grain_strength)``.
     """
     parts: list[tuple] = []
     t = 0.0
@@ -469,6 +477,7 @@ def _timeline_parts(flat: list[tuple], out_dur: float) -> list[tuple]:
                 fade_out_s,
                 float(row[13]) if len(row) > 13 else 1.0,
                 bool(row[14]) if len(row) > 14 else False,
+                normalize_grain_strength(row[15]) if len(row) > 15 else 0.0,
             )
         )
         t = t1
@@ -812,6 +821,10 @@ def _build_cmd_many(
     profile: EncodeProfile = FINAL_PROFILE,
 ) -> tuple[list[str], dict[str, Any]]:
     profile = profile or FINAL_PROFILE
+    if profile.proxy and any(normalize_grain_strength(c.grain_strength) > 0
+                             for c in video_clips):
+        # Coarse proxy compression otherwise erases light grain.
+        profile = replace(profile, crf=min(profile.crf, FINAL_PROFILE.crf))
     media = list(media or [])
     if not any(m.kind == "video" for m in media):
         media = [MediaItem(id="m1", path=video, kind="video")] + media
@@ -951,6 +964,11 @@ def _build_cmd_many(
                     f"scale={placement.w}:{placement.h}:flags=lanczos",
                     f"fps={fps:.4f}", "settb=AVTB", "setsar=1", "format=yuva420p",
                 ]
+                grain = normalize_grain_strength(part[14]) if len(part) > 14 else 0.0
+                if grain > 0.0:
+                    # Luma-only temporal noise leaves chroma and layer alpha intact.
+                    chain.append(f"noise=c0s={max(1, round(grain))}:c0f=t+u:"
+                                 "c1s=0:c2s=0:c3s=0")
                 fi, fo = _part_fades(part)
                 fi, fo = clamp_clip_fades(fi, fo, tl_dur)
                 # Fade layer opacity, so lower tracks remain visible.

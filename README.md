@@ -232,6 +232,17 @@ playhead or ruler, hold the pointer near either visible edge to scroll and seek
 into the hidden portion of the timeline, including back to 0:00.
 
 
+### Film grain
+
+Select a video clip and open its clip controls. The **grain strength** slider
+ranges from **off** (0) to **heavy** (100). It adds animated monochrome film grain
+in rendered previews and exported videos. Raw editing playback shows the source
+without grain; render a preview to judge the effect.
+
+Selecting several video clips applies the slider to all of them. Grain survives
+splitting, undo/redo, and saved projects. Set the slider to 0 to remove it. Source
+files remain unchanged, and older projects open with grain off.
+
 ### Mixing audio layers
 
 **Add audio** places a file on the free audio layer, A1 or A2. If the video has
@@ -264,7 +275,7 @@ splitting, fades, transitions, undo/redo, and export retain the clip's direction
 Trim points on a reversed clip are measured from the end of its source. Disable
 Reverse to restore forward playback.
 
-Projects now save format version 9, including each clip's direction; older
+Projects now save format version 10, including each clip's direction and grain; older
 projects load with forward playback. Original media files are never modified.
 
 ### Browse media with the keyboard

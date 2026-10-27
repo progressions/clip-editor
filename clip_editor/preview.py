@@ -20,6 +20,7 @@ from clip_editor.project import (
     TRANSITION_NONE,
     ClipInst,
     MediaItem,
+    normalize_grain_strength,
     normalize_transition,
 )
 
@@ -225,6 +226,7 @@ def rebase_clips_for_window(
                 transition_s=tdur,
                 speed=c.playback_speed(),
                 reverse=c.reverse,
+                grain_strength=normalize_grain_strength(c.grain_strength),
                 fade_in_s=fade_in_s,
                 fade_out_s=fade_out_s,
             )
@@ -284,6 +286,7 @@ def render_fingerprint(
                 "transition_s": round(float(c.transition_s), 6),
                 "speed": round(float(c.playback_speed()), 6),
                 "reverse": c.reverse,
+                "grain_strength": round(normalize_grain_strength(c.grain_strength), 6),
                 "fade_in_s": round(float(getattr(c, "fade_in_s", 0.0) or 0.0), 6),
                 "fade_out_s": round(float(getattr(c, "fade_out_s", 0.0) or 0.0), 6),
             }
@@ -581,6 +584,7 @@ def extract_acrossfade_signature(filter_complex: str) -> list[str]:
 # Actions that mutate the project or timeline while compiled preview is active.
 COMPILED_BLOCKED_ACTIONS = frozenset(
     {
+        "grain",
         "trim",
         "move",
         "split",
