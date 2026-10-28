@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.18.0] — 2026-10-27
+
 ### Added
 
 - Adjustable monochrome film grain for selected video clips, with an off-to-heavy slider in the clip controls. Grain appears in rendered previews and exports, survives splits and undo/redo, and is saved in project format version 10. Older projects open with grain off.
