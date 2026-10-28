@@ -258,7 +258,7 @@ def render_fingerprint(
             path = str(m.path)
         media_rows.append({"id": m.id, "kind": m.kind, "path": path})
     payload: dict[str, Any] = {
-        "compositor_version": 2,
+        "compositor_version": 3,
         "resolution": normalize_resolution(resolution),
         "aspect": aspect,
         "pan_x": round(float(pan_x), 6),
