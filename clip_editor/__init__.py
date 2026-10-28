@@ -1,3 +1,3 @@
 """Clip Editor — native GTK clip editor for social video exports."""
 
-__version__ = "0.18.0"
+__version__ = "0.18.1"
