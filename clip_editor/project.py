@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 FORMAT = "clip-editor-project"
-VERSION = 9
+VERSION = 10
 SUFFIX = ".clip.json"
 STATE_DIR = Path.home() / ".local" / "state" / "clip-editor"
 AUTOSAVE_PATH = STATE_DIR / "autosave.clip.json"
@@ -156,6 +156,15 @@ def normalize_volume(value: object = 1.0) -> float:
     return max(0.0, min(2.0, number)) if math.isfinite(number) else 1.0
 
 
+def normalize_grain_strength(value: object = 0.0) -> float:
+    """Film grain amount: 0 (off) through 100 (heavy)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(100.0, number)) if math.isfinite(number) else 0.0
+
+
 def normalize_track_volumes(value: object) -> dict[int, float]:
     data = value if isinstance(value, dict) else {}
     return {track: normalize_volume(data.get(track, data.get(str(track), 1.0)))
@@ -185,6 +194,7 @@ class ClipInst:
     volume: float = 1.0
     # In/out are measured in playback order: from the source's end when reversed.
     reverse: bool = False
+    grain_strength: float = 0.0
 
     def set_reverse(self, enabled: bool, src_dur: float) -> None:
         """Mirror trim coordinates while preserving the used source and placement."""
@@ -245,6 +255,7 @@ class ClipInst:
             transition_s=self.transition_s,
             speed=self.playback_speed(),
             reverse=self.reverse,
+            grain_strength=normalize_grain_strength(self.grain_strength),
             fade_in_s=normalize_fade_s(self.fade_in_s),
             fade_out_s=normalize_fade_s(self.fade_out_s),
         )
@@ -286,6 +297,7 @@ class ClipInst:
             transition_s=self.transition_s,
             speed=self.playback_speed(),
             reverse=self.reverse,
+            grain_strength=normalize_grain_strength(self.grain_strength),
             fade_in_s=0.0,
             fade_out_s=normalize_fade_s(self.fade_out_s),
         )
@@ -320,6 +332,9 @@ def clip_to_dict(c: ClipInst) -> dict:
         d["speed"] = speed
     if c.reverse:
         d["reverse"] = True
+    grain = normalize_grain_strength(c.grain_strength)
+    if grain > 0.0:
+        d["grain_strength"] = grain
     fi = normalize_fade_s(c.fade_in_s)
     fo = normalize_fade_s(c.fade_out_s)
     if fi > 0.0:
@@ -360,6 +375,7 @@ def clip_from_dict(data: object) -> ClipInst | None:
         transition_s=tdur,
         speed=speed,
         reverse=data.get("reverse") is True,
+        grain_strength=normalize_grain_strength(data.get("grain_strength")),
         fade_in_s=fade_in_s,
         fade_out_s=fade_out_s,
         volume=normalize_volume(data.get("volume", 1.0)),

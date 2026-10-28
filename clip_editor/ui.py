@@ -82,6 +82,7 @@ from clip_editor.project import (
     media_load_errors,
     next_media_id,
     normalize_fade_s,
+    normalize_grain_strength,
     normalize_speed,
     normalize_volume,
     normalize_track_volumes,
@@ -3088,6 +3089,7 @@ class EditorWindow(Adw.ApplicationWindow):
                     round(c.transform_x, 3),
                     round(c.transform_y, 3),
                     round(c.scale, 4),
+                    round(normalize_grain_strength(c.grain_strength), 3),
                     int(c.track),
                     c.transition,
                     round(float(c.transition_s), 3),
@@ -4139,6 +4141,21 @@ class EditorWindow(Adw.ApplicationWindow):
         field("x / y", self.transform_x_spin, self.transform_y_spin)
         field("scale", self.transform_scale_spin, self._dim("×"), self.btn_transform_reset)
 
+        self.grain_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+        self.grain_scale.set_size_request(180, -1)
+        self.grain_scale.set_digits(0)
+        self.grain_scale.set_draw_value(True)
+        self.grain_scale.add_mark(0, Gtk.PositionType.BOTTOM, "off")
+        self.grain_scale.add_mark(100, Gtk.PositionType.BOTTOM, "heavy")
+        self.grain_scale.set_tooltip_text(
+            "Animated monochrome film grain for selected video clips. "
+            "Visible in rendered previews and exports."
+        )
+        self.grain_scale.connect("value-changed", self._on_grain_changed)
+        field("grain strength", self.grain_scale)
+        self.grain_hint = wrap_dim()
+        note(self.grain_hint)
+
         self.fade_in_check = Gtk.CheckButton(label="in")
         self.fade_in_check.connect("toggled", self._on_fade_changed)
         self.fade_in_spin = Gtk.SpinButton.new_with_range(MIN_FADE_S, MAX_FADE_S, 0.05)
@@ -4857,6 +4874,7 @@ class EditorWindow(Adw.ApplicationWindow):
 
     def _sync_speed_controls(self) -> None:
         self._sync_reverse_control()
+        self._sync_grain_controls()
         clips = self._speed_target_clips()
         enabled = bool(clips) and not self.exporting and not self._editing_locked()
         was_loading = self._loading
@@ -4911,6 +4929,46 @@ class EditorWindow(Adw.ApplicationWindow):
         if not self._speed_target_clips():
             return
         self.speed_spin.set_value(DEFAULT_SPEED)
+
+    def _sync_grain_controls(self) -> None:
+        if not hasattr(self, "grain_scale"):
+            return
+        clips = self._speed_target_clips() if self.sel_kind == "video" else []
+        loading = self._loading
+        self._loading = True
+        try:
+            strengths = [normalize_grain_strength(c.grain_strength) for c in clips]
+            self.grain_scale.set_value(strengths[0] if strengths else 0)
+            self.grain_scale.set_sensitive(
+                bool(clips) and not self._busy_rendering() and not self._editing_locked()
+            )
+            if strengths and max(strengths) - min(strengths) > 0.001:
+                self.grain_hint.set_text(
+                    f"{len(clips)} selected — slider sets all to the same strength"
+                )
+            else:
+                self.grain_hint.set_text("Visible in rendered previews and exports" if clips else "")
+        finally:
+            self._loading = loading
+
+    def _on_grain_changed(self, *_args: object) -> None:
+        if self._loading:
+            return
+        if self._busy_rendering() or not self._guard_edit("grain"):
+            self._sync_grain_controls()
+            return
+        clips = self._speed_target_clips() if self.sel_kind == "video" else []
+        if not clips:
+            return
+        strength = normalize_grain_strength(self.grain_scale.get_value())
+        if all(c.grain_strength == strength for c in clips):
+            return
+        self._stop()
+        for clip in clips:
+            clip.grain_strength = strength
+        self._sync_timeline_clips()
+        self._schedule_checkpoint()
+        self._schedule_autosave()
 
     def _refresh_export_name(self) -> None:
         if not self.video_path:
@@ -6976,6 +7034,7 @@ class EditorWindow(Adw.ApplicationWindow):
 
     def _sync_compiled_preview_controls(self) -> None:
         self._sync_reverse_control()
+        self._sync_grain_controls()
         self._sync_audio_volume_controls()
         busy = self._busy_rendering()
         locked = self._editing_locked()
