@@ -16,6 +16,7 @@ from clip_editor.preview import (
     FINAL_PROFILE,
     EncodeProfile,
     profile_dest_size,
+    rebase_clips_for_window,
 )
 from clip_editor.probe import ProbeError, gate_h264, probe, which_ffmpeg
 from clip_editor.project import (
@@ -27,6 +28,7 @@ from clip_editor.project import (
     apply_legacy_crossfade,
     atempo_chain,
     clamp_clip_fades,
+    next_media_id,
     normalize_grain_strength,
     normalize_speed,
     normalize_transition,
@@ -207,12 +209,14 @@ def _flatten_clips(
     return segs
 
 
-def _trim_needed(in_s: float, duration: float, src_duration: float) -> bool:
-    if in_s > 0.0005:
-        return True
-    if duration + in_s < src_duration - 0.0005:
-        return True
-    return False
+def _input_media_id(media: list[MediaItem], path: Path, kind: str) -> str:
+    """Bind legacy inputs by path without colliding with existing bin ids."""
+    for item in media:
+        if item.kind == kind and item.path.resolve() == path.resolve():
+            return item.id
+    mid = next_media_id(media)
+    media.append(MediaItem(mid, path, kind))
+    return mid
 
 
 def build_cmd(
@@ -256,183 +260,53 @@ def build_cmd(
     if src_dur <= 0:
         raise ExportError(f"unknown duration for {video}")
 
-    in_s = max(0.0, float(in_s or 0.0))
-    if in_s >= src_dur:
-        raise ExportError(f"in-point {in_s:.3f}s is past duration {src_dur:.3f}s")
-    end = float(out_s) if out_s is not None else src_dur
-    end = min(end, src_dur)
-    if end <= in_s + 0.04:
-        raise ExportError("out-point must be after in-point")
-    duration = end - in_s
+    # Explicit timelines own their bounds. Legacy CLI/server arguments are
+    # translated once, then use the same compositor as previews and effects.
+    media = list(media or [])
+    video_id = _input_media_id(media, video, "video")
+    if video_clips is None:
+        in_s = max(0.0, float(in_s or 0.0))
+        if in_s >= src_dur:
+            raise ExportError(f"in-point {in_s:.3f}s is past duration {src_dur:.3f}s")
+        end = min(float(out_s) if out_s is not None else src_dur, src_dur)
+        if end <= in_s + 0.04:
+            raise ExportError("out-point must be after in-point")
+        video_clips = [ClipInst(start=float(video_start or 0.0), in_s=in_s, out_s=end)]
+    video_clips = [c.copy() for c in video_clips]
+    for clip in video_clips:
+        if not clip.media_id:
+            clip.media_id = video_id
+
+    audio_path = Path(audio) if audio else None
+    audio_id = _input_media_id(media, audio_path, "audio") if audio_path is not None else ""
+    if audio_path is not None and audio_clips is None:
+        if audio_follows_in:
+            # Driver audio shares the picture's source-time origin. The common
+            # timeline builder clips it to the visible picture windows below.
+            origin = video_clips[0].start if video_clips else float(video_start or 0.0)
+            audio_clips = [ClipInst(start=origin)]
+        else:
+            audio_clips = [ClipInst(
+                start=float(audio_start or 0.0),
+                in_s=max(0.0, float(audio_in or 0.0)),
+                out_s=float(audio_out) if audio_out is not None else 0.0,
+            )]
+    audio_clips = [c.copy() for c in (audio_clips or [])]
+    for clip in audio_clips:
+        if not clip.media_id:
+            clip.media_id = audio_id or video_id
 
     dw, dh = profile_dest_size(aspect, profile, resolution)
     crop = cover_crop(src_w, src_h, dw, dh, pan_x, pan_y)
-
-    audio_path: Path | None = Path(audio) if audio else None
-    use_replacement = audio_path is not None
-    use_source_audio = (
-        (not use_replacement)
-        and bool(src.get("has_audio"))
-        and use_video_soundtrack
+    return _build_timeline_cmd(
+        video, out, audio_path=audio_path, aspect=aspect, resolution=resolution,
+        pan_x=pan_x, pan_y=pan_y, audio_follows_in=audio_follows_in,
+        audio_offset=audio_offset, video_clips=video_clips, audio_clips=audio_clips,
+        media=media, src=src, src_w=src_w, src_h=src_h, src_dur=src_dur,
+        dw=dw, dh=dh, crop=crop, use_replacement=audio_path is not None,
+        use_source_audio=audio_path is None and use_video_soundtrack,
+        crossfade_s=crossfade_s, profile=profile,
     )
-    many = (video_clips is not None and len(video_clips) > 1) or (
-        audio_clips is not None and len(audio_clips) > 1
-    )
-    if any(
-        c.reverse
-        or normalize_grain_strength(c.grain_strength) > 0.0
-        or abs(float(c.volume) - 1.0) > 0.0001
-        or abs(float(c.transform_x)) > 0.0001
-        or abs(float(c.transform_y)) > 0.0001
-        or abs(float(c.scale) - 1.0) > 0.0001
-        or float(getattr(c, "fade_in_s", 0.0) or 0.0) > 0.0
-        or float(getattr(c, "fade_out_s", 0.0) or 0.0) > 0.0
-        for c in (video_clips or [])
-    ):
-        many = True
-    if any(
-        c.reverse
-        or abs(float(c.volume) - 1.0) > 0.0001
-        or float(getattr(c, "fade_in_s", 0.0) or 0.0) > 0.0
-        or float(getattr(c, "fade_out_s", 0.0) or 0.0) > 0.0
-        for c in (audio_clips or [])
-    ):
-        many = True
-    vmids = {c.media_id for c in (video_clips or []) if c.media_id}
-    amids = {c.media_id for c in (audio_clips or []) if c.media_id}
-    if len(vmids) > 1 or len(amids) > 1:
-        many = True
-    if many:
-        return _build_cmd_many(
-            video,
-            out,
-            audio_path=audio_path,
-            aspect=aspect,
-            resolution=resolution,
-            pan_x=pan_x,
-            pan_y=pan_y,
-            audio_follows_in=audio_follows_in,
-            audio_offset=audio_offset,
-            video_clips=video_clips or [],
-            audio_clips=audio_clips,
-            media=media,
-            src=src,
-            src_w=src_w,
-            src_h=src_h,
-            src_dur=src_dur,
-            dw=dw,
-            dh=dh,
-            crop=crop,
-            use_replacement=use_replacement,
-            use_source_audio=use_source_audio,
-            crossfade_s=crossfade_s,
-            profile=profile,
-        )
-
-    vchain = []
-    if _trim_needed(in_s, duration, src_dur):
-        vchain.append(f"trim=start={in_s:.6f}:duration={duration:.6f}")
-        vchain.append("setpts=PTS-STARTPTS")
-    vchain.append(crop.as_ffmpeg())
-    vchain.append(f"scale={dw}:{dh}:flags=lanczos")
-    vchain.append("setsar=1")
-    vchain.append("format=yuv420p")
-
-    a_start = float(audio_offset or 0.0)
-    if a_start < 0:
-        a_start = 0.0
-    v_place = float(video_start or 0.0)
-    a_place = float(audio_start or 0.0)
-    # Black lead-in is the used clip’s left edge, not unused source
-    # sitting before timeline 0.
-    lead = max(0.0, v_place + in_s)
-    out_dur = duration + lead
-    if lead > 0.04:
-        vchain.append(f"tpad=start_duration={lead:.6f}:color=black")
-
-    # Original soundtrack stays locked to the picture. Replacement audio
-    # only follows the in-point when the user asks (driver sync).
-    # Otherwise the A clip sits at audio_start on the timeline.
-    picture_locked = use_source_audio or (use_replacement and audio_follows_in)
-    ain = max(0.0, float(audio_in or 0.0))
-    if picture_locked:
-        a_start += in_s
-        a_len = duration
-        delay = lead
-    else:
-        delay = max(0.0, a_place + ain)
-        skip = max(0.0, -(a_place + ain))
-        a_start += ain + skip
-        used = None if audio_out is None else max(0.05, float(audio_out) - ain - skip)
-        remain = max(0.05, out_dur - delay)
-        a_len = remain if used is None else min(used, remain)
-
-    achain = [
-        f"atrim=start={a_start:.6f}:duration={a_len:.6f}",
-        "asetpts=PTS-STARTPTS",
-    ]
-    if delay > 0.04:
-        ms = int(round(delay * 1000.0))
-        achain.append(f"adelay={ms}:all=1")
-    achain += [
-        f"apad=whole_dur={out_dur:.6f}",
-        "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo",
-    ]
-
-    cmd = [
-        which_ffmpeg(),
-        "-hide_banner",
-        "-nostdin",
-        "-y",
-        "-progress",
-        "pipe:1",
-        "-nostats",
-        "-loglevel",
-        "error",
-        "-i",
-        str(video),
-    ]
-    if use_replacement:
-        cmd += ["-i", str(audio_path)]
-
-    if use_replacement or use_source_audio:
-        a_in = "[1:a]" if use_replacement else "[0:a]"
-        filt = f"[0:v]{','.join(vchain)}[v];{a_in}{','.join(achain)}[a]"
-        cmd += ["-filter_complex", filt, "-map", "[v]", "-map", "[a]"]
-        cmd += [
-            "-c:a",
-            "aac",
-            "-b:a",
-            profile.audio_bitrate,
-            "-ar",
-            "48000",
-            "-ac",
-            "2",
-        ]
-        cmd += ["-disposition:a", "default"]
-    else:
-        cmd += ["-filter:v", ",".join(vchain), "-map", "0:v:0", "-an"]
-
-    cmd += _encode_tail(out, out_dur, profile=profile)
-    meta = {
-        "crop": {"x": crop.x, "y": crop.y, "w": crop.w, "h": crop.h},
-        "dest": {
-            "width": dw,
-            "height": dh,
-            "aspect": aspect,
-            "resolution": resolution,
-        },
-        "in_s": in_s,
-        "out_s": in_s + duration,
-        "duration": out_dur,
-        "audio": str(audio_path) if audio_path else None,
-        "audio_follows_in": bool(audio_follows_in),
-        "audio_offset": a_start if (use_replacement or use_source_audio) else None,
-        "video_start": v_place,
-        "audio_start": a_place,
-        "profile": profile.name,
-    }
-    return cmd, meta
 
 
 def _timeline_parts(flat: list[tuple], out_dur: float) -> list[tuple]:
@@ -794,7 +668,7 @@ def _join_parts(
     return current, duration, applied
 
 
-def _build_cmd_many(
+def _build_timeline_cmd(
     video: Path,
     out: Path,
     *,
@@ -817,7 +691,7 @@ def _build_cmd_many(
     use_replacement: bool,
     use_source_audio: bool,
     crossfade_s: float = 0.0,
-    media: list[MediaItem] | None = None,
+    media: list[MediaItem],
     profile: EncodeProfile = FINAL_PROFILE,
 ) -> tuple[list[str], dict[str, Any]]:
     profile = profile or FINAL_PROFILE
@@ -825,30 +699,21 @@ def _build_cmd_many(
                              for c in video_clips):
         # Coarse proxy compression otherwise erases light grain.
         profile = replace(profile, crf=min(profile.crf, FINAL_PROFILE.crf))
-    media = list(media or [])
-    if not any(m.kind == "video" for m in media):
-        media = [MediaItem(id="m1", path=video, kind="video")] + media
-    if use_replacement and audio_path is not None and not any(m.kind == "audio" for m in media):
-        media.append(MediaItem(id="m2", path=audio_path, kind="audio"))
     by_id = {m.id: m for m in media}
-    prim_v = next((m.id for m in media if m.kind == "video"), "")
-    prim_a = next((m.id for m in media if m.kind == "audio"), "")
+    used_ids = {c.media_id for c in video_clips + (audio_clips or [])}
     probes: dict[str, dict[str, Any]] = {}
     durs: dict[str, float] = {}
     for m in media:
+        if m.id not in used_ids:
+            continue
         try:
             info = probe(m.path)
         except ProbeError as exc:
             raise ExportError(str(exc)) from exc
         probes[m.id] = info
         durs[m.id] = float(info.get("duration") or 0.0)
-    vwork = []
     # Higher video tracks take priority wherever their clips are present.
-    for c in sorted(video_clips, key=lambda clip: int(clip.track)):
-        cc = c.copy()
-        if not cc.media_id:
-            cc.media_id = prim_v
-        vwork.append(cc)
+    vwork = sorted(video_clips, key=lambda clip: int(clip.track))
     if crossfade_s and float(crossfade_s) > 0.001:
         apply_legacy_crossfade(vwork, float(crossfade_s))
     vflats = {
@@ -859,28 +724,35 @@ def _build_cmd_many(
     vflat = _flatten_clips(vwork, durs if durs else src_dur)
     if not vflat:
         raise ExportError("no video on the timeline")
+    # All exports end with the picture. Independent audio keeps its own source
+    # clock and placement; driver audio is also restricted to picture windows.
+    out_dur = max(vflat[-1][1], 0.05)
+    audio_windows = [(0.0, out_dur)]
+    if audio_follows_in:
+        audio_windows = []
+        for row in vflat:
+            if audio_windows and row[0] <= audio_windows[-1][1] + 0.001:
+                audio_windows[-1] = (audio_windows[-1][0], row[1])
+            else:
+                audio_windows.append((row[0], row[1]))
     aflats: dict[int, list[tuple]] = {}
     if use_replacement and audio_clips:
         for track in (1, 2):
-            awork = []
-            for c in audio_clips:
-                if int(c.track) != track:
-                    continue
-                cc = c.copy()
-                if not cc.media_id:
-                    cc.media_id = prim_a or prim_v
-                awork.append(cc)
-            flat = _flatten_clips(awork, durs if durs else src_dur)
-            if flat:
-                aflats[track] = flat
+            awork = [c for c in audio_clips if int(c.track) == track]
+            if not awork:
+                continue
+            bounded = []
+            for start, end in audio_windows:
+                for clip in rebase_clips_for_window(awork, start, end, durs):
+                    clip.start += start
+                    bounded.append(clip)
+            # An authored track outside the picture becomes silence, so audio
+            # streams do not disappear just because its clips were trimmed out.
+            aflats[track] = _flatten_clips(bounded, durs)
     elif use_source_audio:
         flat = [row for row in vflat if probes.get(row[4], {}).get("has_audio")]
         if flat:
             aflats[1] = flat
-    out_dur = vflat[-1][1]
-    for aflat in aflats.values():
-        out_dur = max(out_dur, aflat[-1][1])
-    out_dur = max(out_dur, 0.05)
     v_parts = _timeline_parts(vflat, out_dur)
     v_parts_by_track = {track: _timeline_parts(rows, out_dur) for track, rows in vflats.items()}
     a_parts_by_track = {
@@ -909,10 +781,6 @@ def _build_cmd_many(
     for aflat in aflats.values():
         for row in aflat:
             add_input(str(row[4]))
-    if not inputs:
-        inputs = [video]
-        idx_of[prim_v] = 0
-
     fps = float(src.get("fps") or 30) or 30.0
     if fps < 1:
         fps = 30.0
@@ -1063,6 +931,7 @@ def _build_cmd_many(
                         fade_in_s=fade_in_s,
                         fade_out_s=fade_out_s,
                     )
+                    achain.append(f"apad=whole_dur={_part_duration(part):.6f}")
                     filters.append(f"{pad}{','.join(achain)}[{lab}]")
                 a_labs.append(f"[{lab}]")
             if len(a_labs) > 1:

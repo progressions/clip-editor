@@ -119,6 +119,8 @@ Drag the preview to reframe. In/out points trim the output (H3 head-blip).
 Replacement audio starts at 0 of the audio file unless “Audio follows video
 in-point” is on (driver sync). If the music is longer than the picture, **Fit**
 cuts it to the video length (no speed change). Export always does that cut.
+Driver audio is silent outside the visible picture range. These timing rules
+are the same for one clip, split clips, and clips with effects such as grain.
 
 Set **Cross-fade** to a duration such as `0.5 seconds` to dissolve between
 adjacent touching clips. `0` disables transitions. Clips separated by a gap do
