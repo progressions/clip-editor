@@ -20,6 +20,15 @@ def parse_command(text: str) -> EditorCommand | None:
     every actual aspect preset, not for ratios the application cannot render.
     """
     command = text.strip().lower().lstrip(":")
+    parts = command.split()
+    if len(parts) == 2 and parts[0] == "grain":
+        try:
+            strength = int(parts[1])
+        except ValueError:
+            return None
+        if 0 <= strength <= 100:
+            return EditorCommand("grain", str(strength))
+        return None
     if command == "rp":
         return EditorCommand("render_preview")
     if command.startswith("r"):

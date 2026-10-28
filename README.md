@@ -147,7 +147,7 @@ or reach it with Tab). Text fields, inspector controls, menus, and dialogs keep
 their native keys, including text undo. Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y edit the
 project history only from the timeline. Space playback, Save, and Open remain application-wide.
 The colon command entry owns typing until Enter or Esc returns focus to the
-timeline.
+timeline; Space inserts a space there instead of starting playback.
 
 `h/l` selects previous/next clips in time order on the active video or audio
 track. `Shift+H/L` extends the selection. `j/k` changes tracks through
@@ -244,6 +244,11 @@ without grain; render a preview to judge the effect.
 Selecting several video clips applies the slider to all of them. Grain survives
 splitting, undo/redo, and saved projects. Set the slider to 0 to remove it. Source
 files remain unchanged, and older projects open with grain off.
+
+With the timeline focused, type **`:grain 25`** and press **Enter** to set the
+selected video clip's strength. **`:grain 0`** turns grain off. The command accepts
+whole numbers from 0 to 100 and applies to all selected video clips as one undo
+step. Render a preview with **`:rp`** to see the result.
 
 ### Mixing audio layers
 

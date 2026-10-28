@@ -113,6 +113,77 @@ class GrainWindowTest(unittest.TestCase):
         self.win.grain_scale.set_value(0)
         self.assertEqual([c.grain_strength for c in self.win.video_clips], [0, 0])
 
+    def command(self, text):
+        self.win._show_command_line()
+        self.assertFalse(self.win._on_key_pressed(None, Gdk.KEY_space, 0, 0))
+        self.win.command_entry.set_text(text)
+        self.win.command_entry.emit('activate')
+
+    def test_command_updates_slider_preview_and_undo_redo_atomically(self):
+        before = self.win._current_render_fingerprint(kind='play')
+        self.win._schedule_autosave.reset_mock()
+        self.win._refresh_cache_bar.reset_mock()
+        self.command('grain 25')
+        self.assertEqual([c.grain_strength for c in self.win.video_clips], [25, 0])
+        self.assertEqual(self.win.grain_scale.get_value(), 25)
+        self.assertEqual(len(self.win._history), 2)
+        self.assertFalse(self.win.command_revealer.get_reveal_child())
+        self.assertIs(self.win.get_focus(), self.win.timeline)
+        self.assertNotEqual(self.win._current_render_fingerprint(kind='play'), before)
+        self.win._refresh_cache_bar.assert_called()
+        self.win._schedule_autosave.assert_called()
+        self.win._on_undo()
+        self.assertEqual(self.win.video_clips[0].grain_strength, 0)
+        self.win._on_redo()
+        self.assertEqual(self.win.video_clips[0].grain_strength, 25)
+
+    def test_command_turns_mixed_selection_off_when_primary_is_already_off(self):
+        self.win.video_clips[1].grain_strength = 60
+        self.win.sel_vs = {0, 1}
+        self.win._sync_grain_controls()
+        self.assertEqual(self.win.grain_scale.get_value(), 0)
+        self.command(':grain 0')
+        self.assertEqual([c.grain_strength for c in self.win.video_clips], [0, 0])
+        self.assertEqual(len(self.win._history), 3)
+        self.win._on_undo()
+        self.assertEqual([c.grain_strength for c in self.win.video_clips], [0, 60])
+        self.win._on_redo()
+        self.command('grain 0')
+        self.assertEqual(len(self.win._history), 3)
+
+    def test_command_keeps_prior_slider_edits_as_a_separate_undo_step(self):
+        self.win.grain_scale.set_value(10)
+        self.assertEqual(len(self.win._history), 1)
+        self.command('grain 40')
+        self.assertEqual(len(self.win._history), 3)
+        self.win._on_undo()
+        self.assertEqual(self.win.video_clips[0].grain_strength, 10)
+        self.win._on_undo()
+        self.assertEqual(self.win.video_clips[0].grain_strength, 0)
+
+    def test_command_requires_video_selection_and_obeys_rendering_locks(self):
+        for state in ('audio', 'unselected', 'rendering', 'exporting', 'compiled'):
+            with self.subTest(state=state):
+                self.win.sel_v, self.win.sel_vs = 0, {0}
+                self.win.sel_kind = 'audio' if state == 'audio' else 'video'
+                if state == 'unselected':
+                    self.win.sel_v, self.win.sel_vs = -1, set()
+                self.win._preview_rendering = state == 'rendering'
+                self.win.exporting = state == 'exporting'
+                self.win._compiled_mode = state == 'compiled'
+                self.command('grain 25')
+                self.assertEqual([c.grain_strength for c in self.win.video_clips], [0, 0])
+                self.assertEqual(len(self.win._history), 1)
+        self.win._compiled_mode = self.win._preview_rendering = self.win.exporting = False
+
+    def test_invalid_command_reports_usage_without_editing(self):
+        for text in ('grain', 'grain -1', 'grain 101', 'grain 1.5', 'grain bad'):
+            with self.subTest(text=text):
+                self.command(text)
+                self.assertIn('Usage: :grain', self.win.status.get_text())
+                self.assertEqual([c.grain_strength for c in self.win.video_clips], [0, 0])
+                self.assertEqual(len(self.win._history), 1)
+
     def test_audio_selection_rendering_and_compiled_mode_block_grain(self):
         for state in ('audio', 'rendering', 'compiled'):
             with self.subTest(state=state):
