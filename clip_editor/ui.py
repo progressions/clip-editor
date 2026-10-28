@@ -2689,7 +2689,7 @@ class EditorWindow(Adw.ApplicationWindow):
         body.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
         body.set_markup(
             "<b>Editor-wide</b>\n"
-            "Space   play / pause from any editor control\n"
+            "Space   play / pause from editor controls (except the command line)\n"
             "Ctrl+N / Ctrl+O   new / open project\n"
             "Ctrl+S / Ctrl+Shift+S   save / save as\n\n"
             "<b>Timeline navigation</b>\n"
@@ -2701,7 +2701,8 @@ class EditorWindow(Adw.ApplicationWindow):
             "Enter   open selected clip settings\n"
             "b   browse media: type to filter, ↑/↓ select, Enter place, Esc close\n"
             "z   toggle safe zones     e   export\n"
-            ":   command line (r916, r43, rp)\n\n"
+            ":   command line (r916, r43, rp)\n"
+            ":grain 0–100   set selected video clips' grain; 0 turns it off\n\n"
             "<b>Keyboard editing</b>\n"
             "m   move selected clips\n"
             "r   ripple-reorder a clip or contiguous group\n"
@@ -2755,8 +2756,14 @@ class EditorWindow(Adw.ApplicationWindow):
         self._hide_command_line()
         parsed = parse_command(command)
         if parsed is None:
-            if command:
+            if command.split()[:1] == ["grain"]:
+                self._set_status("Usage: :grain 0–100 (whole numbers; 0 turns grain off)")
+            elif command:
                 self._set_status(f"Unknown command: :{command}")
+            return
+        if parsed.name == "grain" and parsed.value is not None:
+            if self._set_grain_strength(int(parsed.value), checkpoint=True):
+                self._set_status(f"Grain strength {parsed.value} — render a preview to see it")
             return
         if parsed.name == "render_preview":
             self._on_render_preview()
@@ -2778,9 +2785,15 @@ class EditorWindow(Adw.ApplicationWindow):
         self._start_playthrough_render()
 
     def _on_key_pressed(self, _c: Gtk.EventControllerKey, keyval: int, _code: int, state: int) -> bool:
-        # Playback belongs to the whole editor, including focused controls.
+        # Command arguments need literal spaces; other controls keep playback.
         mods = state & Gtk.accelerator_get_default_mod_mask()
         if not mods and keyval in (Gdk.KEY_space, Gdk.KEY_KP_Space):
+            entry = getattr(self, "command_entry", None)
+            focus = self.get_focus()
+            if entry is not None and focus is not None and (
+                focus is entry or focus.is_ancestor(entry)
+            ):
+                return False
             if not self._space_held:
                 self._space_held = True
                 self._on_play()
@@ -3979,7 +3992,7 @@ class EditorWindow(Adw.ApplicationWindow):
         command_box.append(colon)
         self.command_entry = Gtk.Entry()
         self.command_entry.set_hexpand(True)
-        self.command_entry.set_placeholder_text("r916  r43  rp")
+        self.command_entry.set_placeholder_text("r916  r43  rp  grain 25")
         self.command_entry.connect("activate", self._on_command_activate)
         command_keys = Gtk.EventControllerKey()
         command_keys.connect("key-pressed", self._on_command_key_pressed)
@@ -4954,21 +4967,37 @@ class EditorWindow(Adw.ApplicationWindow):
     def _on_grain_changed(self, *_args: object) -> None:
         if self._loading:
             return
-        if self._busy_rendering() or not self._guard_edit("grain"):
+        self._set_grain_strength(self.grain_scale.get_value())
+
+    def _set_grain_strength(self, strength: float, *, checkpoint: bool = False) -> bool:
+        """Share grain edits between the slider and atomic colon commands."""
+        if self._busy_rendering():
+            self._set_status("Wait for rendering to finish before changing grain")
             self._sync_grain_controls()
-            return
+            return False
+        if not self._guard_edit("grain"):
+            self._sync_grain_controls()
+            return False
         clips = self._speed_target_clips() if self.sel_kind == "video" else []
         if not clips:
-            return
-        strength = normalize_grain_strength(self.grain_scale.get_value())
+            self._set_status("Select a video clip first")
+            return False
+        strength = normalize_grain_strength(strength)
         if all(c.grain_strength == strength for c in clips):
-            return
+            return True
+        if checkpoint:
+            self._flush_checkpoint()
+            self._checkpoint()
         self._stop()
         for clip in clips:
             clip.grain_strength = strength
         self._sync_timeline_clips()
-        self._schedule_checkpoint()
+        if checkpoint:
+            self._checkpoint()
+        else:
+            self._schedule_checkpoint()
         self._schedule_autosave()
+        return True
 
     def _refresh_export_name(self) -> None:
         if not self.video_path:

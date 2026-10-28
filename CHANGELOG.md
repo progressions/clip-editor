@@ -7,6 +7,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- `:grain 0–100` sets grain strength on selected video clips as one undo step; `:grain 0` turns it off. The command shares the slider's editing locks, autosave, and preview invalidation.
+
 ## [0.18.0] — 2026-10-27
 
 ### Added
