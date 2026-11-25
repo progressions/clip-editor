@@ -67,6 +67,15 @@ class KeyboardOwnershipTest(unittest.TestCase):
         for modifier in (Gdk.ModifierType.CONTROL_MASK, Gdk.ModifierType.ALT_MASK):
             self.assertFalse(self.key(win, Gdk.KEY_space, modifier))
 
+    def test_command_entry_keeps_spaces_for_arguments(self):
+        win = self.make_window(False)
+        win.command_entry = object()
+        win.get_focus = lambda: win.command_entry
+        for key in (Gdk.KEY_space, Gdk.KEY_KP_Space):
+            self.assertFalse(self.key(win, key))
+        self.assertFalse(win._space_held)
+        win._on_play.assert_not_called()
+
     def test_timeline_dispatch_and_rendered_preview_guard(self):
         win = self.make_window()
         self.assertTrue(self.key(win, Gdk.KEY_l))
@@ -118,6 +127,7 @@ class KeyboardOwnershipTest(unittest.TestCase):
             box.append(widget)
         win = self.make_window()
         win.timeline = timeline
+        win.command_entry = controls[-1]
         win.get_focus = window.get_focus
         controller = Gtk.EventControllerKey()
         controller.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
@@ -130,8 +140,13 @@ class KeyboardOwnershipTest(unittest.TestCase):
                 for key in (Gdk.KEY_t, Gdk.KEY_Delete, Gdk.KEY_equal, Gdk.KEY_minus, Gdk.KEY_h):
                     self.assertFalse(controller.emit('key-pressed', key, 0, 0))
                 win._on_play.reset_mock()
-                self.assertTrue(controller.emit('key-pressed', Gdk.KEY_space, 0, 0))
-                win._on_play.assert_called_once()
+                handled = controller.emit('key-pressed', Gdk.KEY_space, 0, 0)
+                if widget is win.command_entry:
+                    self.assertFalse(handled)
+                    win._on_play.assert_not_called()
+                else:
+                    self.assertTrue(handled)
+                    win._on_play.assert_called_once()
                 EditorWindow._on_key_released(win, None, Gdk.KEY_space, 0, 0)
                 self.assertFalse(controller.emit('key-pressed', Gdk.KEY_z, 0,
                                                  Gdk.ModifierType.CONTROL_MASK))

@@ -8,10 +8,28 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ## [Unreleased]
 
 ### Added
+
 - `2160` export resolution preset (2160 short edge: 16:9 3840×2160, 9:16 2160×3840, 4:5 2160×2700, 1:1 2160×2160, 3:4 2160×2880, 4:3 2880×2160) in the CLI, GTK toolbar, server and project files.
 
 ### Fixed
+
 - Project loading now validates `resolution` against the shared `RESOLUTIONS` list instead of a hard-coded copy.
+
+## [0.18.1] — 2026-10-28
+
+### Added
+
+- `:grain 0–100` sets grain strength on selected video clips as one undo step; `:grain 0` turns it off. The command shares the slider's editing locks, autosave, and preview invalidation.
+
+## [0.18.0] — 2026-10-27
+
+### Added
+
+- Adjustable monochrome film grain for selected video clips, with an off-to-heavy slider in the clip controls. Grain appears in rendered previews and exports, survives splits and undo/redo, and is saved in project format version 10. Older projects open with grain off.
+
+### Fixed
+
+- Single-clip exports and timeline renders now share one audio/video compositor. Grain and other effects no longer change audio alignment or export duration. Driver audio follows the visible picture range, independent audio keeps its own placement, and all exports end with the video.
 
 ## [0.17.0] — 2026-10-04
 

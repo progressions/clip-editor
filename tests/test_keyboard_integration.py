@@ -301,8 +301,8 @@ class KeyboardEditingTest(unittest.TestCase):
     def test_help_lists_current_shortcuts_and_does_not_capture_text_input(self):
         self.key(Gdk.KEY_question)
         text = self.win.keyboard_help_body.get_text()
-        for hint in ('Space', 'any editor control', 'zoom in', 'fit timeline',
-                     'Enter', 'safe zones', 'export', 'Ctrl+Shift+S', 'rp'):
+        for hint in ('Space', 'editor controls', 'except the command line', 'zoom in', 'fit timeline',
+                     'Enter', 'safe zones', 'export', 'Ctrl+Shift+S', 'rp', ':grain 0–100'):
             self.assertIn(hint, text)
         self.key(Gdk.KEY_Escape)
         self.win.command_entry.grab_focus()

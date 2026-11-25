@@ -119,6 +119,8 @@ Drag the preview to reframe. In/out points trim the output (H3 head-blip).
 Replacement audio starts at 0 of the audio file unless “Audio follows video
 in-point” is on (driver sync). If the music is longer than the picture, **Fit**
 cuts it to the video length (no speed change). Export always does that cut.
+Driver audio is silent outside the visible picture range. These timing rules
+are the same for one clip, split clips, and clips with effects such as grain.
 
 Set **Cross-fade** to a duration such as `0.5 seconds` to dissolve between
 adjacent touching clips. `0` disables transitions. Clips separated by a gap do
@@ -145,7 +147,7 @@ or reach it with Tab). Text fields, inspector controls, menus, and dialogs keep
 their native keys, including text undo. Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y edit the
 project history only from the timeline. Space playback, Save, and Open remain application-wide.
 The colon command entry owns typing until Enter or Esc returns focus to the
-timeline.
+timeline; Space inserts a space there instead of starting playback.
 
 `h/l` selects previous/next clips in time order on the active video or audio
 track. `Shift+H/L` extends the selection. `j/k` changes tracks through
@@ -232,6 +234,22 @@ playhead or ruler, hold the pointer near either visible edge to scroll and seek
 into the hidden portion of the timeline, including back to 0:00.
 
 
+### Film grain
+
+Select a video clip and open its clip controls. The **grain strength** slider
+ranges from **off** (0) to **heavy** (100). It adds animated monochrome film grain
+in rendered previews and exported videos. Raw editing playback shows the source
+without grain; render a preview to judge the effect.
+
+Selecting several video clips applies the slider to all of them. Grain survives
+splitting, undo/redo, and saved projects. Set the slider to 0 to remove it. Source
+files remain unchanged, and older projects open with grain off.
+
+With the timeline focused, type **`:grain 25`** and press **Enter** to set the
+selected video clip's strength. **`:grain 0`** turns grain off. The command accepts
+whole numbers from 0 to 100 and applies to all selected video clips as one undo
+step. Render a preview with **`:rp`** to see the result.
+
 ### Mixing audio layers
 
 **Add audio** places a file on the free audio layer, A1 or A2. If the video has
@@ -264,7 +282,7 @@ splitting, fades, transitions, undo/redo, and export retain the clip's direction
 Trim points on a reversed clip are measured from the end of its source. Disable
 Reverse to restore forward playback.
 
-Projects now save format version 9, including each clip's direction; older
+Projects now save format version 10, including each clip's direction and grain; older
 projects load with forward playback. Original media files are never modified.
 
 ### Browse media with the keyboard
