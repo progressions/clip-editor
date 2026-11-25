@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.19.0] — 2026-11-25
+
 ### Added
 
 - `2160` export resolution preset (2160 short edge: 16:9 3840×2160, 9:16 2160×3840, 4:5 2160×2700, 1:1 2160×2160, 3:4 2160×2880, 4:3 2880×2160) in the CLI, GTK toolbar, server and project files.
