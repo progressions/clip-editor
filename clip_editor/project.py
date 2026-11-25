@@ -14,6 +14,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .aspects import RESOLUTIONS
+
 FORMAT = "clip-editor-project"
 VERSION = 10
 SUFFIX = ".clip.json"
@@ -665,7 +667,7 @@ def from_dict(data: dict, *, origin: Path | None = None) -> Project:
         except OSError:
             pass
     raw_res = str(data.get("resolution") or "medium").strip().lower()
-    if raw_res not in ("low", "medium", "high"):
+    if raw_res not in RESOLUTIONS:
         raw_res = "medium"
     proj = Project(
         video=video,

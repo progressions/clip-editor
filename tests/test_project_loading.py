@@ -348,6 +348,9 @@ class ProjectLoadingTest(unittest.TestCase):
         if not src.is_file():
             self.skipTest("real project not present on this machine")
         original_bytes = src.read_bytes()
+        source_media = json.loads(original_bytes).get("media", [])
+        if any(not Path(item["path"]).is_file() for item in source_media):
+            self.skipTest("real project media not present on this machine")
         # Copy only the project JSON; media stay at absolute paths.
         copy = self.root / "maroon-bodycon.copy.clip.json"
         shutil.copy2(src, copy)

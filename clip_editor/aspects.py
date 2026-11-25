@@ -14,13 +14,14 @@ ASPECTS: dict[str, tuple[int, int]] = {
     "16:9": (1920, 1080),
 }
 
-# Short-edge targets for Low / Medium / High. Medium matches ASPECTS.
-RESOLUTIONS: tuple[str, ...] = ("low", "medium", "high")
+# Short-edge targets for Low / Medium / High / 2160 (4K UHD). Medium matches ASPECTS.
+RESOLUTIONS: tuple[str, ...] = ("low", "medium", "high", "2160")
 DEFAULT_RESOLUTION = "medium"
 RESOLUTION_SHORT_AXIS: dict[str, int] = {
     "low": 720,
     "medium": 1080,
     "high": 1440,
+    "2160": 2160,
 }
 
 
@@ -141,10 +142,10 @@ def normalize_resolution(resolution: str | None) -> str:
 
 
 def dest_size(aspect: str, resolution: str | None = None) -> tuple[int, int]:
-    """Return even WxH for ``aspect`` at ``resolution`` (low/medium/high).
+    """Return even WxH for ``aspect`` at ``resolution`` (low/medium/high/2160).
 
     Medium is the historical ASPECTS table (1080 short edge). Low/high scale
-    that table so the short edge is 720 / 1440.
+    that table so the short edge is 720 / 1440 / 2160 (16:9 2160 = 3840x2160).
     """
     key = str(aspect).strip()
     if key not in ASPECTS:

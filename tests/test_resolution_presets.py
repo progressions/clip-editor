@@ -29,6 +29,20 @@ class ResolutionPresetTests(unittest.TestCase):
         self.assertEqual(dest_size("1:1", "low"), (720, 720))
         self.assertEqual(dest_size("4:5", "high"), (1440, 1800))
 
+    def test_2160_uhd_sizes(self) -> None:
+        self.assertIn("2160", RESOLUTIONS)
+        self.assertEqual(dest_size("16:9", "2160"), (3840, 2160))
+        self.assertEqual(dest_size("9:16", "2160"), (2160, 3840))
+        self.assertEqual(dest_size("4:5", "2160"), (2160, 2700))
+        self.assertEqual(dest_size("1:1", "2160"), (2160, 2160))
+        self.assertEqual(dest_size("3:4", "2160"), (2160, 2880))
+        self.assertEqual(dest_size("4:3", "2160"), (2880, 2160))
+        self.assertEqual(profile_dest_size("16:9", FINAL_PROFILE, "2160"), (3840, 2160))
+
+    def test_project_round_trip_persists_2160(self) -> None:
+        loaded = from_dict(to_dict(Project(aspect="16:9", resolution="2160")))
+        self.assertEqual(loaded.resolution, "2160")
+
     def test_sizes_are_even(self) -> None:
         for aspect in ASPECTS:
             for res in RESOLUTIONS:
